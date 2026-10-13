@@ -7,20 +7,46 @@ Until publication, use path dependencies as shown below.
 `chickinfry` supplies HTTP transport and session handling for Chickinfry generated
 clients. It uses HTTPS or an explicit loopback HTTP origin.
 
-For local development, add the runtime to your application's `pubspec.yaml`:
+## Install and first call
+
+Generate your project's Dart client SDK and make your first call:
+
+1. Add `dart` to `generation.clients` in `chik/project.yml` and run `chik generate`.
+   The SDK is generated at `client/generated/dart` as the `chickinfry_client` package.
+2. Add the generated SDK to your app's `pubspec.yaml`:
 
 ```yaml
 dependencies:
-  chickinfry:
-    path: ../chickinfry-dart/packages/chickinfry
+  chickinfry_client:
+    path: ../my-project/client/generated/dart
 ```
 
-Run `dart pub get`, then pass a transport to your generated client:
+3. `chickinfry` is not published to pub.dev yet, so resolve it from a local
+   checkout. Create `pubspec_overrides.yaml` next to your app's `pubspec.yaml`
+   (this file is yours; `chik generate` does not overwrite it) and adjust the
+   path to your checkout:
+
+```yaml
+dependency_overrides:
+  chickinfry:
+    path: ../../chickinfry-dart/packages/chickinfry
+```
+
+4. Run `dart pub get`, then make the first call:
 
 ```dart
 import 'package:chickinfry/chickinfry.dart';
+import 'package:chickinfry_client/chickinfry_client.dart';
 
-final transport = HttpTransport('https://api.example.com');
+Future<void> main() async {
+  final transport = HttpTransport('https://api.example.com');
+  final client = Client(transport);
+  final result = await client.accountStatus.getStatus(
+    AccountStatusGetStatusInput(/* required fields */),
+  );
+  print(result);
+  transport.close();
+}
 ```
 
 Use `transport.withBearer(token)` or `transport.withSession(sessions)` for an
