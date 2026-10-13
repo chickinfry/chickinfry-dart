@@ -7,6 +7,8 @@ Until publication, use path dependencies as shown below.
 `chickinfry` supplies HTTP transport and session handling for Chickinfry generated
 clients. It uses HTTPS or an explicit loopback HTTP origin.
 
+[`chickinfry_flutter`](packages/chickinfry_flutter) adds OS-backed session storage for native Flutter apps; see its platform verification table.
+
 ## Install and first call
 
 Generate your project's Dart client SDK and make your first call:
@@ -55,20 +57,30 @@ Copies share its connections; closing a copy does not close the original.
 
 The application supplies a `SessionStore`. Successful login results are saved
 explicitly with `sessions.write(SessionCredentials.fromJson(result.toJson()))`.
-After a successful generated logout call, clear only the session that was used:
+Send logout with the captured session credentials, then clear only that session:
 
 ```dart
-Future<void> logout(ClientTransport client, SessionStore sessions) async {
+Future<void> logout(HttpTransport transport, SessionStore sessions) async {
   final expected = await sessions.read();
-  await client.invoke('auth.logout', {});
+  if (expected == null) return;
+  await transport.withBearer(expected.accessToken).invoke('auth.logout', {});
   final latest = await sessions.read();
   if (latest != null &&
-      latest.userId == expected?.userId &&
-      latest.sessionId == expected?.sessionId) {
+      latest.userId == expected.userId &&
+      latest.sessionId == expected.sessionId) {
     await sessions.compareAndSet(latest, null);
   }
 }
 ```
+
+Pass the transport for the store's origin. `withBearer` pins this request to the
+captured session, even if the transport already uses `withSession` and a new
+login is saved before sending. It deliberately disables automatic refresh:
+an expired access token returns `OperationError('invalid_token', 401)` to the
+caller and leaves the stored record intact. Handle that error by asking the user
+to authenticate again; do not retry this logout through `withSession`, which
+could select a different login. Other request failures also preserve the record.
+A rejected request does not confirm server logout.
 
 Stores for the same physical record must return the same `coordinationKey` and
 serialize writes and conditional replacements. Concurrent refresh is coordinated

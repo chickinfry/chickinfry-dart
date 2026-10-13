@@ -1,0 +1,17 @@
+name: session_store_example
+description: Minimal native consumer of Chickinfry secure session storage.
+publish_to: none
+environment:
+  sdk: '>=3.13.0 <4.0.0'
+dependencies:
+  chickinfry:
+    path: ../../chickinfry
+  chickinfry_flutter:
+    path: ..
+  flutter:
+    sdk: flutter
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  integration_test:
+    sdk: flutter

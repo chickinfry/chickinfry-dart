@@ -1201,47 +1201,72 @@ void main() {
     );
   }
 
-  for (final newLogin in [false, true]) {
-    test(
-      'C-10 logout ${newLogin ? 'preserves a new login' : 'clears rotated credentials'}',
-      () async {
-        final record = Record(credentials());
-        final peer = await Peer.start((request) async {
-          await request.drain<void>();
-          if (request.uri.path == '/auth.refresh') {
-            await reply(request, credentials(rotated: true).toJson());
-          } else if (request.headers.value('authorization') ==
-              'Bearer $accessToken') {
-            await reply(request, {'error': 'invalid_token'}, status: 401);
-          } else {
-            if (newLogin) {
-              record.value = credentials(rotated: true, session: 'new-session');
-            }
-            await reply(request, {'status': 'ok'});
-          }
-        });
-        final store = MemorySessionStore(
-          peer.origin,
-          'logout-$newLogin',
-          record,
-        );
-        final expected = await store.read();
-        await peer.transport().withSession(store).invoke('auth.logout', {});
-        final latest = await store.read();
-        if (latest != null &&
-            latest.userId == expected?.userId &&
-            latest.sessionId == expected?.sessionId) {
-          await store.compareAndSet(latest, null);
+  for (final scenario in [
+    'before request',
+    'during request',
+    'rotated credentials',
+    'expired token',
+    'server failure',
+    'missing session',
+  ]) {
+    test('C-10 README logout handles $scenario', () async {
+      final initial = credentials();
+      final newLogin = credentials(rotated: true, session: 'new-session');
+      final record = Record(scenario == 'missing session' ? null : initial);
+      final authorizations = <String?>[];
+      final activeTokens = {'Bearer $accessToken', 'Bearer $nextAccessToken'};
+      late MemorySessionStore store;
+      final peer = await Peer.start((request) async {
+        await request.drain<void>();
+        authorizations.add(request.headers.value('authorization'));
+        expect(request.uri.path, '/auth.logout');
+        if (scenario == 'expired token' || scenario == 'server failure') {
+          await reply(request, {
+            'error': scenario == 'expired token'
+                ? 'invalid_token'
+                : 'unavailable',
+          }, status: scenario == 'expired token' ? 401 : 503);
+          return;
         }
-        expect(
-          newLogin
-              ? record.value?.sessionId == 'new-session'
-              : record.value == null,
-          isTrue,
+        activeTokens.remove(request.headers.value('authorization'));
+        if (scenario == 'during request') await store.write(newLogin);
+        if (scenario == 'rotated credentials') {
+          await store.write(credentials(rotated: true));
+        }
+        await reply(request, {'status': 'ok'});
+      });
+      store = scenario == 'before request'
+          ? LoginAfterReadStore(peer.origin, record, newLogin)
+          : MemorySessionStore(peer.origin, 'logout-$scenario', record);
+      final transport = peer.transport().withSession(store);
+      if (scenario == 'expired token' || scenario == 'server failure') {
+        await expectLater(
+          logout(transport, store),
+          throwsA(
+            operationFailure(
+              scenario == 'expired token' ? 'invalid_token' : 'unavailable',
+              scenario == 'expired token' ? 401 : 503,
+            ),
+          ),
         );
-        expect(record.deletions, newLogin ? 0 : 1);
-      },
-    );
+        expect(record.value, initial);
+        expect(record.deletions, 0);
+      } else {
+        await logout(transport, store);
+        final preservesLogin =
+            scenario == 'before request' || scenario == 'during request';
+        expect(record.value, preservesLogin ? newLogin : null);
+        expect(
+          record.deletions,
+          preservesLogin || scenario == 'missing session' ? 0 : 1,
+        );
+      }
+      expect(activeTokens, contains('Bearer $nextAccessToken'));
+      expect(
+        authorizations,
+        scenario == 'missing session' ? isEmpty : ['Bearer $accessToken'],
+      );
+    });
   }
 }
 
@@ -1261,5 +1286,36 @@ class FaultyStore extends MemorySessionStore {
     // Use a broken store deliberately to detect policy changes in the decorator.
     record.value = next;
     return true;
+  }
+}
+
+Future<void> logout(HttpTransport transport, SessionStore sessions) async {
+  final expected = await sessions.read();
+  if (expected == null) return;
+  await transport.withBearer(expected.accessToken).invoke('auth.logout', {});
+  final latest = await sessions.read();
+  if (latest != null &&
+      latest.userId == expected.userId &&
+      latest.sessionId == expected.sessionId) {
+    await sessions.compareAndSet(latest, null);
+  }
+}
+
+class LoginAfterReadStore extends MemorySessionStore {
+  LoginAfterReadStore(String origin, Record record, this.newLogin)
+    : super(origin, 'logout-before-request', record);
+
+  final SessionCredentials newLogin;
+  bool firstRead = true;
+
+  @override
+  Future<SessionCredentials?> read() async {
+    final captured = await super.read();
+    if (firstRead) {
+      firstRead = false;
+      // Complete a concurrent login after capturing A, before logout can send.
+      await write(newLogin);
+    }
+    return captured;
   }
 }
