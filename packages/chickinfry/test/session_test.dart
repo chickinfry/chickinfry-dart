@@ -2,11 +2,185 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:chickinfry/chickinfry.dart';
+import 'package:chickinfry/src/testing/conformance.dart';
 import 'package:test/test.dart';
 
 import 'support.dart';
 
 void main() {
+  if (conformanceEnabled) {
+    test(
+      'conformance callbacks isolate barriers and preserve SDK outcomes',
+      () async {
+        final entered = Completer<void>();
+        final release = Completer<void>();
+        addTearDown(() {
+          if (!release.isCompleted) release.complete();
+        });
+        final peer = await Peer.start((request) async {
+          await request.drain<void>();
+          await reply(request, {'ok': true});
+        });
+        final transport = peer.transport();
+        final blockedCall = conformanceCall(
+          'blocked',
+          'thing.get',
+          Observer(
+            onArrive: (point, facts) {
+              if (point == ConformancePoint.sdkEntered) {
+                entered.complete();
+                return release.future;
+              }
+              return null;
+            },
+          ),
+        );
+        final blocked = withConformanceCall(
+          blockedCall,
+          () => transport.invoke('thing.get', {}),
+        );
+        await entered.future;
+        expect(peer.requests, 0);
+        final freeCall = conformanceCall('free', 'thing.get', Observer());
+        expect(
+          await withConformanceCall(
+            freeCall,
+            () => transport.invoke('thing.get', {}),
+          ).timeout(
+            const Duration(seconds: 1),
+            onTimeout: () => {'blocked': true},
+          ),
+          {'ok': true},
+        );
+        expect(peer.requests, 1);
+        release.complete();
+        expect(await blocked, {'ok': true});
+        expect(blockedCall.instrumentationFailed, isFalse);
+
+        final shared = Completer<SessionCredentials>();
+        final releaseFailure = Completer<void>();
+        final failureEvents = <ConformanceEvent>[];
+        final failureCall = conformanceCall(
+          'failure',
+          'thing.get',
+          Observer(
+            onArrive: (_, _) => releaseFailure.future,
+            onRecord: failureEvents.add,
+          ),
+        );
+        final flight = Object();
+        final failed = withConformanceCall(
+          failureCall,
+          () => observeRefresh(
+            shared.future,
+            flight,
+            credentials(),
+            initiator: false,
+          ),
+        ).then<Object>((value) => value, onError: (Object error) => error);
+        const error = ClientException('request_timeout');
+        shared.completeError(error);
+        expect(await transport.invoke('thing.get', {}), {'ok': true});
+        expect(failureEvents, isEmpty);
+        releaseFailure.complete();
+        expect(await failed, same(error));
+        final observed = failureEvents.single as ConformanceRefreshEvent;
+        expect(observed.flight, same(flight));
+        expect(observed.code, 'request_timeout');
+        expect(observed.status, isNull);
+        expect(failureCall.instrumentationFailed, isFalse);
+
+        for (final kind in ['sync', 'async', 'record']) {
+          final call = conformanceCall(
+            kind,
+            'thing.get',
+            Observer(
+              onArrive: (_, _) {
+                if (kind == 'sync') throw StateError('observer');
+                if (kind == 'async') {
+                  return Future<void>.error(StateError('observer'));
+                }
+                return null;
+              },
+              onRecord: (_) {
+                if (kind == 'record') throw StateError('observer');
+              },
+            ),
+          );
+          expect(
+            await withConformanceCall(
+              call,
+              () => transport.invoke('thing.get', {}),
+            ),
+            {'ok': true},
+          );
+          expect(call.instrumentationFailed, isTrue);
+        }
+        final invalidArrivals = <ConformanceFacts>[];
+        final invalid = conformanceCall(
+          'invalid',
+          'invalid',
+          Observer(
+            onArrive: (point, facts) {
+              if (point == ConformancePoint.sdkEntered) {
+                invalidArrivals.add(facts);
+              }
+              return null;
+            },
+          ),
+        );
+        await expectLater(
+          withConformanceCall(invalid, () => transport.invoke('invalid', {})),
+          throwsA(clientFailure('invalid_input')),
+        );
+        expect(invalidArrivals, hasLength(1));
+        expect(invalidArrivals.single.operation, 'invalid');
+        expect(invalid.httpAttempts, 0);
+      },
+    );
+
+    test('conformance store delegates exact CAS and preserves atomic revision snapshots', () async {
+      final original = credentials();
+      final replacement = credentials(rotated: true, session: 'other');
+      final record = Record(null);
+      final memory = MemorySessionStore('http://127.0.0.1', 'record', record);
+      final write = memory.write(original);
+      expect(record.snapshot, (value: original, revision: 1));
+      final second = memory.write(replacement);
+      expect(record.snapshot, (value: replacement, revision: 2));
+      await Future.wait([write, second]);
+      expect(await memory.compareAndSet(original, null), isFalse);
+      expect(record.revision, 2);
+      await memory.write(replacement);
+      expect(record.revision, 3);
+      expect(await memory.compareAndSet(replacement, null), isTrue);
+      expect(record.snapshot, (value: null, revision: 4));
+
+      for (final fails in [false, true]) {
+        final delegate = FaultyStore(record, fails);
+        final store = RecordingSessionStore(delegate);
+        record.value = replacement;
+        final call = conformanceCall('clear', 'thing.get', Observer());
+        final future = withConformanceCall(
+          call,
+          () => store.compareAndSet(original, null),
+        );
+        if (fails) {
+          await expectLater(future, throwsA(same(delegate.failure)));
+          expect(store.clearAttempts.single.removed, isNull);
+        } else {
+          expect(await future, isTrue);
+          expect(record.value, isNull);
+          expect(store.clearAttempts.single.removed, isTrue);
+        }
+        expect(delegate.arguments, [(original, null)]);
+        expect(store.clearAttempts.single.expected, same(original));
+        expect(store.clearAttempts.single.callId, 'clear');
+        expect(store.origin, delegate.origin);
+        expect(store.coordinationKey, delegate.coordinationKey);
+      }
+    });
+  }
   test(
     'C-03 session credentials reject missing, null, invalid tokens and times',
     () {
@@ -218,6 +392,51 @@ void main() {
     final releaseLate = Completer<void>();
     final refreshStarted = Completer<void>();
     final releaseRefresh = Completer<void>();
+    final participants = <String, ConformanceFacts>{};
+    final rejected = <String>{};
+    final entered = <String>{};
+    final httpEvents = <String, List<ConformanceHttpEvent>>{};
+    final joined = Completer<void>();
+    final releaseParticipants = Completer<void>();
+    final workerCompleted = Completer<void>();
+    final observer = Observer(
+      onArrive: (point, facts) {
+        final call = currentConformanceCall!;
+        expect(facts.operation, call.operation);
+        if (point == ConformancePoint.sdkEntered) {
+          entered.add(call.callId);
+          expect(httpEvents[call.callId], isNull);
+        } else if (point == ConformancePoint.originalsRejected) {
+          rejected.add(call.callId);
+          expect(entered, contains(call.callId));
+          expect(facts.code, 'invalid_token');
+          expect(facts.status, 401);
+          expect(facts.credentials, credentials());
+          expect(facts.attempt, 1);
+          expect(httpEvents[call.callId]!.last.phase, ConformancePhase.failed);
+        } else {
+          expect(rejected, contains(call.callId));
+          participants[call.callId] = facts;
+          if (participants.length == 2) joined.complete();
+          if (call.callId != 'late') return releaseParticipants.future;
+        }
+        return null;
+      },
+      onRecord: (event) {
+        if (event is ConformanceHttpEvent) {
+          (httpEvents[currentConformanceCall!.callId] ??= []).add(event);
+          if (event.operation == 'auth.refresh' &&
+              event.phase == ConformancePhase.completed) {
+            workerCompleted.complete();
+          }
+        }
+      },
+    );
+    addTearDown(() {
+      for (final gate in [releaseRefresh, releaseParticipants, releaseLate]) {
+        if (!gate.isCompleted) gate.complete();
+      }
+    });
     final peer = await Peer.start((request) async {
       await request.drain<void>();
       if (request.uri.path == '/auth.refresh') {
@@ -255,18 +474,57 @@ void main() {
     expect(identical(firstStore, secondStore), isFalse);
     final first = peer.transport().withSession(firstStore);
     final second = peer.transport().withSession(secondStore);
+    final contexts = [
+      conformanceCall('first', 'thing.first', observer),
+      conformanceCall('second', 'thing.second', observer),
+      conformanceCall('late', 'thing.late', observer),
+    ];
     final calls = [
       for (final call in [
-        first.invoke('thing.first', {}),
-        second.invoke('thing.second', {}),
+        withConformanceCall(contexts[0], () => first.invoke('thing.first', {})),
+        withConformanceCall(
+          contexts[1],
+          () => second.invoke('thing.second', {}),
+        ),
       ])
         call.then<Object?>((value) => value, onError: (Object error) => error),
     ];
-    final late = first
-        .invoke('thing.late', {})
-        .then<Object?>((value) => value, onError: (Object error) => error);
-    await refreshStarted.future;
+    final late = withConformanceCall(
+      contexts[2],
+      () => first.invoke('thing.late', {}),
+    ).then<Object?>((value) => value, onError: (Object error) => error);
+    expect(
+      await refreshStarted.future
+          .then((_) => true)
+          .timeout(const Duration(seconds: 1), onTimeout: () => false),
+      isTrue,
+    );
+    if (conformanceEnabled) {
+      expect(
+        await joined.future
+            .then((_) => true)
+            .timeout(const Duration(seconds: 1), onTimeout: () => false),
+        isTrue,
+      );
+      expect(participants.keys, unorderedEquals(['first', 'second']));
+      expect(
+        identical(
+          participants['first']!.flight,
+          participants['second']!.flight,
+        ),
+        isTrue,
+      );
+      expect(
+        participants.values.map((facts) => facts.initiator),
+        unorderedEquals([true, false]),
+      );
+    }
     releaseRefresh.complete();
+    if (conformanceEnabled) {
+      await workerCompleted.future;
+      expect(replays, 0);
+      releaseParticipants.complete();
+    }
     await expectLater(
       Future.wait(calls),
       completion([
@@ -280,6 +538,32 @@ void main() {
     expect(initial, 3);
     expect(replays, 3);
     expect(record.replacements, 1);
+    if (conformanceEnabled) {
+      expect(
+        contexts.map((call) => call.instrumentationFailed),
+        everyElement(isFalse),
+      );
+      expect(entered, unorderedEquals(['first', 'second', 'late']));
+      expect(rejected, entered);
+      final firstEvents = httpEvents['first']!;
+      final secondEvents = httpEvents['second']!;
+      expect(
+        firstEvents
+            .where((event) => event.phase == ConformancePhase.sending)
+            .map((event) => event.attempt),
+        participants['first']!.initiator! ? [1, 2, 3] : [1, 2],
+      );
+      expect(
+        secondEvents
+            .where((event) => event.phase == ConformancePhase.sending)
+            .map((event) => event.attempt),
+        participants['second']!.initiator! ? [1, 2, 3] : [1, 2],
+      );
+    } else {
+      expect(entered, isEmpty);
+      expect(httpEvents, isEmpty);
+      expect(contexts.map((call) => call.httpAttempts), everyElement(0));
+    }
   });
 
   test('C-09 different records refresh independently', () async {
@@ -385,19 +669,33 @@ void main() {
         }
       });
       final record = Record(credentials());
-      final first = peer.transport().withSession(
+      final store = RecordingSessionStore(
         MemorySessionStore(peer.origin, 'reject', record),
       );
-      final second = peer.transport().withSession(
-        MemorySessionStore(peer.origin, 'reject', record),
+      final first = peer.transport().withSession(store);
+      final second = peer.transport().withSession(store);
+      final initiators = <String>[];
+      final observer = Observer(
+        onArrive: (point, facts) {
+          if (point == ConformancePoint.refreshJoined && facts.initiator!) {
+            initiators.add(currentConformanceCall!.callId);
+          }
+          return null;
+        },
       );
       await Future.wait([
         expectLater(
-          first.invoke('thing.get', {}),
+          withConformanceCall(
+            conformanceCall('first', 'thing.get', observer),
+            () => first.invoke('thing.get', {}),
+          ),
           throwsA(operationFailure('session_revoked', 401)),
         ),
         expectLater(
-          second.invoke('thing.get', {}),
+          withConformanceCall(
+            conformanceCall('second', 'thing.get', observer),
+            () => second.invoke('thing.get', {}),
+          ),
           throwsA(operationFailure('session_revoked', 401)),
         ),
       ]);
@@ -405,6 +703,13 @@ void main() {
       expect(record.deletions, 1);
       expect(initial, 2);
       expect(refreshes, 1);
+      expect(record.revision, 2);
+      if (conformanceEnabled) {
+        expect(store.clearAttempts, hasLength(1));
+        expect(store.clearAttempts.single.callId, initiators.single);
+        expect(store.clearAttempts.single.expected, credentials());
+        expect(store.clearAttempts.single.removed, isTrue);
+      }
     },
   );
 
@@ -438,13 +743,14 @@ void main() {
             await reply(request, {'error': 'invalid_token'}, status: 401);
           }
         });
-        final store = MemorySessionStore(
-          peer.origin,
-          'cas-race-$succeeds',
-          record,
+        final store = RecordingSessionStore(
+          MemorySessionStore(peer.origin, 'cas-race-$succeeds', record),
         );
         final outcome = expectLater(
-          peer.transport().withSession(store).invoke('thing.write', {}),
+          withConformanceCall(
+            conformanceCall('replace', 'thing.write', Observer()),
+            () => peer.transport().withSession(store).invoke('thing.write', {}),
+          ),
           throwsA(
             succeeds
                 ? clientFailure('session_changed')
@@ -459,6 +765,13 @@ void main() {
         expect(record.replacements, 0);
         expect(record.deletions, 0);
         expect(business, 1);
+        expect(record.snapshot, (value: replacement, revision: 2));
+        if (conformanceEnabled && !succeeds) {
+          expect(store.clearAttempts, hasLength(1));
+          expect(store.clearAttempts.single.callId, 'replace');
+          expect(store.clearAttempts.single.expected, credentials());
+          expect(store.clearAttempts.single.removed, isFalse);
+        }
       },
     );
   }
@@ -603,14 +916,72 @@ void main() {
           'malformed' => clientFailure('invalid_response', status: 200),
           _ => operationFailure('operation_failed', 500),
         };
+        final refreshEvents = <String, ConformanceRefreshEvent>{};
+        final httpEvents = <String, List<ConformanceHttpEvent>>{};
+        final observer = Observer(
+          onRecord: (event) {
+            final id = currentConformanceCall!.callId;
+            if (event is ConformanceRefreshEvent) refreshEvents[id] = event;
+            if (event is ConformanceHttpEvent) {
+              (httpEvents[id] ??= []).add(event);
+            }
+          },
+        );
         await Future.wait([
-          expectLater(first.invoke('thing.write', {}), throwsA(failure)),
-          expectLater(second.invoke('thing.write', {}), throwsA(failure)),
+          expectLater(
+            withConformanceCall(
+              conformanceCall('first', 'thing.write', observer),
+              () => first.invoke('thing.write', {}),
+            ),
+            throwsA(failure),
+          ),
+          expectLater(
+            withConformanceCall(
+              conformanceCall('second', 'thing.write', observer),
+              () => second.invoke('thing.write', {}),
+            ),
+            throwsA(failure),
+          ),
         ]);
         expect(business, 2);
         expect(refreshes, 1);
         expect(record.value == credentials(), isTrue);
         expect(record.deletions, 0);
+        if (conformanceEnabled) {
+          expect(refreshEvents.keys, unorderedEquals(['first', 'second']));
+          expect(
+            identical(
+              refreshEvents['first']!.flight,
+              refreshEvents['second']!.flight,
+            ),
+            isTrue,
+          );
+          final expectedStatus = switch (kind) {
+            'oversized' || 'malformed' => 200,
+            'server' => 500,
+            _ => null,
+          };
+          expect(
+            refreshEvents.values.map((event) => event.status),
+            everyElement(expectedStatus),
+          );
+          final worker = httpEvents.values
+              .expand((events) => events)
+              .where((event) => event.operation == 'auth.refresh')
+              .toList();
+          expect(worker.first.phase, ConformancePhase.sending);
+          expect(
+            worker.last.phase,
+            kind == 'storage'
+                ? ConformancePhase.completed
+                : ConformancePhase.failed,
+          );
+          expect(worker.last.status, kind == 'storage' ? 200 : expectedStatus);
+          expect(
+            worker.last.bodyComplete,
+            ['storage', 'malformed', 'server'].contains(kind),
+          );
+        }
         await expectLater(
           second.invoke('thing.write', {}),
           throwsA(operationFailure('invalid_token', 401)),
@@ -781,5 +1152,24 @@ void main() {
         expect(record.deletions, newLogin ? 0 : 1);
       },
     );
+  }
+}
+
+class FaultyStore extends MemorySessionStore {
+  FaultyStore(Record record, this.fails)
+    : super('http://127.0.0.1', 'faulty', record);
+  final bool fails;
+  final failure = StateError('delegate');
+  final arguments = <(SessionCredentials, SessionCredentials?)>[];
+  @override
+  Future<bool> compareAndSet(
+    SessionCredentials expected,
+    SessionCredentials? next,
+  ) async {
+    arguments.add((expected, next));
+    if (fails) throw failure;
+    // Use a broken store deliberately to detect policy changes in the decorator.
+    record.value = next;
+    return true;
   }
 }

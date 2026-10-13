@@ -10,6 +10,7 @@ import 'http_client_stub.dart'
     as platform;
 import 'origin.dart';
 import 'session.dart';
+import 'testing/conformance.dart';
 
 /// ClientTransport is the generated client's operation boundary.
 abstract interface class ClientTransport {
@@ -87,6 +88,13 @@ final class HttpTransport implements ClientTransport {
 
   @override
   Future<Object?> invoke(String operation, Map<String, Object?> input) async {
+    if (conformanceEnabled) {
+      final barrier = currentConformanceCall?.arrive(
+        ConformancePoint.sdkEntered,
+        ConformanceFacts(operation: operation),
+      );
+      if (barrier != null) await barrier;
+    }
     if (!platform.isNative) {
       throw const ClientException('unsupported_platform');
     }
@@ -116,6 +124,20 @@ final class HttpTransport implements ClientTransport {
     try {
       return await _send(operation, body, token);
     } on OperationError catch (error) {
+      if (conformanceEnabled) {
+        final call = currentConformanceCall;
+        final barrier = call?.arrive(
+          ConformancePoint.originalsRejected,
+          ConformanceFacts(
+            operation: operation,
+            credentials: credentials,
+            attempt: call.httpAttempts,
+            code: error.code,
+            status: error.status,
+          ),
+        );
+        if (barrier != null) await barrier;
+      }
       if (operation == 'auth.refresh' ||
           store == null ||
           credentials == null ||
@@ -163,6 +185,14 @@ final class HttpTransport implements ClientTransport {
     final key = (origin, store.coordinationKey);
     final existing = _refreshes[key];
     if (existing != null && existing.expected == expected) {
+      if (conformanceEnabled) {
+        return observeRefresh(
+          existing.result.future,
+          existing,
+          expected,
+          initiator: false,
+        );
+      }
       return existing.result.future;
     }
     final flight = _RefreshFlight(expected);
@@ -176,6 +206,14 @@ final class HttpTransport implements ClientTransport {
         if (identical(_refreshes[key], flight)) _refreshes.remove(key);
       }
     }());
+    if (conformanceEnabled) {
+      return observeRefresh(
+        flight.result.future,
+        flight,
+        expected,
+        initiator: true,
+      );
+    }
     return flight.result.future;
   }
 
@@ -231,6 +269,7 @@ final class HttpTransport implements ClientTransport {
   }
 
   Future<Object?> _send(String operation, List<int> body, String? token) async {
+    if (conformanceEnabled) observeHttp(operation);
     final abort = Completer<void>();
     var timedOut = false;
     final timer = Timer(timeout, () {
@@ -250,6 +289,12 @@ final class HttpTransport implements ClientTransport {
             ..headers['content-type'] = 'application/json'
             ..bodyBytes = body;
       if (token != null) request.headers['authorization'] = 'Bearer $token';
+      if (conformanceEnabled) {
+        currentConformanceCall?.httpObservation?.record(
+          ConformancePhase.sending,
+          null,
+        );
+      }
       // IOClient attaches abort only after opening the connection.
       final response = await _client
           .send(request)
@@ -261,6 +306,12 @@ final class HttpTransport implements ClientTransport {
             },
           );
       status = response.statusCode;
+      if (conformanceEnabled) {
+        currentConformanceCall?.httpObservation?.record(
+          ConformancePhase.response,
+          status,
+        );
+      }
       if (status >= 300 && status < 400) {
         if (!abort.isCompleted) abort.complete();
         await response.stream.listen(null).cancel();
@@ -274,6 +325,12 @@ final class HttpTransport implements ClientTransport {
         }
         bytes.add(chunk);
       }
+      if (conformanceEnabled) {
+        currentConformanceCall?.httpObservation?.record(
+          ConformancePhase.bodyComplete,
+          status,
+        );
+      }
       final Object? value = jsonDecode(utf8.decode(bytes.takeBytes()));
       if (status < 200 || status >= 300) {
         final code = value is Map<String, Object?> ? value['error'] : null;
@@ -284,6 +341,9 @@ final class HttpTransport implements ClientTransport {
       }
       if (value is! Map<String, Object?>) {
         throw ClientException('invalid_response', status: status);
+      }
+      if (conformanceEnabled) {
+        currentConformanceCall?.httpObservation?.completed = true;
       }
       return value;
     } on OperationError {
@@ -299,6 +359,9 @@ final class HttpTransport implements ClientTransport {
       );
     } finally {
       timer.cancel();
+      if (conformanceEnabled) {
+        currentConformanceCall?.httpObservation?.finish(status);
+      }
     }
   }
 }

@@ -4,6 +4,32 @@ import 'dart:io';
 
 import 'package:chickinfry/chickinfry.dart';
 import 'package:test/test.dart';
+import 'package:chickinfry/src/testing/conformance.dart';
+
+export 'package:chickinfry/src/testing/session_store.dart';
+
+class Observer implements ConformanceObserver {
+  Observer({this.onArrive, this.onRecord});
+  final Future<void>? Function(ConformancePoint, ConformanceFacts)? onArrive;
+  final void Function(ConformanceEvent)? onRecord;
+  @override
+  Future<void>? arrive(ConformancePoint point, ConformanceFacts facts) =>
+      onArrive?.call(point, facts);
+  @override
+  void record(ConformanceEvent event) => onRecord?.call(event);
+}
+
+ConformanceCall conformanceCall(
+  String id,
+  String operation,
+  Observer observer,
+) => ConformanceCall(
+  runId: 'run',
+  caseId: 'case',
+  callId: id,
+  operation: operation,
+  observer: observer,
+);
 
 const accessToken = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
 const refreshToken = 'BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
@@ -69,50 +95,5 @@ class Peer {
     final result = HttpTransport(origin, timeout: timeout);
     addTearDown(result.close);
     return result;
-  }
-}
-
-class Record {
-  Record(this.value);
-  SessionCredentials? value;
-  bool failRead = false;
-  bool corrupt = false;
-  bool failReplace = false;
-  int replacements = 0;
-  int deletions = 0;
-}
-
-class MemorySessionStore implements SessionStore {
-  MemorySessionStore(this.origin, this.coordinationKey, this.record);
-  @override
-  final String origin;
-  @override
-  final String coordinationKey;
-  final Record record;
-
-  @override
-  Future<SessionCredentials?> read() async {
-    if (record.corrupt) throw const ClientException('invalid_session_record');
-    if (record.failRead) throw StateError('Private storage failure.');
-    return record.value;
-  }
-
-  @override
-  Future<void> write(SessionCredentials value) async {
-    record.value = value;
-  }
-
-  @override
-  Future<bool> compareAndSet(
-    SessionCredentials expected,
-    SessionCredentials? next,
-  ) async {
-    if (record.failReplace) throw StateError('Private storage failure.');
-    // No await may separate comparison and mutation of the shared record.
-    if (record.value != expected) return false;
-    record.value = next;
-    record.replacements++;
-    if (next == null) record.deletions++;
-    return true;
   }
 }
