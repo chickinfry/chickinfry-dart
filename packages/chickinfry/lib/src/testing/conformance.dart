@@ -12,6 +12,16 @@ enum ConformancePoint { sdkEntered, originalsRejected, refreshJoined }
 
 enum ConformancePhase { sending, response, bodyComplete, completed, failed }
 
+enum ConformanceTransportPhase {
+  headers,
+  read,
+  limit,
+  cancelRequested,
+  cancelObserved,
+  readerClosed,
+  completed,
+}
+
 abstract interface class ConformanceObserver {
   /// Returns null for unarmed barriers to avoid asynchronous waiting.
   Future<void>? arrive(ConformancePoint point, ConformanceFacts facts);
@@ -40,6 +50,41 @@ final class ConformanceFacts {
 
 abstract class ConformanceEvent {}
 
+final class ConformanceConstruction extends ConformanceEvent {
+  int httpSends = 0;
+  int socketEntries = 0;
+  bool succeeded = false;
+  bool _active = true;
+  int get networkEntries => httpSends + socketEntries;
+
+  void enterHttpSend() {
+    if (_active) httpSends++;
+  }
+
+  void enterSocket() {
+    if (_active) socketEntries++;
+  }
+}
+
+ConformanceConstruction? get currentConformanceConstruction =>
+    Zone.current[#chickinfryConformanceConstruction]
+        as ConformanceConstruction?;
+
+R observeConstruction<R>(R Function() body) {
+  final observation = ConformanceConstruction();
+  try {
+    final result = runZoned(
+      body,
+      zoneValues: {#chickinfryConformanceConstruction: observation},
+    );
+    observation.succeeded = true;
+    return result;
+  } finally {
+    observation._active = false;
+    currentConformanceCall?.record(observation);
+  }
+}
+
 final class ConformanceHttpEvent extends ConformanceEvent {
   ConformanceHttpEvent(
     this.attempt,
@@ -63,8 +108,81 @@ final class ConformanceHttpAttempt {
   final int attempt;
   bool bodyComplete = false;
   bool completed = false;
+  int? socketBytesWritten;
+  int? pendingSocketBytes;
+  bool responseConfirmed = false;
+  int? status;
+  int readBytes = 0;
+  int runtimeRetainedBytes = 0;
+  int runtimePeakRetainedBytes = 0;
+  // Private parser and response queue occupancy and fixed bounds remain unobserved.
+  int? libraryRetainedBytes;
+  int? peakRetainedBytes;
+  bool? cancelObserved;
+  bool? readerClosed;
+  bool readerStarted = false;
+  bool cancelRequested = false;
+  int _chunks = 0;
+
+  bool? get outcomeUnknown => responseConfirmed
+      ? false
+      : socketBytesWritten == null
+      ? null
+      : socketBytesWritten! > 0;
+
+  void transport(ConformanceTransportPhase phase) {
+    if (runtimeRetainedBytes > runtimePeakRetainedBytes) {
+      runtimePeakRetainedBytes = runtimeRetainedBytes;
+    }
+    final library = libraryRetainedBytes;
+    final retained = library == null ? null : runtimeRetainedBytes + library;
+    if (retained != null &&
+        (peakRetainedBytes == null || retained > peakRetainedBytes!)) {
+      peakRetainedBytes = retained;
+    }
+    call.recordTransport(phase, this);
+  }
+
+  void read(int count) {
+    readBytes += count;
+    transport(ConformanceTransportPhase.read);
+  }
+
+  void retain(int count) {
+    _chunks++;
+    runtimeRetainedBytes += count;
+    if (runtimeRetainedBytes > runtimePeakRetainedBytes) {
+      runtimePeakRetainedBytes = runtimeRetainedBytes;
+    }
+  }
+
+  void materializeBody() {
+    // BytesBuilder(copy: false) copies the body only when joining multiple chunks.
+    if (_chunks > 1 && runtimeRetainedBytes * 2 > runtimePeakRetainedBytes) {
+      runtimePeakRetainedBytes = runtimeRetainedBytes * 2;
+    }
+  }
+
+  void requestCancel() {
+    if (cancelRequested) return;
+    cancelRequested = true;
+    transport(ConformanceTransportPhase.cancelRequested);
+  }
+
+  void observeCancel() {
+    if (!cancelRequested || cancelObserved == true) return;
+    cancelObserved = true;
+    transport(ConformanceTransportPhase.cancelObserved);
+  }
+
+  void closeReader() {
+    if (readerClosed == true) return;
+    readerClosed = true;
+    transport(ConformanceTransportPhase.readerClosed);
+  }
 
   void record(ConformancePhase phase, int? status) {
+    this.status = status;
     if (phase == ConformancePhase.bodyComplete) bodyComplete = true;
     call.record(
       ConformanceHttpEvent(attempt, operation, phase, status, bodyComplete),
@@ -77,6 +195,35 @@ final class ConformanceHttpAttempt {
   );
 }
 
+int _transportSequence = 0;
+
+final class ConformanceTransportEvent extends ConformanceEvent {
+  ConformanceTransportEvent(
+    this.attempt,
+    this.phase,
+    this.sequence,
+    this.elapsedMs,
+    this.status,
+    this.readBytes,
+    this.runtimeRetainedBytes,
+    this.libraryRetainedBytes,
+    this.retainedBytes,
+    this.peakRetainedBytes,
+    this.runtimePeakRetainedBytes,
+  );
+  final ConformanceHttpAttempt? attempt;
+  final ConformanceTransportPhase phase;
+  final int sequence;
+  final double elapsedMs;
+  final int? status;
+  final int? readBytes;
+  final int? runtimeRetainedBytes;
+  final int? libraryRetainedBytes;
+  final int? retainedBytes;
+  final int? peakRetainedBytes;
+  final int? runtimePeakRetainedBytes;
+}
+
 void observeHttp(String operation) {
   final call = currentConformanceCall;
   if (call != null) {
@@ -85,10 +232,36 @@ void observeHttp(String operation) {
 }
 
 final class ConformanceRefreshEvent extends ConformanceEvent {
-  ConformanceRefreshEvent(this.flight, this.code, this.status);
+  ConformanceRefreshEvent(
+    this.flight,
+    this.code,
+    this.status, [
+    this.observation,
+  ]);
   final Object flight;
   final String? code;
   final int? status;
+  final ConformanceRefreshObservation? observation;
+}
+
+final class ConformanceRefreshObservation {
+  ConformanceHttpAttempt? attempt;
+  bool credentialsValidated = false;
+  bool credentialsStored = false;
+  bool rejected401 = false;
+  bool? get outcomeUnknown => credentialsStored || rejected401
+      ? false
+      : attempt?.socketBytesWritten == null
+      ? null
+      : attempt!.socketBytesWritten! > 0;
+}
+
+final _refreshObservations = Expando<ConformanceRefreshObservation>();
+
+void startRefreshObservation(Object flight) {
+  final observation = ConformanceRefreshObservation();
+  _refreshObservations[flight] = observation;
+  currentConformanceCall?.refreshObservation = observation;
 }
 
 final class ConformanceCall {
@@ -107,6 +280,44 @@ final class ConformanceCall {
   bool instrumentationFailed = false;
   int httpAttempts = 0;
   ConformanceHttpAttempt? httpObservation;
+  ConformanceRefreshObservation? refreshObservation;
+  final elapsed = Stopwatch();
+  final transportEvents = <ConformanceTransportEvent>[];
+  bool _completed = false;
+
+  void recordTransport(
+    ConformanceTransportPhase phase,
+    ConformanceHttpAttempt? attempt,
+  ) {
+    final runtime = attempt?.runtimeRetainedBytes;
+    final library = attempt?.libraryRetainedBytes;
+    final event = ConformanceTransportEvent(
+      attempt,
+      phase,
+      ++_transportSequence,
+      elapsed.elapsedMicroseconds / 1000,
+      attempt?.status,
+      attempt?.readBytes,
+      runtime,
+      library,
+      runtime == null || library == null ? null : runtime + library,
+      attempt?.peakRetainedBytes,
+      attempt?.runtimePeakRetainedBytes,
+    );
+    transportEvents.add(event);
+    record(event);
+  }
+
+  void complete({required bool succeeded}) {
+    if (_completed) return;
+    _completed = true;
+    final attempt = httpObservation;
+    final status = attempt?.status;
+    if (succeeded && status != null && status >= 200 && status < 300) {
+      attempt!.responseConfirmed = true;
+    }
+    recordTransport(ConformanceTransportPhase.completed, attempt);
+  }
 
   Future<void>? arrive(ConformancePoint point, ConformanceFacts facts) {
     try {
@@ -139,7 +350,20 @@ ConformanceCall? get currentConformanceCall => conformanceEnabled
 
 R withConformanceCall<R>(ConformanceCall call, R Function() body) =>
     conformanceEnabled
-    ? runZoned(body, zoneValues: {#chickinfryConformanceCall: call})
+    ? runZoned(() {
+        final result = body();
+        if (result is Future) {
+          unawaited(
+            result.then<void>(
+              (_) => call.complete(succeeded: true),
+              onError: (Object _, StackTrace __) {
+                call.complete(succeeded: false);
+              },
+            ),
+          );
+        }
+        return result;
+      }, zoneValues: {#chickinfryConformanceCall: call})
     : body();
 
 Future<SessionCredentials> observeRefresh(
@@ -180,6 +404,7 @@ Future<SessionCredentials> observeRefresh(
             : error is ClientException
             ? error.status
             : null,
+        _refreshObservations[flight],
       ),
     );
     if (error != null) Error.throwWithStackTrace(error, stack!);

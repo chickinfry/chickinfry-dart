@@ -6,6 +6,8 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 import 'package:http/io_client.dart';
 
+import 'testing/conformance.dart';
+
 const isNative = true;
 final _abortKey = Object();
 
@@ -20,12 +22,17 @@ class _NativeClient extends IOClient {
       );
 
   @override
-  Future<IOStreamedResponse> send(http.BaseRequest request) => runZoned(
-    () => super.send(request),
-    zoneValues: {
-      _abortKey: request is http.Abortable ? request.abortTrigger : null,
-    },
-  );
+  Future<IOStreamedResponse> send(http.BaseRequest request) {
+    if (conformanceEnabled) {
+      currentConformanceConstruction?.enterHttpSend();
+    }
+    return runZoned(
+      () => super.send(request),
+      zoneValues: {
+        _abortKey: request is http.Abortable ? request.abortTrigger : null,
+      },
+    );
+  }
 }
 
 Future<ConnectionTask<Socket>> _connect(
@@ -33,11 +40,30 @@ Future<ConnectionTask<Socket>> _connect(
   String? proxyHost,
   int? proxyPort,
 ) async {
+  if (conformanceEnabled) {
+    currentConformanceConstruction?.enterSocket();
+  }
   if (proxyHost != null) {
+    if (conformanceEnabled) {
+      currentConformanceCall?.httpObservation?.socketBytesWritten = null;
+    }
     // shortcut: SDK owns proxy CONNECT/TLS cancellation; revisit for prompt proxy socket closure.
     return Socket.startConnect(proxyHost, proxyPort!);
   }
-  if (url.scheme != 'https') return Socket.startConnect(url.host, url.port);
+  if (url.scheme != 'https') {
+    if (conformanceEnabled) {
+      currentConformanceCall?.httpObservation?.socketBytesWritten = 0;
+      final pending = await RawSocket.startConnect(url.host, url.port);
+      return ConnectionTask.fromSocket(
+        pending.socket.then<Socket>((raw) => _TlsSocket(_PlainRawSocket(raw))),
+        pending.cancel,
+      );
+    }
+    return Socket.startConnect(url.host, url.port);
+  }
+  if (conformanceEnabled) {
+    currentConformanceCall?.httpObservation?.socketBytesWritten = 0;
+  }
   final abort = Zone.current[_abortKey] as Future<void>?;
   ConnectionTask<RawSocket>? pending;
   RawSocket? raw;
@@ -78,6 +104,60 @@ Future<ConnectionTask<Socket>> _connect(
 }
 
 // HttpClient retains HTTP parsing; this adapter only bridges raw TLS to Socket.
+// Observe plaintext writes through the same bridge while preserving off-mode TLS types and AOT layout.
+class _PlainRawSocket implements RawSecureSocket {
+  _PlainRawSocket(this.raw);
+  final RawSocket raw;
+  @override
+  Uint8List? read([int? len]) => raw.read(len);
+  @override
+  int write(List<int> buffer, [int offset = 0, int? count]) =>
+      raw.write(buffer, offset, count);
+  @override
+  bool get readEventsEnabled => raw.readEventsEnabled;
+  @override
+  set readEventsEnabled(bool value) => raw.readEventsEnabled = value;
+  @override
+  bool get writeEventsEnabled => raw.writeEventsEnabled;
+  @override
+  set writeEventsEnabled(bool value) => raw.writeEventsEnabled = value;
+  @override
+  StreamSubscription<RawSocketEvent> listen(
+    void Function(RawSocketEvent)? onData, {
+    Function? onError,
+    void Function()? onDone,
+    bool? cancelOnError,
+  }) => raw.listen(
+    onData,
+    onError: onError,
+    onDone: onDone,
+    cancelOnError: cancelOnError,
+  );
+  @override
+  Future<RawSocket> close() => raw.close();
+  @override
+  void shutdown(SocketDirection direction) => raw.shutdown(direction);
+  @override
+  InternetAddress get address => raw.address;
+  @override
+  InternetAddress get remoteAddress => raw.remoteAddress;
+  @override
+  int get port => raw.port;
+  @override
+  int get remotePort => raw.remotePort;
+  @override
+  bool setOption(SocketOption option, bool enabled) =>
+      raw.setOption(option, enabled);
+  @override
+  Uint8List getRawOption(RawSocketOption option) => raw.getRawOption(option);
+  @override
+  void setRawOption(RawSocketOption option) => raw.setRawOption(option);
+  @override
+  dynamic noSuchMethod(Invocation invocation) => throw UnsupportedError(
+    'Secure socket operations are unavailable on plaintext connections.',
+  );
+}
+
 class _TlsSocket extends Stream<Uint8List> implements Socket {
   _TlsSocket(this._raw) {
     _input = StreamController<Uint8List>(
@@ -138,7 +218,12 @@ class _TlsSocket extends Stream<Uint8List> implements Socket {
     if (_destroyed) return;
     _destroyed = true;
     _writer.fail();
-    unawaited(_raw.close());
+    if (conformanceEnabled) {
+      final observation = _writer.observation;
+      unawaited(_raw.close().then((_) => observation?.observeCancel()));
+    } else {
+      unawaited(_raw.close());
+    }
     unawaited(_input.close());
   }
 
@@ -162,12 +247,26 @@ class _TlsSocket extends Stream<Uint8List> implements Socket {
   @override
   set encoding(Encoding value) => _sink.encoding = value;
   @override
-  void add(List<int> data) => _sink.add(data);
+  void add(List<int> data) {
+    if (conformanceEnabled) {
+      _writer.observation = currentConformanceCall?.httpObservation;
+      _writer.observation?.socketBytesWritten ??= 0;
+    }
+    _sink.add(data);
+  }
+
   @override
   void addError(Object error, [StackTrace? stackTrace]) =>
       throw UnsupportedError('Socket.addError is unsupported.');
   @override
-  Future<void> addStream(Stream<List<int>> stream) => _sink.addStream(stream);
+  Future<void> addStream(Stream<List<int>> stream) {
+    if (conformanceEnabled) {
+      _writer.observation = currentConformanceCall?.httpObservation;
+      _writer.observation?.socketBytesWritten ??= 0;
+    }
+    return _sink.addStream(stream);
+  }
+
   @override
   void write(Object? object) => _sink.write(object);
   @override
@@ -193,6 +292,7 @@ class _TlsSocket extends Stream<Uint8List> implements Socket {
 class _TlsWriter implements StreamConsumer<List<int>> {
   _TlsWriter(this.raw);
   final RawSecureSocket raw;
+  ConformanceHttpAttempt? observation;
   Completer<void>? _ready;
   var _failed = false;
 
@@ -213,10 +313,24 @@ class _TlsWriter implements StreamConsumer<List<int>> {
   @override
   Future<void> addStream(Stream<List<int>> stream) async {
     await for (final bytes in stream) {
+      if (conformanceEnabled) {
+        observation?.pendingSocketBytes = bytes.length;
+      }
       var offset = 0;
       while (offset < bytes.length) {
         if (_failed) throw const SocketException('Connection closed.');
-        offset += raw.write(bytes, offset);
+        if (conformanceEnabled) {
+          final written = raw.write(bytes, offset);
+          offset += written;
+          final attempt = observation;
+          if (attempt != null) {
+            attempt.socketBytesWritten =
+                (attempt.socketBytesWritten ?? 0) + written;
+            attempt.pendingSocketBytes = bytes.length - offset;
+          }
+        } else {
+          offset += raw.write(bytes, offset);
+        }
         if (offset < bytes.length) {
           final ready = _ready = Completer<void>();
           raw.writeEventsEnabled = true;

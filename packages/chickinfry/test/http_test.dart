@@ -3,6 +3,9 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:chickinfry/chickinfry.dart';
+import 'package:chickinfry/src/http_client_io.dart' as native;
+import 'package:chickinfry/src/testing/conformance.dart';
+import 'package:http/http.dart' as http;
 import 'package:test/test.dart';
 
 import 'support.dart';
@@ -53,13 +56,23 @@ void main() {
   });
 
   test('C-02 origin validation and normalization', () {
+    final constructions = <ConformanceConstruction>[];
+    final call = conformanceCall(
+      'constructor',
+      'client.create',
+      Observer(
+        onRecord: (event) {
+          if (event is ConformanceConstruction) constructions.add(event);
+        },
+      ),
+    );
     for (final origin in [
       'https://EXAMPLE.COM:443/',
       'http://127.0.0.1:1234/',
       'http://127.255.255.255',
       'http://[::1]:1234',
     ]) {
-      final transport = HttpTransport(origin);
+      final transport = withConformanceCall(call, () => HttpTransport(origin));
       transport.close();
     }
     final transport = HttpTransport('https://EXAMPLE.COM:443/');
@@ -96,7 +109,7 @@ void main() {
       'not a URL',
     ]) {
       expect(
-        () => HttpTransport(origin),
+        () => withConformanceCall(call, () => HttpTransport(origin)),
         throwsA(clientFailure('invalid_origin')),
         reason: 'Must reject the invalid origin $origin.',
       );
@@ -115,7 +128,246 @@ void main() {
       () => HttpTransport('https://example.com', timeout: Duration.zero),
       throwsArgumentError,
     );
+    if (conformanceEnabled) {
+      expect(constructions.where((event) => event.succeeded), isNotEmpty);
+      expect(constructions.where((event) => !event.succeeded), isNotEmpty);
+      expect(
+        constructions.map((event) => event.networkEntries),
+        everyElement(0),
+      );
+    } else {
+      expect(constructions, isEmpty);
+    }
   });
+
+  if (conformanceEnabled) {
+    test(
+      'RT-2 separates connection refusal, actual writes and lost response',
+      () async {
+        final portProbe = await ServerSocket.bind(
+          InternetAddress.loopbackIPv4,
+          0,
+        );
+        final unusedPort = portProbe.port;
+        await portProbe.close();
+        final refused = HttpTransport('http://127.0.0.1:$unusedPort');
+        addTearDown(refused.close);
+        final beforeSend = conformanceCall(
+          'before-send',
+          'thing.write',
+          Observer(),
+        );
+        await expectLater(
+          withConformanceCall(
+            beforeSend,
+            () => refused.invoke('thing.write', {}),
+          ),
+          throwsA(clientFailure('network_error')),
+        );
+        expect(beforeSend.httpObservation!.socketBytesWritten, 0);
+        expect(beforeSend.httpObservation!.outcomeUnknown, isFalse);
+        expect(beforeSend.httpObservation!.cancelObserved, isNull);
+
+        final server = await RawServerSocket.bind(
+          InternetAddress.loopbackIPv4,
+          0,
+        );
+        addTearDown(server.close);
+        var received = 0;
+        server.listen((socket) {
+          addTearDown(socket.close);
+          socket.listen((event) {
+            if (event == RawSocketEvent.read) {
+              received += socket.read(1)?.length ?? 0;
+              unawaited(socket.close());
+            }
+          });
+        });
+        final dropped = HttpTransport('http://127.0.0.1:${server.port}');
+        addTearDown(dropped.close);
+        final sent = conformanceCall('partial-send', 'thing.write', Observer());
+        await expectLater(
+          withConformanceCall(
+            sent,
+            () => dropped.invoke('thing.write', {
+              'data': 'x' * (4 * 1024 * 1024 - 512),
+            }),
+          ),
+          throwsA(clientFailure('network_error')),
+        );
+        expect(received, greaterThan(0));
+        expect(sent.httpObservation!.socketBytesWritten, greaterThan(0));
+        expect(sent.httpObservation!.pendingSocketBytes, greaterThan(0));
+        expect(sent.httpObservation!.responseConfirmed, isFalse);
+        expect(sent.httpObservation!.outcomeUnknown, isTrue);
+
+        final peer = await Peer.start((request) async {
+          await request.drain<void>();
+          await reply(request, {});
+        });
+        final transport = peer.transport();
+        final invalid = conformanceCall(
+          'invalid-model',
+          'thing.write',
+          Observer(),
+        );
+        await expectLater(
+          withConformanceCall(invalid, () async {
+            final value = await transport.invoke('thing.write', {});
+            if (value is! Map<String, Object?> || value['id'] is! String) {
+              throw const ClientException('invalid_response');
+            }
+            return value['id'];
+          }),
+          throwsA(clientFailure('invalid_response')),
+        );
+        expect(peer.requests, 1);
+        expect(invalid.httpObservation!.status, 200);
+        expect(invalid.httpObservation!.bodyComplete, isTrue);
+        expect(invalid.httpObservation!.socketBytesWritten, greaterThan(0));
+        expect(invalid.httpObservation!.responseConfirmed, isFalse);
+        expect(invalid.httpObservation!.outcomeUnknown, isTrue);
+        expect(
+          invalid.transportEvents.where(
+            (event) => event.phase == ConformanceTransportPhase.completed,
+          ),
+          hasLength(1),
+        );
+      },
+    );
+
+    test('RT-3 observes live bytes, copy peak and generated-call completion', () async {
+      final release = Completer<void>();
+      final read = Completer<void>();
+      final readerClosed = Completer<void>();
+      addTearDown(() {
+        if (!release.isCompleted) release.complete();
+      });
+      final head = utf8.encode('{"value":"first');
+      final tail = utf8.encode('second"}');
+      final peer = await Peer.start((request) async {
+        await request.drain<void>();
+        final socket = await request.response.detachSocket(writeHeaders: false);
+        addTearDown(socket.destroy);
+        socket.add(
+          utf8.encode(
+            'HTTP/1.1 200 OK\r\nContent-Length: ${head.length + tail.length}\r\n\r\n',
+          ),
+        );
+        socket.add(head);
+        await socket.flush();
+        await release.future;
+        socket.add(tail);
+        await socket.close();
+      });
+      final transport = peer.transport();
+      final call = conformanceCall(
+        'live-reader',
+        'thing.get',
+        Observer(
+          onRecord: (event) {
+            if (event is ConformanceTransportEvent &&
+                event.phase == ConformanceTransportPhase.read &&
+                !read.isCompleted) {
+              read.complete();
+            }
+            if (event is ConformanceTransportEvent &&
+                event.phase == ConformanceTransportPhase.readerClosed) {
+              readerClosed.complete();
+            }
+          },
+        ),
+      );
+      final sdkResult = Completer<void>();
+      final pending = withConformanceCall(call, () async {
+        final value = await transport.invoke('thing.get', {});
+        expect(value, {'value': 'firstsecond'});
+        await sdkResult.future;
+      });
+      await read.future;
+      expect(call.httpObservation!.readBytes, head.length);
+      expect(call.httpObservation!.runtimeRetainedBytes, head.length);
+      expect(call.transportEvents.last.runtimeRetainedBytes, 0);
+      expect(
+        call.transportEvents.every(
+          (event) =>
+              event.libraryRetainedBytes == null &&
+              event.retainedBytes == null &&
+              event.peakRetainedBytes == null,
+        ),
+        isTrue,
+      );
+      release.complete();
+      await readerClosed.future;
+      expect(call.httpObservation!.responseConfirmed, isFalse);
+      expect(call.httpObservation!.outcomeUnknown, isTrue);
+      expect(
+        call.transportEvents.any(
+          (event) => event.phase == ConformanceTransportPhase.completed,
+        ),
+        isFalse,
+      );
+      sdkResult.complete();
+      await pending;
+      expect(call.httpObservation!.readBytes, head.length + tail.length);
+      expect(
+        call.transportEvents.last.phase,
+        ConformanceTransportPhase.completed,
+      );
+      expect(call.transportEvents.last.runtimeRetainedBytes, 0);
+      expect(
+        call.transportEvents.last.runtimePeakRetainedBytes,
+        (head.length + tail.length) * 2,
+      );
+      expect(call.httpObservation!.responseConfirmed, isTrue);
+      expect(call.httpObservation!.outcomeUnknown, isFalse);
+      expect(call.httpObservation!.cancelObserved, isNull);
+      expect(
+        call.transportEvents.where(
+          (event) => event.phase == ConformanceTransportPhase.completed,
+        ),
+        hasLength(1),
+      );
+      for (var i = 1; i < call.transportEvents.length; i++) {
+        expect(
+          call.transportEvents[i].sequence,
+          greaterThan(call.transportEvents[i - 1].sequence),
+        );
+        expect(
+          call.transportEvents[i].elapsedMs,
+          greaterThanOrEqualTo(call.transportEvents[i - 1].elapsedMs),
+        );
+      }
+    });
+
+    test('RT-1 constructor monitor counts a real native HTTP send', () async {
+      final peer = await Peer.start((request) => reply(request, {}));
+      final client = native.createClient(const Duration(seconds: 2));
+      addTearDown(client.close);
+      final constructions = <ConformanceConstruction>[];
+      final call = conformanceCall(
+        'network-constructor',
+        'client.create',
+        Observer(
+          onRecord: (event) {
+            if (event is ConformanceConstruction) constructions.add(event);
+          },
+        ),
+      );
+      final response = await withConformanceCall(
+        call,
+        () => observeConstruction(
+          () => client.send(
+            http.Request('POST', Uri.parse('${peer.origin}/thing.get')),
+          ),
+        ),
+      );
+      await response.stream.drain<void>();
+      expect(peer.requests, 1);
+      expect(constructions.single.httpSends, 1);
+      expect(constructions.single.networkEntries, greaterThan(0));
+    });
+  }
 
   test(
     'C-07 bearer copies leave the original anonymous and share root lifetime',
@@ -606,29 +858,97 @@ void main() {
     );
   }
 
-  test('C-04 oversized unbounded stream aborts at the limit without waiting for EOF', () async {
-    final disconnected = Completer<void>();
-    final peer = await Peer.start((request) async {
-      await request.drain<void>();
-      final socket = await request.response.detachSocket(writeHeaders: false);
-      addTearDown(socket.destroy);
-      socket.listen(
-        (_) {},
-        onDone: () {
-          if (!disconnected.isCompleted) disconnected.complete();
-        },
-      );
-      socket.add(utf8.encode('HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n'));
-      socket.add(List.filled(1024 * 1024 + 1, 32));
-      await socket.flush();
-    });
-    await expectLater(
-      peer.transport().invoke('thing.get', {}),
-      throwsA(clientFailure('response_too_large', status: 200)),
+  for (final status in [200, 302, 503]) {
+    test(
+      'C-04 oversized unbounded $status stream aborts without waiting for EOF',
+      () async {
+        final disconnected = Completer<void>();
+        final peer = await Peer.start((request) async {
+          await request.drain<void>();
+          final socket = await request.response.detachSocket(
+            writeHeaders: false,
+          );
+          addTearDown(socket.destroy);
+          socket.listen(
+            (_) {},
+            onError: (Object error) {
+              expect(error, isA<SocketException>());
+              if (!disconnected.isCompleted) disconnected.complete();
+            },
+            onDone: () {
+              if (!disconnected.isCompleted) disconnected.complete();
+            },
+          );
+          socket.add(
+            utf8.encode('HTTP/1.1 $status Test\r\nConnection: close\r\n\r\n'),
+          );
+          socket.add(List.filled(1024 * 1024 + 1, 32));
+          try {
+            await socket.flush();
+          } on SocketException {
+            await disconnected.future;
+          }
+        });
+        final call = conformanceCall(
+          'oversized-$status',
+          'thing.get',
+          Observer(),
+        );
+        await expectLater(
+          withConformanceCall(
+            call,
+            () => peer.transport().invoke('thing.get', {}),
+          ),
+          throwsA(
+            status == 302
+                ? operationFailure('redirect_not_allowed', status)
+                : clientFailure('response_too_large', status: status),
+          ),
+        );
+        await disconnected.future.timeout(const Duration(seconds: 2));
+        expect(peer.requests, 1);
+        if (conformanceEnabled) {
+          final attempt = call.httpObservation!;
+          expect(attempt.cancelRequested, isTrue);
+          expect(attempt.cancelObserved, isTrue);
+          expect(attempt.readerClosed, isTrue);
+          expect(
+            attempt.readBytes,
+            status == 302 ? 0 : greaterThan(1024 * 1024),
+          );
+          expect(
+            attempt.runtimePeakRetainedBytes,
+            lessThanOrEqualTo(1024 * 1024),
+          );
+          expect(attempt.libraryRetainedBytes, isNull);
+          expect(attempt.peakRetainedBytes, isNull);
+          final phases = call.transportEvents
+              .map((event) => event.phase)
+              .toList();
+          expect(
+            phases,
+            containsAll([
+              ConformanceTransportPhase.headers,
+              ConformanceTransportPhase.cancelRequested,
+              ConformanceTransportPhase.cancelObserved,
+              ConformanceTransportPhase.readerClosed,
+              ConformanceTransportPhase.completed,
+            ]),
+          );
+          if (status != 302) {
+            final limit = phases.indexOf(ConformanceTransportPhase.limit);
+            expect(phases[limit - 1], ConformanceTransportPhase.read);
+            expect(
+              phases[limit + 1],
+              ConformanceTransportPhase.cancelRequested,
+            );
+          } else {
+            expect(phases, isNot(contains(ConformanceTransportPhase.read)));
+          }
+        }
+      },
     );
-    await disconnected.future.timeout(const Duration(seconds: 2));
-    expect(peer.requests, 1);
-  });
+  }
 
   test('C-05 committed write with lost response is never replayed', () async {
     var writes = 0;

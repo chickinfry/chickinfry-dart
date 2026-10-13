@@ -34,6 +34,11 @@ final class HttpTransport implements ClientTransport {
     String origin, {
     Duration timeout = const Duration(seconds: 30),
   }) {
+    if (conformanceEnabled &&
+        currentConformanceCall != null &&
+        currentConformanceConstruction == null) {
+      return observeConstruction(() => HttpTransport(origin, timeout: timeout));
+    }
     final normalized = normalizeOrigin(origin);
     if (timeout <= Duration.zero) {
       throw ArgumentError('Timeout must be positive.');
@@ -89,6 +94,7 @@ final class HttpTransport implements ClientTransport {
   @override
   Future<Object?> invoke(String operation, Map<String, Object?> input) async {
     if (conformanceEnabled) {
+      currentConformanceCall?.elapsed.start();
       final barrier = currentConformanceCall?.arrive(
         ConformancePoint.sdkEntered,
         ConformanceFacts(operation: operation),
@@ -197,6 +203,7 @@ final class HttpTransport implements ClientTransport {
     }
     final flight = _RefreshFlight(expected);
     _refreshes[key] = flight;
+    if (conformanceEnabled) startRefreshObservation(flight);
     unawaited(() async {
       try {
         flight.result.complete(await _runRefresh(store, expected));
@@ -249,14 +256,23 @@ final class HttpTransport implements ClientTransport {
       if (!_sameSession(refreshed, expected)) {
         throw const ClientException('invalid_response');
       }
+      if (conformanceEnabled) {
+        currentConformanceCall?.refreshObservation?.credentialsValidated = true;
+      }
       if (!await _replace(store, expected, refreshed)) {
         throw const ClientException('session_changed');
       }
       confirmed = true;
+      if (conformanceEnabled) {
+        currentConformanceCall?.refreshObservation?.credentialsStored = true;
+      }
       return refreshed;
     } on OperationError catch (error) {
       if (error.status == 401) {
         confirmed = true;
+        if (conformanceEnabled) {
+          currentConformanceCall?.refreshObservation?.rejected401 = true;
+        }
         await _replace(store, expected, null, failure: error);
       }
       rethrow;
@@ -270,10 +286,17 @@ final class HttpTransport implements ClientTransport {
 
   Future<Object?> _send(String operation, List<int> body, String? token) async {
     if (conformanceEnabled) observeHttp(operation);
+    if (conformanceEnabled && operation == 'auth.refresh') {
+      currentConformanceCall?.refreshObservation?.attempt =
+          currentConformanceCall?.httpObservation;
+    }
     final abort = Completer<void>();
     var timedOut = false;
     final timer = Timer(timeout, () {
       timedOut = true;
+      if (conformanceEnabled) {
+        currentConformanceCall?.httpObservation?.requestCancel();
+      }
       if (!abort.isCompleted) abort.complete();
     });
     int? status;
@@ -301,6 +324,9 @@ final class HttpTransport implements ClientTransport {
           .timeout(
             timeout,
             onTimeout: () {
+              if (conformanceEnabled) {
+                currentConformanceCall?.httpObservation?.requestCancel();
+              }
               if (!abort.isCompleted) abort.complete();
               throw const ClientException('request_timeout');
             },
@@ -311,19 +337,43 @@ final class HttpTransport implements ClientTransport {
           ConformancePhase.response,
           status,
         );
+        currentConformanceCall?.httpObservation?.transport(
+          ConformanceTransportPhase.headers,
+        );
       }
       if (status >= 300 && status < 400) {
+        if (conformanceEnabled) {
+          currentConformanceCall?.httpObservation?.requestCancel();
+        }
         if (!abort.isCompleted) abort.complete();
         await response.stream.listen(null).cancel();
+        if (conformanceEnabled) {
+          currentConformanceCall?.httpObservation?.closeReader();
+        }
         throw OperationError('redirect_not_allowed', status);
       }
       final bytes = BytesBuilder(copy: false);
+      if (conformanceEnabled) {
+        currentConformanceCall?.httpObservation?.readerStarted = true;
+      }
       await for (final chunk in response.stream) {
+        if (conformanceEnabled) {
+          currentConformanceCall?.httpObservation?.read(chunk.length);
+        }
         if (chunk.length > 1024 * 1024 - bytes.length) {
+          if (conformanceEnabled) {
+            currentConformanceCall?.httpObservation?.transport(
+              ConformanceTransportPhase.limit,
+            );
+            currentConformanceCall?.httpObservation?.requestCancel();
+          }
           if (!abort.isCompleted) abort.complete();
           throw ClientException('response_too_large', status: status);
         }
         bytes.add(chunk);
+        if (conformanceEnabled) {
+          currentConformanceCall?.httpObservation?.retain(chunk.length);
+        }
       }
       if (conformanceEnabled) {
         currentConformanceCall?.httpObservation?.record(
@@ -331,11 +381,17 @@ final class HttpTransport implements ClientTransport {
           status,
         );
       }
+      if (conformanceEnabled) {
+        currentConformanceCall?.httpObservation?.materializeBody();
+      }
       final Object? value = jsonDecode(utf8.decode(bytes.takeBytes()));
       if (status < 200 || status >= 300) {
         final code = value is Map<String, Object?> ? value['error'] : null;
         if (code is! String || !_errorPattern.hasMatch(code)) {
           throw ClientException('invalid_response', status: status);
+        }
+        if (conformanceEnabled) {
+          currentConformanceCall?.httpObservation?.responseConfirmed = true;
         }
         throw OperationError(code, status);
       }
@@ -360,6 +416,10 @@ final class HttpTransport implements ClientTransport {
     } finally {
       timer.cancel();
       if (conformanceEnabled) {
+        if (currentConformanceCall?.httpObservation?.readerStarted ?? false) {
+          currentConformanceCall?.httpObservation?.closeReader();
+        }
+        currentConformanceCall?.httpObservation?.runtimeRetainedBytes = 0;
         currentConformanceCall?.httpObservation?.finish(status);
       }
     }

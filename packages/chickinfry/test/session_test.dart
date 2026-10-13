@@ -84,7 +84,9 @@ void main() {
         expect(failureEvents, isEmpty);
         releaseFailure.complete();
         expect(await failed, same(error));
-        final observed = failureEvents.single as ConformanceRefreshEvent;
+        final observed = failureEvents
+            .whereType<ConformanceRefreshEvent>()
+            .single;
         expect(observed.flight, same(flight));
         expect(observed.code, 'request_timeout');
         expect(observed.status, isNull);
@@ -369,8 +371,14 @@ void main() {
         final transport = peer.transport().withSession(
           MemorySessionStore(peer.origin, 'read-failure', record),
         );
+        final events = <ConformanceEvent>[];
+        final call = conformanceCall(
+          'read-failure-$corrupt',
+          'thing.get',
+          Observer(onRecord: events.add),
+        );
         await expectLater(
-          transport.invoke('thing.get', {}),
+          withConformanceCall(call, () => transport.invoke('thing.get', {})),
           throwsA(
             clientFailure(
               corrupt ? 'invalid_session_record' : 'session_storage_error',
@@ -380,6 +388,26 @@ void main() {
         expect(peer.requests, 0);
         expect(record.value == credentials(), isTrue);
         expect(record.deletions, 0);
+        if (conformanceEnabled) {
+          expect(call.httpAttempts, 0);
+          expect(call.httpObservation, isNull);
+          expect(call.instrumentationFailed, isFalse);
+          expect(events.whereType<ConformanceHttpEvent>(), isEmpty);
+          expect(call.transportEvents, hasLength(1));
+          final completed = call.transportEvents.single;
+          expect(completed.phase, ConformanceTransportPhase.completed);
+          expect(completed.attempt, isNull);
+          expect(completed.status, isNull);
+          expect(completed.readBytes, isNull);
+          expect(completed.runtimeRetainedBytes, isNull);
+          expect(completed.libraryRetainedBytes, isNull);
+          expect(completed.retainedBytes, isNull);
+          expect(completed.peakRetainedBytes, isNull);
+          expect(completed.runtimePeakRetainedBytes, isNull);
+          expect(events.single, same(completed));
+        } else {
+          expect(events, isEmpty);
+        }
       },
     );
   }
@@ -399,6 +427,7 @@ void main() {
     final joined = Completer<void>();
     final releaseParticipants = Completer<void>();
     final workerCompleted = Completer<void>();
+    final refreshObservations = <ConformanceRefreshObservation>[];
     final observer = Observer(
       onArrive: (point, facts) {
         final call = currentConformanceCall!;
@@ -423,6 +452,9 @@ void main() {
         return null;
       },
       onRecord: (event) {
+        if (event is ConformanceRefreshEvent) {
+          refreshObservations.add(event.observation!);
+        }
         if (event is ConformanceHttpEvent) {
           (httpEvents[currentConformanceCall!.callId] ??= []).add(event);
           if (event.operation == 'auth.refresh' &&
@@ -539,6 +571,19 @@ void main() {
     expect(replays, 3);
     expect(record.replacements, 1);
     if (conformanceEnabled) {
+      expect(refreshObservations, isNotEmpty);
+      expect(
+        refreshObservations
+            .where((observation) => observation.attempt != null)
+            .every(
+              (observation) =>
+                  observation.credentialsValidated &&
+                  observation.credentialsStored &&
+                  !observation.rejected401 &&
+                  observation.outcomeUnknown == false,
+            ),
+        isTrue,
+      );
       expect(
         contexts.map((call) => call.instrumentationFailed),
         everyElement(isFalse),
@@ -675,7 +720,13 @@ void main() {
       final first = peer.transport().withSession(store);
       final second = peer.transport().withSession(store);
       final initiators = <String>[];
+      final refreshObservations = <ConformanceRefreshObservation>[];
       final observer = Observer(
+        onRecord: (event) {
+          if (event is ConformanceRefreshEvent) {
+            refreshObservations.add(event.observation!);
+          }
+        },
         onArrive: (point, facts) {
           if (point == ConformancePoint.refreshJoined && facts.initiator!) {
             initiators.add(currentConformanceCall!.callId);
@@ -705,6 +756,17 @@ void main() {
       expect(refreshes, 1);
       expect(record.revision, 2);
       if (conformanceEnabled) {
+        expect(refreshObservations, isNotEmpty);
+        expect(
+          refreshObservations.every(
+            (observation) =>
+                !observation.credentialsValidated &&
+                !observation.credentialsStored &&
+                observation.rejected401 &&
+                observation.outcomeUnknown == false,
+          ),
+          isTrue,
+        );
         expect(store.clearAttempts, hasLength(1));
         expect(store.clearAttempts.single.callId, initiators.single);
         expect(store.clearAttempts.single.expected, credentials());
@@ -846,6 +908,7 @@ void main() {
     'oversized',
     'malformed',
     'server',
+    'rate-limited',
   ]) {
     test(
       'C-08 uncertain refresh $kind is shared, retained and not sent again until new login',
@@ -874,6 +937,8 @@ void main() {
               await request.response.close();
             } else if (kind == 'server') {
               await reply(request, {'error': 'operation_failed'}, status: 500);
+            } else if (kind == 'rate-limited') {
+              await reply(request, {'error': 'rate_limited'}, status: 429);
             } else {
               final socket = await request.response.detachSocket(
                 writeHeaders: false,
@@ -914,6 +979,7 @@ void main() {
           'storage' => clientFailure('session_storage_error'),
           'oversized' => clientFailure('response_too_large', status: 200),
           'malformed' => clientFailure('invalid_response', status: 200),
+          'rate-limited' => operationFailure('rate_limited', 429),
           _ => operationFailure('operation_failed', 500),
         };
         final refreshEvents = <String, ConformanceRefreshEvent>{};
@@ -959,6 +1025,7 @@ void main() {
           final expectedStatus = switch (kind) {
             'oversized' || 'malformed' => 200,
             'server' => 500,
+            'rate-limited' => 429,
             _ => null,
           };
           expect(
@@ -979,14 +1046,37 @@ void main() {
           expect(worker.last.status, kind == 'storage' ? 200 : expectedStatus);
           expect(
             worker.last.bodyComplete,
-            ['storage', 'malformed', 'server'].contains(kind),
+            ['storage', 'malformed', 'server', 'rate-limited'].contains(kind),
           );
+          final observation = refreshEvents['first']!.observation!;
+          expect(
+            identical(observation, refreshEvents['second']!.observation),
+            isTrue,
+          );
+          expect(observation.credentialsValidated, kind == 'storage');
+          expect(observation.credentialsStored, isFalse);
+          expect(observation.rejected401, isFalse);
+          expect(observation.attempt!.socketBytesWritten, greaterThan(0));
+          expect(observation.outcomeUnknown, isTrue);
         }
+        final suppressed = conformanceCall(
+          'suppressed',
+          'thing.write',
+          Observer(),
+        );
         await expectLater(
-          second.invoke('thing.write', {}),
+          withConformanceCall(
+            suppressed,
+            () => second.invoke('thing.write', {}),
+          ),
           throwsA(operationFailure('invalid_token', 401)),
         );
         expect(refreshes, 1);
+        if (conformanceEnabled) {
+          expect(suppressed.refreshObservation, isNull);
+          expect(suppressed.httpObservation!.operation, 'thing.write');
+          expect(suppressed.httpObservation!.outcomeUnknown, isFalse);
+        }
         expect(record.value == credentials(), isTrue);
         expect(record.replacements, 0);
         expect(record.deletions, 0);
