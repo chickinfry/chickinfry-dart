@@ -2,6 +2,7 @@
 // ignore_for_file: implementation_imports
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:chickinfry/chickinfry.dart';
 import 'package:chickinfry/src/testing/conformance.dart';
@@ -21,9 +22,11 @@ final class Store {
 }
 
 final class Client {
-  Client(this.transport, this.bridge);
+  Client(this.transport, this.bridge, this.fixture, this.hasSession);
   final HttpTransport transport;
   final Bridge bridge;
+  final String fixture;
+  final bool hasSession;
 }
 
 final class SdkFailure implements Exception {
@@ -63,6 +66,7 @@ final class Driver {
     'client.call',
     'session.store',
     if (conformanceEnabled) ...['barrier', 'session.trace'],
+    if (conformanceEnabled && provenSdk(Platform.version)) 'client.transport',
   ];
 
   T lookup<T>(Map<String, T> values, String ref) {
@@ -102,7 +106,7 @@ final class Driver {
       case 'client.create':
         fields(
           args,
-          {...common, 'clientRef', 'origin', 'requestTimeoutMs'},
+          {...common, 'clientRef', 'fixture', 'origin', 'requestTimeoutMs'},
           {'storeRef', 'bearerRef'},
         );
         break;
@@ -226,6 +230,7 @@ final class Driver {
         }
         final ref = identifier(args, 'clientRef');
         if (clients.containsKey(ref)) violation();
+        final fixture = string(args, 'fixture');
         final origin = string(args, 'origin');
         final timeout = positive(args, 'requestTimeoutMs');
         final store = args.containsKey('storeRef')
@@ -237,17 +242,19 @@ final class Driver {
         final (call, observation) = observationFor(id, 'constructor');
         try {
           final client = withConformanceCall(call, () {
-            final base = HttpTransport(
-              origin,
-              timeout: Duration(milliseconds: timeout),
-            );
-            ownedTransports.add(base);
-            final transport = store != null
-                ? base.withSession(store)
-                : bearer != null
-                ? base.withBearer(bearer)
-                : base;
-            return Client(transport, createBridge(transport));
+            final (transport, bridge) = createBridge(() {
+              final base = HttpTransport(
+                origin,
+                timeout: Duration(milliseconds: timeout),
+              );
+              ownedTransports.add(base);
+              return store != null
+                  ? base.withSession(store)
+                  : bearer != null
+                  ? base.withBearer(bearer)
+                  : base;
+            }, fixture: fixture);
+            return Client(transport, bridge, fixture, store != null);
           });
           if (call.instrumentationFailed) {
             throw const DriverError('driver_failed');
@@ -274,8 +281,11 @@ final class Driver {
         final token = credentials.value(identifier(args, 'bearerRef'));
         final (call, observation) = observationFor(id, 'copy');
         try {
-          final transport = source.transport.withBearer(token);
-          clients[ref] = Client(transport, createBridge(transport));
+          final (transport, bridge) = createBridge(
+            () => source.transport.withBearer(token),
+            fixture: source.fixture,
+          );
+          clients[ref] = Client(transport, bridge, source.fixture, false);
           return {'clientRef': ref};
         } catch (error) {
           throw SdkFailure(observation.sdkError(error, call, credentials));
@@ -301,7 +311,11 @@ final class Driver {
           final ref = identifier(outputs, entry.key);
           if (credentials.contains(ref) || !newRefs.add(ref)) violation();
         }
-        final (call, observation) = observationFor(id, operation);
+        final (call, observation) = observationFor(
+          id,
+          operation,
+          deferTransport: client.hasSession && operation != 'auth.refresh',
+        );
         calls[id] = (call, observation);
         try {
           final output = await withConformanceCall(
@@ -425,7 +439,11 @@ final class Driver {
     };
   }
 
-  (ConformanceCall, Observation) observationFor(String id, String operation) {
+  (ConformanceCall, Observation) observationFor(
+    String id,
+    String operation, {
+    bool deferTransport = false,
+  }) {
     final observation = Observation(id, operation, barriers, flights, (
       barrier,
       callId,
@@ -451,7 +469,7 @@ final class Driver {
           positive(result, 'sequence') < 1) {
         violation();
       }
-    });
+    }, deferTransport: deferTransport);
     return (
       ConformanceCall(
         runId: runId!,

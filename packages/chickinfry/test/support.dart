@@ -100,8 +100,9 @@ class Peer {
 }
 
 class ControlledRawSocket implements RawSocket {
-  ControlledRawSocket(this.chunks);
+  ControlledRawSocket(this.chunks, {this.onWrite});
   final List<List<int>> chunks;
+  final int Function(List<int>, int, int)? onWrite;
   final buffer = Uint8List(8192);
   final events = StreamController<RawSocketEvent>();
   final readArguments = <int?>[];
@@ -143,7 +144,9 @@ class ControlledRawSocket implements RawSocket {
 
   @override
   int write(List<int> bytes, [int offset = 0, int? count]) =>
-      count ?? bytes.length - offset;
+      onWrite?.call(bytes, offset, count ?? bytes.length - offset) ??
+      count ??
+      bytes.length - offset;
   @override
   StreamSubscription<RawSocketEvent> listen(
     void Function(RawSocketEvent)? onData, {

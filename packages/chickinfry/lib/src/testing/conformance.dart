@@ -129,6 +129,7 @@ final class ConformanceHttpAttempt {
   bool? readerClosed;
   bool readerStarted = false;
   bool cancelRequested = false;
+  bool _readerClosePending = false;
   int _chunks = 0;
 
   bool? get outcomeUnknown => responseConfirmed
@@ -203,10 +204,16 @@ final class ConformanceHttpAttempt {
     if (!cancelRequested || cancelObserved == true) return;
     cancelObserved = true;
     transport(ConformanceTransportPhase.cancelObserved);
+    if (_readerClosePending) closeReader();
   }
 
   void closeReader() {
     if (readerClosed == true) return;
+    // Subscription cancellation alone does not prove the native reader is closed.
+    if (cancelRequested && cancelObserved != true) {
+      _readerClosePending = true;
+      return;
+    }
     readerClosed = true;
     transport(ConformanceTransportPhase.readerClosed);
   }
@@ -276,6 +283,7 @@ final class ConformanceRefreshEvent extends ConformanceEvent {
 
 final class ConformanceRefreshObservation {
   ConformanceHttpAttempt? attempt;
+  Future<void>? Function()? _requestSent;
   bool credentialsValidated = false;
   bool credentialsStored = false;
   bool rejected401 = false;
@@ -288,10 +296,39 @@ final class ConformanceRefreshObservation {
 
 final _refreshObservations = Expando<ConformanceRefreshObservation>();
 
-void startRefreshObservation(Object flight) {
+void startRefreshObservation(Object flight, SessionCredentials expected) {
   final observation = ConformanceRefreshObservation();
   _refreshObservations[flight] = observation;
-  currentConformanceCall?.refreshObservation = observation;
+  final call = currentConformanceCall;
+  if (call == null) return;
+  call.refreshObservation = observation;
+  observation._requestSent = () => call.arrive(
+    ConformancePoint.refreshJoined,
+    ConformanceFacts(
+      operation: call.operation,
+      credentials: expected,
+      flight: flight,
+      initiator: true,
+    ),
+  );
+}
+
+Future<void> observeRequestSent(
+  Future<void> sent,
+  ConformanceHttpAttempt? attempt,
+) async {
+  await sent;
+  final observation = attempt?.call.refreshObservation;
+  if (observation == null ||
+      !identical(observation.attempt, attempt) ||
+      (attempt!.socketBytesWritten ?? 0) == 0 ||
+      attempt.pendingSocketBytes != 0) {
+    return;
+  }
+  final arrive = observation._requestSent;
+  observation._requestSent = null;
+  final barrier = arrive?.call();
+  if (barrier != null) await barrier;
 }
 
 final class ConformanceCall {
@@ -419,16 +456,18 @@ Future<SessionCredentials> observeRefresh(
     onError: (Object error, StackTrace stack) => (null, error, stack),
   );
   return () async {
-    final barrier = call.arrive(
-      ConformancePoint.refreshJoined,
-      ConformanceFacts(
-        operation: call.operation,
-        credentials: expected,
-        flight: flight,
-        initiator: initiator,
-      ),
-    );
-    if (barrier != null) await barrier;
+    if (!initiator) {
+      final barrier = call.arrive(
+        ConformancePoint.refreshJoined,
+        ConformanceFacts(
+          operation: call.operation,
+          credentials: expected,
+          flight: flight,
+          initiator: false,
+        ),
+      );
+      if (barrier != null) await barrier;
+    }
     final (value, error, stack) = await outcome;
     call.record(
       ConformanceRefreshEvent(

@@ -336,7 +336,13 @@ class _TlsSocket extends Stream<Uint8List> implements Socket {
   @override
   void writeCharCode(int charCode) => _sink.writeCharCode(charCode);
   @override
-  Future<void> flush() => _sink.flush();
+  Future<void> flush() {
+    if (conformanceEnabled) {
+      return observeRequestSent(_sink.flush(), _writer.observation);
+    }
+    return _sink.flush();
+  }
+
   @override
   Future<void> close() async => _sink.close();
   @override

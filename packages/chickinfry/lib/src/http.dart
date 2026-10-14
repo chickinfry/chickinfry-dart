@@ -203,7 +203,7 @@ final class HttpTransport implements ClientTransport {
     }
     final flight = _RefreshFlight(expected);
     _refreshes[key] = flight;
-    if (conformanceEnabled) startRefreshObservation(flight);
+    if (conformanceEnabled) startRefreshObservation(flight, expected);
     unawaited(() async {
       try {
         flight.result.complete(await _runRefresh(store, expected));

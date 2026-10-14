@@ -1,7 +1,9 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:chickinfry/chickinfry.dart';
+import 'package:chickinfry/src/http_client_io.dart' as native;
 import 'package:chickinfry/src/testing/conformance.dart';
 import 'package:test/test.dart';
 
@@ -9,6 +11,75 @@ import 'support.dart';
 
 void main() {
   if (conformanceEnabled) {
+    test('C-09 refresh initiator waits for every byte and joins only once across flushes', () async {
+      final partialWrite = Completer<void>();
+      final written = <int>[];
+      final raw = ControlledRawSocket(
+        [],
+        onWrite: (bytes, offset, count) {
+          final accepted = partialWrite.isCompleted ? count : count - 1;
+          written.addAll(bytes.sublist(offset, offset + accepted));
+          if (!partialWrite.isCompleted) partialWrite.complete();
+          return accepted;
+        },
+      );
+      final socket = native.createSocketForTesting(raw);
+      addTearDown(socket.destroy);
+      final arrivals = <ConformanceFacts>[];
+      final call = conformanceCall(
+        'leader',
+        'thing.get',
+        Observer(
+          onArrive: (point, facts) {
+            if (point == ConformancePoint.refreshJoined) arrivals.add(facts);
+            return null;
+          },
+        ),
+      );
+      final flight = Object();
+      final expected = credentials();
+      final body = utf8.encode(
+        jsonEncode({'refresh_token': expected.refreshToken}),
+      );
+      final request =
+          utf8.encode(
+            'POST /auth.refresh HTTP/1.1\r\nHost: 127.0.0.1\r\n'
+            'Content-Type: application/json\r\nContent-Length: ${body.length}\r\n\r\n',
+          ) +
+          body;
+      await withConformanceCall(call, () async {
+        startRefreshObservation(flight, expected);
+        observeHttp('auth.refresh');
+        final attempt = call.httpObservation!;
+        call.refreshObservation!.attempt = attempt;
+        socket.add(request);
+        final flushed = socket.flush();
+        await partialWrite.future;
+        expect(raw.writeEventsEnabled, isTrue);
+        expect(attempt.socketBytesWritten, request.length - 1);
+        expect(attempt.pendingSocketBytes, 1);
+        expect(arrivals, isEmpty);
+        // A completed flush notification must not bypass a pending raw write.
+        try {
+          await observeRequestSent(Future<void>.value(), attempt);
+          expect(arrivals, isEmpty);
+        } finally {
+          raw.events.add(RawSocketEvent.write);
+          await flushed;
+        }
+        expect(written, request);
+        expect(attempt.pendingSocketBytes, 0);
+        expect(arrivals, hasLength(1));
+        expect(arrivals.single.initiator, isTrue);
+        expect(arrivals.single.flight, same(flight));
+        expect(arrivals.single.credentials, same(expected));
+        await socket.flush();
+        expect(arrivals, hasLength(1));
+        expect(call.httpAttempts, 1);
+        expect(call.instrumentationFailed, isFalse);
+      });
+    });
+
     test(
       'conformance callbacks isolate barriers and preserve SDK outcomes',
       () async {
@@ -445,6 +516,11 @@ void main() {
           expect(httpEvents[call.callId]!.last.phase, ConformancePhase.failed);
         } else {
           expect(rejected, contains(call.callId));
+          if (facts.initiator!) {
+            expect(call.httpObservation!.operation, 'auth.refresh');
+            expect(call.httpObservation!.socketBytesWritten, greaterThan(0));
+            expect(call.httpObservation!.pendingSocketBytes, 0);
+          }
           participants[call.callId] = facts;
           if (participants.length == 2) joined.complete();
           if (call.callId != 'late') return releaseParticipants.future;
@@ -551,12 +627,13 @@ void main() {
         unorderedEquals([true, false]),
       );
     }
-    releaseRefresh.complete();
     if (conformanceEnabled) {
-      await workerCompleted.future;
+      expect(workerCompleted.isCompleted, isFalse);
       expect(replays, 0);
       releaseParticipants.complete();
     }
+    releaseRefresh.complete();
+    if (conformanceEnabled) await workerCompleted.future;
     await expectLater(
       Future.wait(calls),
       completion([

@@ -28,19 +28,35 @@ must resolve to the pinned runtime source. The coordinator injects
 `-Dchickinfry.conformance=true`; they are generated inputs, not registry packages.
 No dependency download or custom build/run arguments belong in the declaration.
 
-CLI `92b19d7` supplies both SDK paths but does not forward its execution JSON's
-fixture selector to the driver (`conformance/run/build.go:198`, `run.go:272`).
-The driver selects the plain bridge and reports auth-only operations as
-`unimplemented`. `createBridge` is
-the single selection boundary for the later explicit fixture field. Do not infer
-the fixture from a case ID, operation input, or credential presence.
+The coordinator supplies `fixture: "plain"` or `fixture: "auth"` on every
+`client.create`. `createBridge` is the only selection boundary; it rejects unknown
+fixtures before SDK construction. Copies retain the source client's fixture.
+The driver accepts only the native Dart SDK role and process protocol version 1;
+the shared suite, execution and result schema version is 3.
 
-`client.transport` is not advertised. `client.observe` validates the request and
-reports `unimplemented` while the required library retention, cancellation and
-reader completion observations are unavailable. Missing observations stay null;
-they are never converted to zero, false, or a complete interval. Schema 3 suite
-integration, Windows protected input, Linux native execution and Flutter
-app validation are separate work.
+With enabled hooks and a source-proven Dart SDK, `client.transport` exposes
+`client.observe` snapshots with eight fields per event and a process-wide
+sequence watermark. Reads are published immediately and cumulative across HTTP
+exchanges. Session calls project only the result exchange's other phases at
+selection time; SDK completion appears once. Stored SDK errors remain observable.
+Incomplete intervals have `complete:false`; unknown byte counts remain null.
+The driver reports cancellation timestamps, never its own cancellation verdict.
+The shared suite checks the fixed 1000 ms cancellation/reader-close budget.
+
+Retention comes from the runtime's pinned native HTTP/1.1 path, not a memory
+sampler or logical payload estimate. Native `dart:io` uses HTTP/1.1, including the
+controlled plain peer; this driver does not establish remote HTTP/2 bounds.
+The runtime source pins Dart 3.13.0/3.13.5 and package:http 1.6.0.
+In `http_client_io.dart`, raw reads cap at 8192 bytes and the plain fixed bound
+is 5 * 8192 = 40960 bytes, below the 64 KiB transient allowance; the TLS bound
+is 393216 bytes and is added to runtime retention and materialization peaks.
+The source comments document raw-read overlap, parser views, owned-chunk handoff,
+TLS filter rings, BIO and SSLBuffer allocations with pinned file/line references.
+`testing/conformance.dart` confirms the connection, SDK, profiler, encoding and
+single-exchange conditions at headers. Gzip, proxy, unproven SDK and shared
+refresh/multiple-exchange retention remains null, including after completion.
+Windows protected input, Linux native execution and Flutter app validation
+remain separate work.
 
 After the coordinator has connected the actual generated packages, run:
 
@@ -57,5 +73,5 @@ checks handshake ordering against protected EOF, checks control EOF and process
 exit, and rejects malformed, duplicate, oversized and unclosed bootstrap input.
 It prints only host and executable identity. Unit tests use small synthetic
 protocol messages and generated SDK calls; shared case expectations are not
-copied here. Run the shared schema 2 coordinator and independent aggregator to
+copied here. Run the shared schema 3 coordinator and independent aggregator to
 obtain case results; local tests cannot establish a shared conformance pass.

@@ -10,11 +10,20 @@ typedef Bridge = Future<Map<String, Object?>> Function(
   Map<String, Object?> input,
 );
 
-/// Selects only an explicit fixture; schema 2 currently supplies no selector.
-Bridge createBridge(HttpTransport transport, {String fixture = 'plain'}) {
-  if (fixture == 'plain') return plainBridge(plain.Client(transport));
-  if (fixture == 'auth') return authBridge(auth.Client(transport));
-  unimplemented();
+/// Selects the generated SDK only from the explicit fixture identifier.
+(HttpTransport, Bridge) createBridge(
+  HttpTransport Function() createTransport, {
+  required String fixture,
+}) {
+  final factory = switch (fixture) {
+    'plain' => (HttpTransport transport) => plainBridge(
+      plain.Client(transport),
+    ),
+    'auth' => (HttpTransport transport) => authBridge(auth.Client(transport)),
+    _ => invalidArgs(),
+  };
+  final transport = createTransport();
+  return (transport, factory(transport));
 }
 
 Bridge plainBridge(plain.Client client) => (operation, input) async {

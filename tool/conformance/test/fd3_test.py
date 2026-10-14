@@ -133,7 +133,7 @@ class InheritedDescriptorTest(unittest.TestCase):
             self.assertEqual(json.loads(response)["result"]["protocolVersion"], 1)
             for command, values in [
                 ("client.create", {"clientRef": "native", "origin": "http://127.0.0.1:" + str(peer.server_port),
-                                   "requestTimeoutMs": 1000, "bearerRef": "protected"}),
+                                   "fixture": "plain", "requestTimeoutMs": 1000, "bearerRef": "protected"}),
                 ("client.call", {"clientRef": "native", "operation": "probe.echo", "input": {"wire_value": "native"}}),
             ]:
                 values.update({"caseId": "native", "timeoutMs": 5000})
@@ -141,6 +141,24 @@ class InheritedDescriptorTest(unittest.TestCase):
                 row = self.frame(process, deadline)
                 self.assertTrue(json.loads(row)["error"] is None, "Native SDK command failed.")
                 self.assertTrue(credential.encode() not in row, "Protected value exposed.")
+            command = {"id": "c:observe", "command": "client.observe",
+                       "args": {"caseId": "native", "timeoutMs": 5000,
+                                "callId": "c:client.call", "afterSequence": 0}}
+            self.write(process, process.stdin.fileno(), json.dumps(command).encode() + b"\n", deadline)
+            observed = json.loads(self.frame(process, deadline))
+            self.assertIsNone(observed["error"], "Native transport snapshot failed.")
+            snapshot = observed["result"]
+            self.assertTrue(snapshot["complete"])
+            self.assertEqual(snapshot["events"][-1]["phase"], "completed")
+            self.assertTrue(all(set(event) == {"sequence", "callId", "elapsedMs", "phase",
+                                              "httpStatus", "readBytes", "retainedBytes",
+                                              "peakRetainedBytes"} for event in snapshot["events"]))
+            self.assertTrue(all(event["retainedBytes"] is not None and event["peakRetainedBytes"] is not None
+                                for event in snapshot["events"]), "Proven native retention missing.")
+            command["id"] = "c:observe:next"
+            command["args"]["afterSequence"] = snapshot["throughSequence"]
+            self.write(process, process.stdin.fileno(), json.dumps(command).encode() + b"\n", deadline)
+            self.assertEqual(json.loads(self.frame(process, deadline))["result"]["events"], [])
             process.stdin.close()
             process.stdin = None
             stdout, stderr = self.communicate(process, deadline)
@@ -155,6 +173,116 @@ class InheritedDescriptorTest(unittest.TestCase):
         print(json.dumps({"bootstrapBytes": len(frame), "referencesMatched": True,
                           "bootstrapEOFBeforeHandshake": True, "controlEOF": True,
                           "exitObserved": True, "freshProcesses": 2}), flush=True)
+
+    def test_redirect_reader_closure_waits_for_native_cancellation(self):
+        self.redirect_reader_closure(False)
+
+    def test_session_refresh_redirect_preserves_native_reader_closure(self):
+        self.redirect_reader_closure(True)
+
+    def redirect_reader_closure(self, session):
+        closed = threading.Event()
+        requests = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                requests.append(self.path)
+                if session and self.path == "/probe.echo":
+                    body = json.dumps({"error": "invalid_token"}).encode()
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(302)
+                self.send_header("Content-Length", str(2 * 1024 * 1024 + 1))
+                self.send_header("Location", "/sink")
+                self.end_headers()
+                self.wfile.flush()
+                try:
+                    self.wfile.write(b"x" * 65536)
+                    self.wfile.flush()
+                    self.connection.settimeout(2)
+                    if not self.connection.recv(1):
+                        closed.set()
+                except (ConnectionResetError, BrokenPipeError):
+                    closed.set()
+
+            def log_message(self, *args):
+                pass
+
+        peer = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=peer.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(peer.server_close)
+        self.addCleanup(peer.shutdown)
+        process, writer, deadline = self.start()
+        origin = "http://127.0.0.1:" + str(peer.server_port)
+        if session:
+            record = {"origin": origin, "access_token": "a" * 43, "refresh_token": "r" * 43,
+                      "expires_at": "2099-01-01T00:00:00Z", "refresh_expires_at": "2099-02-01T00:00:00Z",
+                      "user_id": "user", "session_id": "session"}
+            for ref, value in [("record", json.dumps(record)), ("access", record["access_token"]),
+                               ("refresh", record["refresh_token"])]:
+                self.write(process, writer, json.dumps({"ref": ref, "value": value}).encode() + b"\n", deadline)
+        os.close(writer)
+        commands = [HANDSHAKE]
+        if session:
+            commands.append({"id": "c:store", "command": "session.store.create", "args": {
+                "caseId": "redirect", "timeoutMs": 5000, "storeRef": "store", "origin": origin,
+                "recordRef": "record", "accessRef": "access", "refreshRef": "refresh"}})
+        commands.extend([
+                        {"id": "c:create", "command": "client.create", "args": {
+                            "caseId": "redirect", "timeoutMs": 5000, "clientRef": "client", "fixture": "plain",
+                            "origin": origin, "requestTimeoutMs": 1000,
+                            **({"storeRef": "store"} if session else {})}},
+                        {"id": "c:call", "command": "client.call", "args": {
+                            "caseId": "redirect", "timeoutMs": 5000, "clientRef": "client",
+                            "operation": "probe.echo", "input": {"wire_value": "value"}}}])
+        for command in commands:
+            self.write(process, process.stdin.fileno(), json.dumps(command).encode() + b"\n", deadline)
+            response = json.loads(self.frame(process, deadline))
+            if command["command"] != "client.call":
+                self.assertIsNone(response["error"], "Native setup failed.")
+        self.assertEqual(response["error"]["code"], "redirect_not_allowed")
+        self.assertEqual(response["error"]["httpStatus"], 302)
+        events, through, queries = [], 0, 0
+        while not any(event["phase"] == "reader-closed" for event in events):
+            command = {"id": "c:observe:" + str(queries), "command": "client.observe", "args": {
+                "caseId": "redirect", "timeoutMs": 5000, "callId": "c:call", "afterSequence": through}}
+            self.write(process, process.stdin.fileno(), json.dumps(command).encode() + b"\n", deadline)
+            snapshot = json.loads(self.frame(process, deadline))["result"]
+            self.assertEqual(snapshot["complete"],
+                             all(event[field] is not None for event in snapshot["events"]
+                                 for field in ("readBytes", "retainedBytes", "peakRetainedBytes")))
+            events.extend(snapshot["events"])
+            through, queries = snapshot["throughSequence"], queries + 1
+        phases = [event["phase"] for event in events]
+        self.assertLess(phases.index("cancel-requested"), phases.index("cancel-observed"))
+        self.assertLess(phases.index("cancel-observed"), phases.index("reader-closed"))
+        if not session:
+            self.assertNotIn("read", phases)
+        self.assertEqual(phases.count("headers"), 1)
+        self.assertEqual(phases.count("cancel-observed"), 1)
+        self.assertEqual(phases.count("reader-closed"), 1)
+        self.assertEqual(phases.count("completed"), 1)
+        self.assertTrue(all(event["httpStatus"] == 302 for event in events if event["phase"] != "read"))
+        self.assertEqual([event["sequence"] for event in events],
+                         sorted(set(event["sequence"] for event in events)))
+        self.assertLessEqual(events[phases.index("reader-closed")]["elapsedMs"] - events[0]["elapsedMs"], 1000)
+        self.assertTrue(closed.wait(self.remaining(process, deadline)))
+        self.assertEqual(requests, ["/probe.echo", "/auth.refresh"] if session else ["/probe.echo"])
+        command["id"] = "c:observe:exhausted"
+        command["args"]["afterSequence"] = through
+        self.write(process, process.stdin.fileno(), json.dumps(command).encode() + b"\n", deadline)
+        self.assertEqual(json.loads(self.frame(process, deadline))["result"]["events"], [])
+        process.stdin.close()
+        process.stdin = None
+        stdout, stderr = self.communicate(process, deadline)
+        self.assertEqual(process.returncode, 0)
+        self.assertFalse(bool(stdout + stderr), "Unexpected protocol output.")
 
     def test_invalid_bootstrap_is_finite_and_secret_free(self):
         credential = "s" * 43
@@ -231,7 +359,7 @@ class InheritedDescriptorTest(unittest.TestCase):
                     self.addCleanup(release.set)
                     for command, values in [
                         ("client.create", {"clientRef": "slow", "origin": "http://127.0.0.1:" + str(peer.server_port),
-                                           "requestTimeoutMs": 2000, "timeoutMs": 2000}),
+                                           "fixture": "plain", "requestTimeoutMs": 2000, "timeoutMs": 2000}),
                         ("client.call", {"clientRef": "slow", "operation": "probe.echo",
                                          "input": {"wire_value": "slow"}, "timeoutMs": 50}),
                     ]:

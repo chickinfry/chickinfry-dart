@@ -101,7 +101,7 @@ void main() {
       throwsA(isA<DriverError>()),
     );
   });
-  test('handshake has exactly three target fields and never advertises incomplete transport', () {
+  test('handshake validates the target and advertises only enabled instrumentation', () {
     final driver = Driver(Credentials(), (_, __) async => {});
     expect(
       () => driver.handshake({
@@ -120,19 +120,365 @@ void main() {
       }),
       throwsA(isA<DriverError>()),
     );
+    final enabled = conformanceEnabled && provenSdk(Platform.version);
+    if (!enabled) {
+      expect(
+        () => driver.handshake({
+          ...handshake,
+          'requiredCapabilities': ['client.transport'],
+        }),
+        throwsA(isA<DriverError>()),
+      );
+    }
     expect(
-      () => driver.handshake({
-        ...handshake,
-        'requiredCapabilities': ['client.transport'],
-      }),
-      throwsA(isA<DriverError>()),
+      (driver.handshake(handshake)['capabilities'] as List).contains(
+        'client.transport',
+      ),
+      enabled,
     );
-    expect(
-      driver.handshake(handshake)['capabilities'],
-      isNot(contains('client.transport')),
-    );
+    final otherRole = Driver(Credentials(), (_, __) async => {});
+    for (final role in ['server', 'cli']) {
+      expect(
+        () => otherRole.handshake({
+          ...handshake,
+          'target': {'language': 'dart', 'role': role, 'environment': 'native'},
+        }),
+        throwsA(
+          isA<DriverError>().having(
+            (error) => error.kind,
+            'kind',
+            'unimplemented',
+          ),
+        ),
+      );
+    }
+    otherRole.dispose();
     driver.dispose();
   });
+  test(
+    'fixture is explicit and unknown values fail before SDK construction',
+    () async {
+      final driver = Driver(Credentials(), (_, __) async => {})
+        ..handshake(handshake);
+      addTearDown(driver.dispose);
+      for (final fixture in ['unknown', '', null, 1]) {
+        await expectLater(
+          driver.handle(
+            'c:bad:$fixture',
+            'client.create',
+            args({
+              'clientRef': 'bad',
+              'fixture': fixture,
+              'origin': 'invalid',
+              'requestTimeoutMs': 1000,
+            }),
+          ),
+          throwsA(
+            isA<DriverError>().having(
+              (error) => error.code,
+              'code',
+              'invalid_args',
+            ),
+          ),
+        );
+      }
+      expect(driver.ownedTransports, isEmpty);
+    },
+  );
+  test(
+    'auth fixture and its bearer copy call the generated refresh bridge',
+    () async {
+      final peer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => peer.close(force: true));
+      var requests = 0;
+      final refs = Credentials()
+        ..register('inputRefresh', 'r' * 43)
+        ..register('bearer', 'a' * 43);
+      final subscription = peer.listen((request) async {
+        expect(request.uri.path, '/auth.refresh');
+        final input = jsonDecode(await utf8.decoder.bind(request).join());
+        expect(input['refresh_token'] == refs.value('inputRefresh'), true);
+        requests++;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode({
+            'access_token': 'b' * 43,
+            'refresh_token': 's' * 43,
+            'expires_at': '2099-01-01T00:00:00Z',
+            'refresh_expires_at': '2099-02-01T00:00:00Z',
+            'user_id': 'user',
+            'session_id': 'session',
+          }),
+        );
+        await request.response.close();
+      });
+      addTearDown(subscription.cancel);
+      final driver = Driver(refs, (_, __) async => {})..handshake(handshake);
+      addTearDown(driver.dispose);
+      await driver.handle(
+        'c:create:auth',
+        'client.create',
+        args({
+          'fixture': 'auth',
+          'clientRef': 'auth',
+          'origin': 'http://127.0.0.1:${peer.port}',
+          'requestTimeoutMs': 1000,
+        }),
+      );
+      await driver.handle(
+        'c:copy:auth',
+        'client.copy',
+        args({
+          'sourceClientRef': 'auth',
+          'clientRef': 'copy',
+          'bearerRef': 'bearer',
+        }),
+      );
+      for (final client in ['auth', 'copy']) {
+        final result = await driver.handle(
+          'c:refresh:$client',
+          'client.call',
+          args({
+            'clientRef': client,
+            'operation': 'auth.refresh',
+            'input': <String, Object?>{},
+            'inputRefs': {'refresh_token': 'inputRefresh'},
+            'outputRefs': {
+              'access_token': 'access:$client',
+              'refresh_token': 'refresh:$client',
+            },
+          }),
+        );
+        expect(object(result['output']).keys, isNot(contains('access_token')));
+        expect(object(result['output']).keys, isNot(contains('refresh_token')));
+        expect(object(result['output'])['session_id'], 'session');
+        expect(result['credentialRefs'], {
+          'access_token': 'access:$client',
+          'refresh_token': 'refresh:$client',
+        });
+        expect(refs.exposes(result), false);
+      }
+      expect(requests, 2);
+    },
+  );
+  test('snapshot preserves live watermarks, final projection and unavailable retention', () async {
+    final driver = Driver(Credentials(), (_, __) async => {})
+      ..handshake(handshake)
+      ..caseId = 'case';
+    addTearDown(driver.dispose);
+    final (call, observation) = driver.observationFor(
+      'c:observed',
+      'probe.echo',
+    );
+    call.elapsed.start();
+    observe(ConformanceTransportPhase phase) =>
+        call.httpObservation!.transport(phase);
+    final first = ConformanceHttpAttempt(call, 'probe.echo')
+      ..status = 302
+      ..libraryRetainedBytes = 0;
+    call.httpObservation = first;
+    observe(ConformanceTransportPhase.headers);
+    final initial = observation.snapshot(call, 0);
+    expect(initial['complete'], true);
+    expect((initial['events'] as List).single, containsPair('httpStatus', 302));
+    final watermark = initial['throughSequence'] as int;
+    first.requestCancel();
+    first.closeReader();
+    expect(observation.transport.last['phase'], 'cancel-requested');
+    first.observeCancel();
+    call.complete(succeeded: false);
+    final finalSnapshot = observation.snapshot(call, watermark);
+    final events = (finalSnapshot['events'] as List)
+        .cast<Map<String, Object?>>();
+    expect(events.map((event) => event['phase']), [
+      'cancel-requested',
+      'cancel-observed',
+      'reader-closed',
+      'completed',
+    ]);
+    expect(
+      events.every((event) => (event['sequence'] as int) > watermark),
+      true,
+    );
+    expect(events.every((event) => event.keys.toSet().length == 8), true);
+    expect(
+      observation.snapshot(
+        call,
+        finalSnapshot['throughSequence'] as int,
+      )['events'],
+      isEmpty,
+    );
+    final (unknown, unknownObservation) = driver.observationFor(
+      'c:unknown',
+      'probe.echo',
+    );
+    final unknownAttempt = ConformanceHttpAttempt(unknown, 'probe.echo')
+      ..status = 200;
+    unknown.httpObservation = unknownAttempt;
+    unknownAttempt.transport(ConformanceTransportPhase.headers);
+    final unavailable =
+        (unknownObservation.snapshot(unknown, 0)['events'] as List).single;
+    expect(unavailable['retainedBytes'], null);
+    expect(unavailable['peakRetainedBytes'], null);
+    expect(unknownObservation.snapshot(unknown, 0)['complete'], false);
+    expect(
+      unavailable['sequence'],
+      greaterThan(finalSnapshot['throughSequence'] as int),
+    );
+    unknown.instrumentationFailed = true;
+    expect(
+      unknownObservation.snapshot(
+        unknown,
+        unknownObservation.transport.last['sequence'] as int,
+      )['complete'],
+      false,
+    );
+    final (multiple, projection) = driver.observationFor(
+      'c:multi',
+      'probe.echo',
+      deferTransport: true,
+    );
+    multiple.elapsed.start();
+    for (final status in [401, 503]) {
+      final exchange = ConformanceHttpAttempt(
+        multiple,
+        status == 401 ? 'probe.echo' : 'auth.refresh',
+      )..status = status;
+      multiple.httpObservation = exchange;
+      exchange.transport(ConformanceTransportPhase.headers);
+      exchange.read(12);
+      exchange.closeReader();
+    }
+    final live = projection.snapshot(multiple, 0);
+    expect((live['events'] as List).map((event) => event['phase']), [
+      'read',
+      'read',
+    ]);
+    expect((live['events'] as List).map((event) => event['readBytes']), [
+      12,
+      24,
+    ]);
+    projection.record(
+      ConformanceRefreshEvent(
+        Object(),
+        'operation_failed',
+        503,
+        ConformanceRefreshObservation()..attempt = multiple.httpObservation,
+      ),
+    );
+    multiple.complete(succeeded: false);
+    final finalProjection =
+        (projection.snapshot(multiple, live['throughSequence'] as int)['events']
+            as List);
+    expect(finalProjection.map((event) => event['phase']), [
+      'headers',
+      'reader-closed',
+      'completed',
+    ]);
+    expect(
+      finalProjection.every(
+        (event) =>
+            event['httpStatus'] == 503 &&
+            event['readBytes'] == 24 &&
+            event['peakRetainedBytes'] == null,
+      ),
+      true,
+    );
+    for (final status in [401, 302]) {
+      final (late, lateProjection) = driver.observationFor(
+        'c:late:$status',
+        'probe.echo',
+        deferTransport: true,
+      );
+      late.elapsed.start();
+      ConformanceHttpAttempt? intermediate;
+      if (status == 302) {
+        intermediate = ConformanceHttpAttempt(late, 'probe.echo')..status = 401;
+        late.httpObservation = intermediate;
+        intermediate.transport(ConformanceTransportPhase.headers);
+        intermediate.read(12);
+        intermediate.requestCancel();
+        intermediate.closeReader();
+      }
+      final result =
+          ConformanceHttpAttempt(
+              late,
+              status == 401 ? 'probe.echo' : 'auth.refresh',
+            )
+            ..status = status
+            ..libraryRetainedBytes = 0;
+      late.httpObservation = result;
+      result.transport(ConformanceTransportPhase.headers);
+      result.requestCancel();
+      result.closeReader();
+      if (status == 302) {
+        lateProjection.record(
+          ConformanceRefreshEvent(
+            Object(),
+            'redirect_not_allowed',
+            status,
+            ConformanceRefreshObservation()..attempt = result,
+          ),
+        );
+      }
+      late.complete(succeeded: false);
+      final completed = lateProjection.snapshot(late, 0);
+      final completedEvents = (completed['events'] as List)
+          .cast<Map<String, Object?>>();
+      expect(completedEvents.map((event) => event['phase']), [
+        if (intermediate != null) 'read',
+        'headers',
+        'cancel-requested',
+        'completed',
+      ]);
+      await Future<void>.delayed(const Duration(milliseconds: 2));
+      intermediate?.observeCancel();
+      result.observeCancel();
+      result.observeCancel();
+      result.closeReader();
+      late.complete(succeeded: false);
+      final completionWatermark = completed['throughSequence'] as int;
+      final closed = lateProjection.snapshot(late, completionWatermark);
+      final closureEvents = (closed['events'] as List)
+          .cast<Map<String, Object?>>();
+      expect(closureEvents.map((event) => event['phase']), [
+        'cancel-observed',
+        'reader-closed',
+      ]);
+      expect(
+        closureEvents.every(
+          (event) =>
+              (event['sequence'] as int) > completionWatermark &&
+              (event['elapsedMs'] as double) >
+                  (completedEvents.last['elapsedMs'] as double) &&
+              event['httpStatus'] == status,
+        ),
+        true,
+      );
+      expect(
+        completed['complete'],
+        completedEvents.every(
+          (event) =>
+              event['readBytes'] != null &&
+              event['retainedBytes'] != null &&
+              event['peakRetainedBytes'] != null,
+        ),
+      );
+      if (status == 401) expect(completed['complete'], true);
+      expect(closed['complete'], status == 401);
+      final exhausted = lateProjection.snapshot(
+        late,
+        closed['throughSequence'] as int,
+      );
+      expect(exhausted['events'], isEmpty);
+      expect(
+        lateProjection.transport.where(
+          (event) => event['phase'] == 'completed',
+        ),
+        hasLength(1),
+      );
+    }
+  }, skip: !conformanceEnabled);
   test(
     'store create is all-or-none and snapshot/revision/null are preserved',
     () async {
@@ -359,6 +705,7 @@ void main() {
         'client.create',
         args({
           'clientRef': 'client',
+          'fixture': 'plain',
           'origin': 'http://127.0.0.1:1234',
           'requestTimeoutMs': 1000,
         }),
@@ -465,6 +812,7 @@ void main() {
         'client.create',
         args({
           'clientRef': ref,
+          'fixture': 'auth',
           'origin': 'http://127.0.0.1:${peer.port}',
           'requestTimeoutMs': 1000,
           'storeRef': 'shared',
@@ -522,7 +870,10 @@ void main() {
       'client.observe',
       args({'callId': 'c:first', 'afterSequence': 0}),
     );
-    expect(object(observation['error'])['kind'], 'unimplemented');
+    expect(observation['error'], null);
+    final observed = object(observation['result']);
+    expect(observed['complete'], true);
+    expect((observed['events'] as List).last['phase'], 'completed');
     await Future.wait(server.active.toList());
   }, skip: !conformanceEnabled);
   test('trace preserves actual expected credentials, failed CAS and mutation revision', () async {

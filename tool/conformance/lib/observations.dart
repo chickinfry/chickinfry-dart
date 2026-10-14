@@ -61,20 +61,29 @@ typedef Arrive = Future<void> Function(
   Map<String, Object?> facts,
 );
 
+int _transportSequence = 0;
+
 final class Observation implements ConformanceObserver {
   Observation(
     this.id,
     this.operation,
     this.barriers,
     this.flights,
-    this.callBarrier,
-  );
+    this.callBarrier, {
+    this.deferTransport = false,
+  });
   final String id;
   final String operation;
   final List<Barrier> barriers;
   final Map<Object, String> flights;
   final Arrive callBarrier;
   final events = <ConformanceEvent>[];
+  final bool deferTransport;
+  final transport = <Map<String, Object?>>[];
+  final _attemptReads = <ConformanceHttpAttempt, int>{};
+  int _readBytes = 0;
+  int? _peakRetainedBytes = 0;
+  ConformanceHttpAttempt? _selectedAttempt;
 
   @override
   Future<void>? arrive(ConformancePoint point, ConformanceFacts facts) {
@@ -108,7 +117,81 @@ final class Observation implements ConformanceObserver {
   }
 
   @override
-  void record(ConformanceEvent event) => events.add(event);
+  void record(ConformanceEvent event) {
+    events.add(event);
+    if (event is! ConformanceTransportEvent) return;
+    final attempt = event.attempt;
+    if (event.phase == ConformanceTransportPhase.headers &&
+        (!deferTransport ||
+            attempt?.operation == operation && event.status != 401)) {
+      _selectedAttempt = attempt;
+    }
+    final bytes = event.readBytes;
+    if (attempt != null && bytes != null) {
+      _readBytes += bytes - (_attemptReads[attempt] ?? 0);
+      _attemptReads[attempt] = bytes;
+    }
+    final peak = event.peakRetainedBytes;
+    if (peak == null) {
+      _peakRetainedBytes = null;
+    } else if (_peakRetainedBytes != null && peak > _peakRetainedBytes!) {
+      _peakRetainedBytes = peak;
+    }
+    if (deferTransport &&
+        _selectedAttempt == null &&
+        event.phase != ConformanceTransportPhase.read &&
+        event.phase != ConformanceTransportPhase.limit) {
+      if (event.phase != ConformanceTransportPhase.completed) return;
+      final refresh = events.whereType<ConformanceRefreshEvent>().lastOrNull;
+      final selected = refresh != null && refresh.code != null
+          ? refresh.observation?.attempt
+          : attempt;
+      _selectedAttempt = selected;
+      // Publish only the result exchange, at selection time with current counts.
+      for (final pending in events.whereType<ConformanceTransportEvent>()) {
+        if (selected != null &&
+            identical(pending.attempt, selected) &&
+            pending.phase != ConformanceTransportPhase.read &&
+            pending.phase != ConformanceTransportPhase.limit &&
+            pending.phase != ConformanceTransportPhase.completed) {
+          _publish(event, pending.phase, selected.status);
+        }
+      }
+      _publish(event, event.phase, selected?.status);
+    } else {
+      if (deferTransport &&
+          _selectedAttempt != null &&
+          !identical(attempt, _selectedAttempt) &&
+          event.phase != ConformanceTransportPhase.read &&
+          event.phase != ConformanceTransportPhase.limit &&
+          event.phase != ConformanceTransportPhase.completed) {
+        return;
+      }
+      _publish(event, event.phase, event.status);
+    }
+  }
+
+  void _publish(
+    ConformanceTransportEvent event,
+    ConformanceTransportPhase phase,
+    int? status,
+  ) {
+    transport.add({
+      'sequence': ++_transportSequence,
+      'callId': id,
+      'elapsedMs': event.elapsedMs,
+      'phase': switch (phase) {
+        ConformanceTransportPhase.cancelRequested => 'cancel-requested',
+        ConformanceTransportPhase.cancelObserved => 'cancel-observed',
+        ConformanceTransportPhase.readerClosed => 'reader-closed',
+        _ => phase.name,
+      },
+      'httpStatus': status,
+      'readBytes': event.readBytes == null ? null : _readBytes,
+      'retainedBytes': event.retainedBytes,
+      'peakRetainedBytes': _peakRetainedBytes,
+    });
+  }
 
   int? get constructorRequests {
     final counts = events.whereType<ConformanceConstruction>().toList();
@@ -189,18 +272,24 @@ final class Observation implements ConformanceObserver {
   }
 
   Map<String, Object?> snapshot(ConformanceCall call, int after) {
-    // Missing library retention must never become zero or a complete interval.
-    final transport = events.whereType<ConformanceTransportEvent>().toList();
-    if (!conformanceEnabled ||
-        call.instrumentationFailed ||
-        transport.any(
-          (event) =>
-              event.readBytes == null ||
-              event.retainedBytes == null ||
-              event.peakRetainedBytes == null,
-        )) {
-      unimplemented();
-    }
-    unimplemented();
+    if (!conformanceEnabled) unimplemented();
+    if (after > _transportSequence) invalidArgs();
+    final selected = [
+      for (final event in transport)
+        if ((event['sequence'] as int) > after) event,
+    ];
+    return {
+      'callId': id,
+      'throughSequence': _transportSequence,
+      'complete':
+          !call.instrumentationFailed &&
+          selected.every(
+            (event) =>
+                event['readBytes'] != null &&
+                event['retainedBytes'] != null &&
+                event['peakRetainedBytes'] != null,
+          ),
+      'events': selected,
+    };
   }
 }
