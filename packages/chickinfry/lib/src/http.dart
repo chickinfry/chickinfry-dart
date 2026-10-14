@@ -352,6 +352,10 @@ final class HttpTransport implements ClientTransport {
         }
         throw OperationError('redirect_not_allowed', status);
       }
+      // Dart pins da6595cd6bb5d4c0a185d759a025e879ff06e631 (3.13.0) and
+      // 04bcd1036cdc799ac6564988f159ee454d42c822 (3.13.5):
+      // sdk/lib/internal/bytes_builder.dart:179-219 retains exact owned chunks;
+      // copy:true grows with spare capacity (:119-137), outside this proof.
       final bytes = BytesBuilder(copy: false);
       if (conformanceEnabled) {
         currentConformanceCall?.httpObservation?.readerStarted = true;
@@ -370,7 +374,7 @@ final class HttpTransport implements ClientTransport {
           if (!abort.isCompleted) abort.complete();
           throw ClientException('response_too_large', status: status);
         }
-        bytes.add(chunk);
+        bytes.add(Uint8List.fromList(chunk));
         if (conformanceEnabled) {
           currentConformanceCall?.httpObservation?.retain(chunk.length);
         }

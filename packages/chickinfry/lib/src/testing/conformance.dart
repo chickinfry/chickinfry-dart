@@ -8,6 +8,10 @@ const conformanceEnabled = bool.fromEnvironment(
   defaultValue: false,
 );
 
+bool provenSdk(String version) =>
+    version.startsWith('3.13.0 (stable)') ||
+    version.startsWith('3.13.5 (stable)');
+
 enum ConformancePoint { sdkEntered, originalsRejected, refreshJoined }
 
 enum ConformancePhase { sending, response, bodyComplete, completed, failed }
@@ -115,7 +119,10 @@ final class ConformanceHttpAttempt {
   int readBytes = 0;
   int runtimeRetainedBytes = 0;
   int runtimePeakRetainedBytes = 0;
-  // Private parser and response queue occupancy and fixed bounds remain unobserved.
+  // A direct socket supplies a candidate; response headers confirm applicability.
+  int? fixedRetainedBytes;
+  Object? _connection;
+  bool _multipleConnections = false;
   int? libraryRetainedBytes;
   int? peakRetainedBytes;
   bool? cancelObserved;
@@ -130,15 +137,38 @@ final class ConformanceHttpAttempt {
       ? null
       : socketBytesWritten! > 0;
 
+  void observeConnection(Object connection, int fixedBytes) {
+    if (_connection != null && !identical(_connection, connection)) {
+      _multipleConnections = true;
+    }
+    _connection = connection;
+    fixedRetainedBytes = _multipleConnections ? null : fixedBytes;
+  }
+
+  void confirmRetainedBytes(
+    String sdkVersion, {
+    required bool profiled,
+    required String? encoding,
+  }) {
+    libraryRetainedBytes =
+        provenSdk(sdkVersion) &&
+            !profiled &&
+            call.httpAttempts == 1 &&
+            (encoding == null || encoding == 'identity')
+        ? fixedRetainedBytes
+        : null;
+  }
+
   void transport(ConformanceTransportPhase phase) {
     if (runtimeRetainedBytes > runtimePeakRetainedBytes) {
       runtimePeakRetainedBytes = runtimeRetainedBytes;
     }
     final library = libraryRetainedBytes;
-    final retained = library == null ? null : runtimeRetainedBytes + library;
-    if (retained != null &&
-        (peakRetainedBytes == null || retained > peakRetainedBytes!)) {
-      peakRetainedBytes = retained;
+    final peak = library == null ? null : runtimePeakRetainedBytes + library;
+    if (peak == null) {
+      peakRetainedBytes = null;
+    } else if (peakRetainedBytes == null || peak > peakRetainedBytes!) {
+      peakRetainedBytes = peak;
     }
     call.recordTransport(phase, this);
   }
@@ -284,13 +314,17 @@ final class ConformanceCall {
   final elapsed = Stopwatch();
   final transportEvents = <ConformanceTransportEvent>[];
   bool _completed = false;
+  bool _retainedUnknown = false;
 
   void recordTransport(
     ConformanceTransportPhase phase,
     ConformanceHttpAttempt? attempt,
   ) {
     final runtime = attempt?.runtimeRetainedBytes;
-    final library = attempt?.libraryRetainedBytes;
+    if (httpAttempts != 1 || attempt?.libraryRetainedBytes == null) {
+      _retainedUnknown = true;
+    }
+    final library = _retainedUnknown ? null : attempt?.libraryRetainedBytes;
     final event = ConformanceTransportEvent(
       attempt,
       phase,
@@ -301,7 +335,7 @@ final class ConformanceCall {
       runtime,
       library,
       runtime == null || library == null ? null : runtime + library,
-      attempt?.peakRetainedBytes,
+      _retainedUnknown ? null : attempt?.peakRetainedBytes,
       attempt?.runtimePeakRetainedBytes,
     );
     transportEvents.add(event);
@@ -316,7 +350,11 @@ final class ConformanceCall {
     if (succeeded && status != null && status >= 200 && status < 300) {
       attempt!.responseConfirmed = true;
     }
-    recordTransport(ConformanceTransportPhase.completed, attempt);
+    if (attempt == null) {
+      recordTransport(ConformanceTransportPhase.completed, null);
+    } else {
+      attempt.transport(ConformanceTransportPhase.completed);
+    }
   }
 
   Future<void>? arrive(ConformancePoint point, ConformanceFacts facts) {
@@ -374,6 +412,7 @@ Future<SessionCredentials> observeRefresh(
 }) {
   final call = currentConformanceCall;
   if (call == null) return result;
+  call._retainedUnknown = true;
   // Attach the error handler before the barrier to avoid unhandled shared Future errors.
   final outcome = result.then<(SessionCredentials?, Object?, StackTrace?)>(
     (value) => (value, null, null),

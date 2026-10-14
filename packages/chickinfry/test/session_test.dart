@@ -588,6 +588,10 @@ void main() {
         contexts.map((call) => call.instrumentationFailed),
         everyElement(isFalse),
       );
+      for (final call in contexts) {
+        expect(call.transportEvents.last.retainedBytes, isNull);
+        expect(call.transportEvents.last.peakRetainedBytes, isNull);
+      }
       expect(entered, unorderedEquals(['first', 'second', 'late']));
       expect(rejected, entered);
       final firstEvents = httpEvents['first']!;
@@ -702,10 +706,13 @@ void main() {
       var initial = 0;
       var refreshes = 0;
       final bothStarted = Completer<void>();
+      final bothJoined = Completer<void>();
+      var joined = 0;
       final peer = await Peer.start((request) async {
         await request.drain<void>();
         if (request.uri.path == '/auth.refresh') {
           refreshes++;
+          if (conformanceEnabled) await bothJoined.future;
           await reply(request, {'error': 'session_revoked'}, status: 401);
         } else {
           if (++initial == 2) bothStarted.complete();
@@ -728,23 +735,27 @@ void main() {
           }
         },
         onArrive: (point, facts) {
-          if (point == ConformancePoint.refreshJoined && facts.initiator!) {
-            initiators.add(currentConformanceCall!.callId);
+          if (point == ConformancePoint.refreshJoined) {
+            if (facts.initiator!) {
+              initiators.add(currentConformanceCall!.callId);
+            }
+            if (++joined == 2) bothJoined.complete();
           }
           return null;
         },
       );
+      final contexts = [
+        conformanceCall('first', 'thing.get', observer),
+        conformanceCall('second', 'thing.get', observer),
+      ];
       await Future.wait([
         expectLater(
-          withConformanceCall(
-            conformanceCall('first', 'thing.get', observer),
-            () => first.invoke('thing.get', {}),
-          ),
+          withConformanceCall(contexts[0], () => first.invoke('thing.get', {})),
           throwsA(operationFailure('session_revoked', 401)),
         ),
         expectLater(
           withConformanceCall(
-            conformanceCall('second', 'thing.get', observer),
+            contexts[1],
             () => second.invoke('thing.get', {}),
           ),
           throwsA(operationFailure('session_revoked', 401)),
@@ -756,6 +767,21 @@ void main() {
       expect(refreshes, 1);
       expect(record.revision, 2);
       if (conformanceEnabled) {
+        expect(
+          contexts.map((call) => call.httpAttempts),
+          unorderedEquals([1, 2]),
+        );
+        for (final call in contexts) {
+          expect(
+            call.transportEvents.last.phase,
+            ConformanceTransportPhase.completed,
+          );
+          expect(call.transportEvents.last.retainedBytes, isNull);
+          expect(call.transportEvents.last.peakRetainedBytes, isNull);
+          if (call.httpAttempts > 1) {
+            expect(call.httpObservation!.libraryRetainedBytes, isNull);
+          }
+        }
         expect(refreshObservations, isNotEmpty);
         expect(
           refreshObservations.every(
@@ -993,17 +1019,21 @@ void main() {
             }
           },
         );
+        final contexts = [
+          conformanceCall('first', 'thing.write', observer),
+          conformanceCall('second', 'thing.write', observer),
+        ];
         await Future.wait([
           expectLater(
             withConformanceCall(
-              conformanceCall('first', 'thing.write', observer),
+              contexts[0],
               () => first.invoke('thing.write', {}),
             ),
             throwsA(failure),
           ),
           expectLater(
             withConformanceCall(
-              conformanceCall('second', 'thing.write', observer),
+              contexts[1],
               () => second.invoke('thing.write', {}),
             ),
             throwsA(failure),
@@ -1014,6 +1044,14 @@ void main() {
         expect(record.value == credentials(), isTrue);
         expect(record.deletions, 0);
         if (conformanceEnabled) {
+          expect(
+            contexts.map((call) => call.httpAttempts),
+            unorderedEquals([1, 2]),
+          );
+          for (final call in contexts) {
+            expect(call.transportEvents.last.retainedBytes, isNull);
+            expect(call.transportEvents.last.peakRetainedBytes, isNull);
+          }
           expect(refreshEvents.keys, unorderedEquals(['first', 'second']));
           expect(
             identical(

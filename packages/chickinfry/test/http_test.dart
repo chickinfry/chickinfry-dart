@@ -11,6 +11,94 @@ import 'package:test/test.dart';
 import 'support.dart';
 
 void main() {
+  test('RT-3 only proven stable SDK versions allow retained bounds', () {
+    for (final version in ['3.13.0 (stable)', '3.13.5 (stable)']) {
+      expect(provenSdk(version), isTrue);
+    }
+    for (final version in [
+      '',
+      'unknown',
+      '3.13.6 (stable)',
+      '3.13.5 (beta)',
+      '3.13.50 (stable)',
+    ]) {
+      expect(provenSdk(version), isFalse);
+      final call = conformanceCall('sdk', 'thing.get', Observer());
+      final attempt = ConformanceHttpAttempt(call, 'thing.get');
+      attempt.observeConnection(Object(), 384 * 1024);
+      attempt.confirmRetainedBytes(version, profiled: false, encoding: null);
+      attempt.transport(ConformanceTransportPhase.headers);
+      expect(attempt.libraryRetainedBytes, isNull);
+      expect(call.transportEvents.last.retainedBytes, isNull);
+      expect(call.transportEvents.last.peakRetainedBytes, isNull);
+    }
+  });
+
+  test(
+    'C-04 native bridge caps reads and guards paused or destroyed readers',
+    () async {
+      final raw = ControlledRawSocket([
+        List.filled(8192, 1),
+        [2],
+      ]);
+      final socket = native.createSocketForTesting(raw);
+      addTearDown(socket.destroy);
+      raw.events.add(RawSocketEvent.read);
+      await Future<void>.delayed(Duration.zero);
+      expect(raw.readArguments, isEmpty);
+      final first = Completer<void>();
+      final second = Completer<void>();
+      late StreamSubscription<List<int>> subscription;
+      subscription = socket.listen((bytes) {
+        if (!first.isCompleted) {
+          expect(bytes.length, 8192);
+          subscription.pause();
+          first.complete();
+        } else {
+          expect(bytes, [2]);
+          second.complete();
+        }
+      });
+      await first.future;
+      expect(raw.readEventsEnabled, isFalse);
+      raw.events.add(RawSocketEvent.read);
+      await Future<void>.delayed(Duration.zero);
+      expect(raw.readArguments, [8192]);
+      subscription.resume();
+      await second.future;
+      expect(raw.readArguments, [8192, 8192]);
+      raw.events.add(RawSocketEvent.read);
+      socket.destroy();
+      await Future<void>.delayed(Duration.zero);
+      expect(raw.readArguments, [8192, 8192]);
+    },
+  );
+
+  test('C-04 accumulated small views own their bytes before backing reuse', () async {
+    final head = utf8.encode('{"value":"first');
+    final tail = utf8.encode('second"}');
+    final raw = ControlledRawSocket([
+      utf8.encode(
+            'HTTP/1.1 200 OK\r\nContent-Length: ${head.length + tail.length}\r\n\r\n',
+          ) +
+          head,
+      tail,
+    ]);
+    final socket = native.createSocketForTesting(raw);
+    addTearDown(socket.destroy);
+    final client = BridgedHttpClient(
+      HttpClient()..findProxy = (_) => 'DIRECT',
+      socket,
+    );
+    final transport = HttpOverrides.runZoned(
+      () => HttpTransport('http://127.0.0.1'),
+      createHttpClient: (_) => client,
+    );
+    addTearDown(transport.close);
+    expect(await transport.invoke('thing.get', {}), {'value': 'firstsecond'});
+    expect(raw.readArguments, [8192, 8192]);
+  });
+
   test('C-01 JSON POST preserves wire names and values', () async {
     final peer = await Peer.start((request) async {
       expect(request.method, 'POST');
@@ -272,7 +360,8 @@ void main() {
               read.complete();
             }
             if (event is ConformanceTransportEvent &&
-                event.phase == ConformanceTransportPhase.readerClosed) {
+                event.phase == ConformanceTransportPhase.readerClosed &&
+                !readerClosed.isCompleted) {
               readerClosed.complete();
             }
           },
@@ -291,9 +380,9 @@ void main() {
       expect(
         call.transportEvents.every(
           (event) =>
-              event.libraryRetainedBytes == null &&
-              event.retainedBytes == null &&
-              event.peakRetainedBytes == null,
+              event.libraryRetainedBytes == 0 &&
+              event.retainedBytes == event.runtimeRetainedBytes &&
+              event.peakRetainedBytes == event.runtimePeakRetainedBytes,
         ),
         isTrue,
       );
@@ -319,6 +408,11 @@ void main() {
         call.transportEvents.last.runtimePeakRetainedBytes,
         (head.length + tail.length) * 2,
       );
+      expect(
+        call.transportEvents.last.peakRetainedBytes,
+        (head.length + tail.length) * 2,
+      );
+      expect(call.transportEvents.last.retainedBytes, 0);
       expect(call.httpObservation!.responseConfirmed, isTrue);
       expect(call.httpObservation!.outcomeUnknown, isFalse);
       expect(call.httpObservation!.cancelObserved, isNull);
@@ -337,7 +431,95 @@ void main() {
           call.transportEvents[i].elapsedMs,
           greaterThanOrEqualTo(call.transportEvents[i - 1].elapsedMs),
         );
+        expect(
+          call.transportEvents[i].peakRetainedBytes,
+          greaterThanOrEqualTo(call.transportEvents[i - 1].peakRetainedBytes!),
+        );
       }
+    });
+
+    test('RT-3 confirms every request on a reused direct connection', () async {
+      final ports = <int>[];
+      final peer = await Peer.start((request) async {
+        ports.add(request.connectionInfo!.remotePort);
+        await reply(request, {});
+      });
+      final transport = peer.transport();
+      for (var i = 0; i < 2; i++) {
+        final call = conformanceCall('reuse-$i', 'thing.get', Observer());
+        await withConformanceCall(
+          call,
+          () => transport.invoke('thing.get', {}),
+        );
+        expect(call.httpObservation!.libraryRetainedBytes, 0);
+        expect(call.transportEvents.last.retainedBytes, 0);
+        expect(call.transportEvents.last.peakRetainedBytes, isNotNull);
+      }
+      expect(ports[1], ports[0]);
+    });
+
+    for (final profiled in [false, true]) {
+      test('RT-3 ${profiled ? 'profiler' : 'gzip'} stays unknown', () async {
+        final wasProfiled = HttpClient.enableTimelineLogging;
+        HttpClient.enableTimelineLogging = profiled;
+        addTearDown(() => HttpClient.enableTimelineLogging = wasProfiled);
+        final peer = await Peer.start((request) async {
+          if (profiled) {
+            await reply(request, {'value': 'kept'});
+          } else {
+            request.response.headers.set('content-encoding', 'gzip');
+            request.response.add(gzip.encode(utf8.encode('{"value":"kept"}')));
+            await request.response.close();
+          }
+        });
+        final call = conformanceCall('unknown', 'thing.get', Observer());
+        expect(
+          await withConformanceCall(
+            call,
+            () => peer.transport().invoke('thing.get', {}),
+          ),
+          {'value': 'kept'},
+        );
+        expect(call.transportEvents, isNotEmpty);
+        for (final event in call.transportEvents) {
+          expect(event.libraryRetainedBytes, isNull);
+          expect(event.retainedBytes, isNull);
+          expect(event.peakRetainedBytes, isNull);
+        }
+      });
+    }
+
+    test('RT-3 unknown and multiple exchanges never recover a known peak', () {
+      final call = conformanceCall('exchanges', 'thing.get', Observer());
+      final first = ConformanceHttpAttempt(call, 'thing.get');
+      first.transport(ConformanceTransportPhase.headers);
+      first.libraryRetainedBytes = 0;
+      first.retain(10);
+      first.transport(ConformanceTransportPhase.read);
+      expect(call.transportEvents.last.retainedBytes, isNull);
+      final second = ConformanceHttpAttempt(call, 'thing.get');
+      second.libraryRetainedBytes = 0;
+      second.transport(ConformanceTransportPhase.headers);
+      expect(call.transportEvents.last.peakRetainedBytes, isNull);
+      final connection = Object();
+      second.observeConnection(connection, 0);
+      second.observeConnection(connection, 0);
+      expect(second.fixedRetainedBytes, 0);
+      second.observeConnection(Object(), 0);
+      expect(second.fixedRetainedBytes, isNull);
+      second.observeConnection(connection, 0);
+      expect(second.fixedRetainedBytes, isNull);
+
+      final repeated = conformanceCall('repeated', 'thing.get', Observer());
+      final known = ConformanceHttpAttempt(repeated, 'thing.get');
+      known.libraryRetainedBytes = 0;
+      known.transport(ConformanceTransportPhase.headers);
+      expect(repeated.transportEvents.last.retainedBytes, 0);
+      final replay = ConformanceHttpAttempt(repeated, 'thing.get');
+      replay.libraryRetainedBytes = 0;
+      replay.transport(ConformanceTransportPhase.headers);
+      expect(repeated.transportEvents.last.retainedBytes, isNull);
+      expect(repeated.transportEvents.last.peakRetainedBytes, isNull);
     });
 
     test('RT-1 constructor monitor counts a real native HTTP send', () async {
@@ -611,7 +793,20 @@ void main() {
       await HttpOverrides.runZoned(
         () async {
           final transport = origin.transport().withBearer(accessToken);
-          expect(await transport.invoke('thing.get', {}), <String, Object?>{});
+          final call = conformanceCall('proxy', 'thing.get', Observer());
+          expect(
+            await withConformanceCall(
+              call,
+              () => transport.invoke('thing.get', {}),
+            ),
+            <String, Object?>{},
+          );
+          if (conformanceEnabled) {
+            for (final event in call.transportEvents) {
+              expect(event.retainedBytes, isNull);
+              expect(event.peakRetainedBytes, isNull);
+            }
+          }
         },
         findProxyFromEnvironment: (url, environment) {
           return 'PROXY 127.0.0.1:${proxy.server.port}';
@@ -801,12 +996,25 @@ void main() {
       SecurityContext.defaultContext.setTrustedCertificates(
         'test/fixtures/ca.pem',
       );
-      final result = await transport.invoke('thing.get', {
-        'value': 'a' * (256 * 1024),
-      }) as Map<String, Object?>;
+      final call = conformanceCall('tls-bound', 'thing.get', Observer());
+      final result = await withConformanceCall(
+        call,
+        () => transport.invoke('thing.get', {'value': 'a' * (256 * 1024)}),
+      ) as Map<String, Object?>;
       expect((result['value'] as String).length, 256 * 1024);
       expect(receivedBytes, 256 * 1024 + 12);
       expect(requests, 1);
+      if (conformanceEnabled) {
+        for (final event in call.transportEvents) {
+          expect(event.libraryRetainedBytes, 393216);
+          expect(event.retainedBytes, event.runtimeRetainedBytes! + 393216);
+          expect(
+            event.peakRetainedBytes,
+            event.runtimePeakRetainedBytes! + 393216,
+          );
+        }
+        expect(call.transportEvents.last.retainedBytes, 393216);
+      }
     },
   );
 
@@ -858,9 +1066,13 @@ void main() {
     );
   }
 
-  for (final status in [200, 302, 503]) {
+  for (final (status, framing) in [
+    for (final status in [200, 302, 503])
+      for (final framing in ['eof', 'content-length', 'chunked'])
+        (status, framing),
+  ]) {
     test(
-      'C-04 oversized unbounded $status stream aborts without waiting for EOF',
+      'C-04 oversized $framing $status stream aborts without waiting for EOF',
       () async {
         final disconnected = Completer<void>();
         final peer = await Peer.start((request) async {
@@ -879,10 +1091,19 @@ void main() {
               if (!disconnected.isCompleted) disconnected.complete();
             },
           );
-          socket.add(
-            utf8.encode('HTTP/1.1 $status Test\r\nConnection: close\r\n\r\n'),
-          );
-          socket.add(List.filled(1024 * 1024 + 1, 32));
+          const size = 1024 * 1024 + 1;
+          final headers = switch (framing) {
+            'content-length' => 'Content-Length: ${size + 1024}\r\n',
+            'chunked' => 'Transfer-Encoding: chunked\r\n',
+            _ => '',
+          };
+          socket.add([
+            ...utf8.encode(
+              'HTTP/1.1 $status Test\r\n${headers}Connection: close\r\n\r\n'
+              '${framing == 'chunked' ? '${size.toRadixString(16)}\r\n' : ''}',
+            ),
+            ...List.filled(size, 32),
+          ]);
           try {
             await socket.flush();
           } on SocketException {
@@ -890,7 +1111,7 @@ void main() {
           }
         });
         final call = conformanceCall(
-          'oversized-$status',
+          'oversized-$framing-$status',
           'thing.get',
           Observer(),
         );
@@ -920,8 +1141,12 @@ void main() {
             attempt.runtimePeakRetainedBytes,
             lessThanOrEqualTo(1024 * 1024),
           );
-          expect(attempt.libraryRetainedBytes, isNull);
-          expect(attempt.peakRetainedBytes, isNull);
+          expect(attempt.libraryRetainedBytes, 0);
+          expect(attempt.peakRetainedBytes, attempt.runtimePeakRetainedBytes);
+          for (final event in call.transportEvents) {
+            expect(event.retainedBytes, event.runtimeRetainedBytes);
+            expect(event.peakRetainedBytes, event.runtimePeakRetainedBytes);
+          }
           final phases = call.transportEvents
               .map((event) => event.phase)
               .toList();

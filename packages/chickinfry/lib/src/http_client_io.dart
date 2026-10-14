@@ -11,6 +11,26 @@ import 'testing/conformance.dart';
 const isNative = true;
 final _abortKey = Object();
 
+const _readCap = 8192;
+// Dart pins da6595cd6bb5d4c0a185d759a025e879ff06e631 (3.13.0) and
+// 04bcd1036cdc799ac6564988f159ee454d42c822 (3.13.5): socket.cc:531-565,
+// http_parser.dart:907-968, stream_impl.dart:1025-1049,1108-1117.
+// Raw short-read overlap (2C), parser (C), iterator (C), owned-copy handoff (C)
+// total 5C = 40,960 bytes, independent of body length and below 64 KiB.
+// Plaintext excludes these transient slots; retained counts owned body copies.
+const _plainTransientBytes = 5 * _readCap;
+// Same Dart pins: secure_socket_patch.dart:57-79 (2*8192 + 2*10240 rings),
+// secure_socket_filter.cc:43-45,395-420,504-505 (2*10240 BIO),
+// secure_socket.dart:1136-1165 (2*10240 raw staging). BoringSSL pin
+// 2e508c973d634b3aa51b71db5062bc6b096e5031: ssl_buffer.cc:49-93,
+// internal.h:1003-1052,2809-2816 (4*65535 resize overlap + 2*5 inline).
+// Fixed allocations total 380,934 including 5C, rounded up to 384 KiB.
+const _tlsRetainedBytes = 384 * 1024;
+
+// Internal access to the production bridge for native read/pause/backing tests.
+Socket createSocketForTesting(RawSocket raw) =>
+    _TlsSocket(_PlainRawSocket(raw));
+
 http.Client createClient(Duration timeout) => _NativeClient(timeout);
 
 class _NativeClient extends IOClient {
@@ -26,13 +46,36 @@ class _NativeClient extends IOClient {
     if (conformanceEnabled) {
       currentConformanceConstruction?.enterHttpSend();
     }
-    return runZoned(
+    final result = runZoned(
       () => super.send(request),
       zoneValues: {
         _abortKey: request is http.Abortable ? request.abortTrigger : null,
       },
     );
+    return conformanceEnabled ? _observeResponse(result) : result;
   }
+}
+
+// Keep observation captures out of the off-mode request closure context.
+Future<IOStreamedResponse> _observeResponse(Future<IOStreamedResponse> result) {
+  final attempt = currentConformanceCall?.httpObservation;
+  final profiled =
+      !const bool.fromEnvironment('dart.vm.product') &&
+      HttpClient.enableTimelineLogging;
+  return result.then((response) {
+    final encoding = response.headers['content-encoding']?.trim().toLowerCase();
+    if (attempt != null) {
+      attempt.confirmRetainedBytes(
+        Platform.version,
+        profiled:
+            profiled ||
+            (!const bool.fromEnvironment('dart.vm.product') &&
+                HttpClient.enableTimelineLogging),
+        encoding: encoding,
+      );
+    }
+    return response;
+  });
 }
 
 Future<ConnectionTask<Socket>> _connect(
@@ -53,13 +96,12 @@ Future<ConnectionTask<Socket>> _connect(
   if (url.scheme != 'https') {
     if (conformanceEnabled) {
       currentConformanceCall?.httpObservation?.socketBytesWritten = 0;
-      final pending = await RawSocket.startConnect(url.host, url.port);
-      return ConnectionTask.fromSocket(
-        pending.socket.then<Socket>((raw) => _TlsSocket(_PlainRawSocket(raw))),
-        pending.cancel,
-      );
     }
-    return Socket.startConnect(url.host, url.port);
+    final pending = await RawSocket.startConnect(url.host, url.port);
+    return ConnectionTask.fromSocket(
+      pending.socket.then<Socket>((raw) => _TlsSocket(_PlainRawSocket(raw))),
+      pending.cancel,
+    );
   }
   if (conformanceEnabled) {
     currentConformanceCall?.httpObservation?.socketBytesWritten = 0;
@@ -104,7 +146,7 @@ Future<ConnectionTask<Socket>> _connect(
 }
 
 // HttpClient retains HTTP parsing; this adapter only bridges raw TLS to Socket.
-// Observe plaintext writes through the same bridge while preserving off-mode TLS types and AOT layout.
+// Plaintext uses the same bounded byte path with instrumentation on or off.
 class _PlainRawSocket implements RawSecureSocket {
   _PlainRawSocket(this.raw);
   final RawSocket raw;
@@ -160,6 +202,24 @@ class _PlainRawSocket implements RawSecureSocket {
 
 class _TlsSocket extends Stream<Uint8List> implements Socket {
   _TlsSocket(this._raw) {
+    assert(_plainTransientBytes <= 64 * 1024);
+    // Pinned BoringSSL ssl/ssl_buffer.cc:49-93 and
+    // ssl/internal.h:1003-1052,2809-2816 require both old/new allocations.
+    assert(
+      _tlsRetainedBytes >=
+          2 * 8192 +
+              2 * 10240 +
+              2 * 10240 +
+              4 * 65535 +
+              2 * 5 +
+              2 * 10240 +
+              _plainTransientBytes,
+    );
+    // The same Dart pins: stream_impl.dart:308-315,470-499,1025-1049;
+    // http 1.6.0 lib/src/io_client.dart:155-201 (archive SHA-256
+    // 87721a4a50b19c7f1d49001e51409bddc46303966ce89a65af4f4e6004896412)
+    // forwards synchronously and propagates pause.
+    // Async delivery would invalidate the bounded parser/iterator handoff proof.
     _input = StreamController<Uint8List>(
       sync: true,
       onListen: () => _raw.readEventsEnabled = true,
@@ -176,7 +236,8 @@ class _TlsSocket extends Stream<Uint8List> implements Socket {
         (event) {
           switch (event) {
             case RawSocketEvent.read:
-              final bytes = _raw.read();
+              if (_destroyed || _input.isPaused || !_input.hasListener) break;
+              final bytes = _raw.read(_readCap);
               if (bytes != null) _input.add(bytes);
             case RawSocketEvent.write:
               _writer.writable();
@@ -250,7 +311,6 @@ class _TlsSocket extends Stream<Uint8List> implements Socket {
   void add(List<int> data) {
     if (conformanceEnabled) {
       _writer.observation = currentConformanceCall?.httpObservation;
-      _writer.observation?.socketBytesWritten ??= 0;
     }
     _sink.add(data);
   }
@@ -262,7 +322,6 @@ class _TlsSocket extends Stream<Uint8List> implements Socket {
   Future<void> addStream(Stream<List<int>> stream) {
     if (conformanceEnabled) {
       _writer.observation = currentConformanceCall?.httpObservation;
-      _writer.observation?.socketBytesWritten ??= 0;
     }
     return _sink.addStream(stream);
   }
@@ -320,6 +379,10 @@ class _TlsWriter implements StreamConsumer<List<int>> {
       while (offset < bytes.length) {
         if (_failed) throw const SocketException('Connection closed.');
         if (conformanceEnabled) {
+          observation?.observeConnection(
+            this,
+            raw is _PlainRawSocket ? 0 : _tlsRetainedBytes,
+          );
           final written = raw.write(bytes, offset);
           offset += written;
           final attempt = observation;
