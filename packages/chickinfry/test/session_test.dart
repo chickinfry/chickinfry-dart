@@ -483,7 +483,51 @@ void main() {
     );
   }
 
-  test('C-09 distinct store objects and independent transports merge refresh; late 401 adopts rotation', () async {
+  for (final expiry in ['2026-10-21T12:00:00Z', '2026-10-19T12:00:00Z']) {
+    test(
+      'C-08 refresh accepts changed expiry $expiry and replays once',
+      () async {
+        final rotated = credentials(rotated: true, refreshExpiry: expiry);
+        var business = 0;
+        var refreshes = 0;
+        final peer = await Peer.start((request) async {
+          final body = await readBody(request);
+          if (request.uri.path == '/auth.refresh') {
+            refreshes++;
+            expect(body, {'refresh_token': refreshToken});
+            await reply(request, rotated.toJson());
+          } else {
+            business++;
+            expect(
+              request.headers.value('authorization'),
+              'Bearer ${business == 1 ? accessToken : nextAccessToken}',
+            );
+            await reply(
+              request,
+              business == 1 ? {'error': 'invalid_token'} : {'value': 'ok'},
+              status: business == 1 ? 401 : 200,
+            );
+          }
+        });
+        final record = Record(credentials());
+        final transport = peer.transport().withSession(
+          MemorySessionStore(peer.origin, 'changed-expiry', record),
+        );
+        expect(await transport.invoke('thing.get', {}), {'value': 'ok'});
+        expect(refreshes, 1);
+        expect(business, 2);
+        expect(record.value, rotated);
+        expect(record.replacements, 1);
+        expect(record.deletions, 0);
+      },
+    );
+  }
+
+  test('C-09 distinct store objects and independent transports merge refresh; late 401 adopts rolling rotation', () async {
+    final rotated = credentials(
+      rotated: true,
+      refreshExpiry: '2026-10-21T12:00:00Z',
+    );
     var initial = 0;
     var refreshes = 0;
     var replays = 0;
@@ -551,7 +595,7 @@ void main() {
         refreshes++;
         if (!refreshStarted.isCompleted) refreshStarted.complete();
         await releaseRefresh.future;
-        await reply(request, credentials(rotated: true).toJson());
+        await reply(request, rotated.toJson());
       } else if (request.headers.value('authorization') ==
           'Bearer $accessToken') {
         initial++;
@@ -641,6 +685,7 @@ void main() {
         {'value': 'ok'},
       ]),
     );
+    expect(record.value, rotated);
     releaseLate.complete();
     expect(await late, {'value': 'ok'});
     expect(refreshes, 1);
@@ -1273,7 +1318,7 @@ void main() {
     },
   );
 
-  for (final change in ['user', 'session', 'expiry', 'shape']) {
+  for (final change in ['user', 'session', 'shape']) {
     test(
       'C-08 refresh rejects $change change without replacing credentials or replaying',
       () async {
@@ -1289,9 +1334,6 @@ void main() {
                       rotated: true,
                       user: change == 'user' ? 'other' : 'user-one',
                       session: change == 'session' ? 'other' : 'session-one',
-                      refreshExpiry: change == 'expiry'
-                          ? '2026-10-21T12:00:00Z'
-                          : '2026-10-20T12:00:00.000000Z',
                     ).toJson(),
             );
           } else {

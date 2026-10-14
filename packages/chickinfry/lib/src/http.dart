@@ -225,10 +225,7 @@ final class HttpTransport implements ClientTransport {
   }
 
   bool _sameSession(SessionCredentials left, SessionCredentials right) =>
-      left.userId == right.userId &&
-      left.sessionId == right.sessionId &&
-      DateTime.parse(left.refreshExpiresAt) ==
-          DateTime.parse(right.refreshExpiresAt);
+      left.userId == right.userId && left.sessionId == right.sessionId;
 
   Future<SessionCredentials> _runRefresh(
     SessionStore store,
