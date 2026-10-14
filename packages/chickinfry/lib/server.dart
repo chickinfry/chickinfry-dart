@@ -6,3 +6,5 @@ export 'src/server/application.dart';
 export 'src/server/interop_stub.dart'
     if (dart.library.js_interop) 'src/server/interop.dart'
     show runApplication;
+
+export 'src/server/database.dart';

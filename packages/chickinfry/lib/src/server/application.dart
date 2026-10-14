@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:typed_data';
 
 import '../errors.dart';
+import 'database.dart';
 
 /// Immutable public request metadata without host resources or credentials.
 final class ServerRequest {
@@ -35,7 +36,7 @@ final class SessionUser {
 }
 
 /// Request context for an application without selected resources.
-final class Context {
+class Context {
   const Context(this.request);
   final ServerRequest request;
   Session? get session => null;
@@ -59,14 +60,16 @@ final class Application {
       String,
       Future<Map<String, Object?>> Function(Context, Map<String, Object?>)
     >
-    operations,
-  ) : _operations = Map.unmodifiable(operations);
+    operations, {
+    this._contextFactory,
+  }) : _operations = Map.unmodifiable(operations);
 
   final Map<
     String,
     Future<Map<String, Object?>> Function(Context, Map<String, Object?>)
   >
   _operations;
+  final Context Function(ServerRequest, DatabaseConnection?)? _contextFactory;
   static const maxRequestBytes = 4 << 20;
   static final _code = RegExp(r'^[a-z_]{1,64}$');
   static const _statuses = {400, 401, 403, 404, 409, 413, 429, 503};
@@ -75,6 +78,7 @@ final class Application {
     ServerRequest request,
     Stream<List<int>> body, {
     String? rawUri,
+    DatabaseConnection? connection,
   }) async {
     try {
       final operation =
@@ -118,7 +122,10 @@ final class Application {
       if (request.headers.containsKey('authorization')) {
         return _error('invalid_token', 401);
       }
-      final output = await operation(Context(request), input);
+      final output = await operation(
+        _contextFactory?.call(request, connection) ?? Context(request),
+        input,
+      );
       return ServerResponse(200, jsonEncode(output));
     } on OperationError catch (error) {
       if (_code.hasMatch(error.code) && _statuses.contains(error.status)) {
