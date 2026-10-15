@@ -128,7 +128,10 @@ final class Application {
       );
       return ServerResponse(200, jsonEncode(output));
     } on OperationError catch (error) {
-      if (_code.hasMatch(error.code) && _statuses.contains(error.status)) {
+      // Status 501 is reserved for the explicit not_implemented contract.
+      if (_code.hasMatch(error.code) &&
+          (_statuses.contains(error.status) ||
+              (error.status == 501 && error.code == 'not_implemented'))) {
         return _error(error.code, error.status);
       }
       return _error('operation_failed', 500);

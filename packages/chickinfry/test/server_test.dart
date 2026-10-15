@@ -27,6 +27,14 @@ void main() {
             throw const OperationError('SECRET_SENTINEL', 409);
           case 'badstatus':
             throw const OperationError('conflict', 200);
+          case 'notimplemented':
+            throw const OperationError('not_implemented', 501);
+          case 'other501':
+            throw const OperationError('conflict', 501);
+          case 'builtin':
+            throw UnimplementedError('not_implemented');
+          case 'messageonly':
+            throw Exception('not_implemented');
         }
         return {'request_id': input['request_id'], 'message': input['message']};
       },
@@ -165,6 +173,10 @@ void main() {
         'sentinel',
         'badcode',
         'badstatus',
+        'notimplemented',
+        'other501',
+        'builtin',
+        'messageonly',
       ]) {
         final response = await call(
           input: {'request_id': 'not-a-uuid', 'message': message},
@@ -175,6 +187,8 @@ void main() {
               ? 409
               : message == 'protected'
               ? 401
+              : message == 'notimplemented'
+              ? 501
               : 500,
         );
         expect(
@@ -183,6 +197,8 @@ void main() {
               ? '{"error":"conflict"}'
               : message == 'protected'
               ? '{"error":"unauthenticated"}'
+              : message == 'notimplemented'
+              ? '{"error":"not_implemented"}'
               : '{"error":"operation_failed"}',
         );
       }
