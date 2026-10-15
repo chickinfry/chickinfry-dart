@@ -35,6 +35,10 @@ Run a targeted check with
 | Drop the explicit 501 exception (original status set) | DX-08: explicit `not_implemented`/501 business error surfaces as 501 with its code | `server_test.dart`: `only permitted business errors` | Detected: expected status 501, observed 500 with `operation_failed` |
 | Allow 501 regardless of code | DX-08: other-code 501 stays `operation_failed`/500 | `server_test.dart`: `only permitted business errors` | Detected: expected status 500, observed 501 with `conflict` |
 | Keep Proxy-Authorization in handler headers | Proxy credentials never reach handlers or context factories (RFC 9110 11.7.2) | `server_test.dart`: `Proxy-Authorization never reaches` | Detected: both paths expected the key absent and observed it present |
+| Run setup on every request without caching the Future | DX-12: one setup per application instance; concurrent first requests wait on one setup | `server_test.dart`: `setup gates concurrent requests once` | Detected: expected setup count 1, observed 2 (latched-failure variants observed 3) |
+| Clear the setup failure cache so the next request retries setup | DX-12: a failed setup stays latched with exact 500 responses and no handler work | `server_test.dart`: `setup failure is latched` | Detected: expected setup count 1, observed 2 after the retried request |
+| Return 401 `invalid_token` when an `authorization` header is present | DX-AUTH-NONE-03: auth-free apps pass credentials through to a 200 business call | `server_test.dart`: `application credentials reach handlers` | Detected: expected status 200, observed 401; handler not called |
+| Drop `cookie` from request headers | DX-AUTH-NONE-03: both credential headers reach handlers unchanged | `server_test.dart`: `application credentials reach handlers` | Detected: cookie equality check flipped from true to false (value mismatch) |
 
 The deletion variant reads the latest record and conditionally deletes that
 record, deliberately ignoring the request's expected credentials. The store

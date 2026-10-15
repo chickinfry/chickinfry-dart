@@ -5,7 +5,7 @@ import 'dart:typed_data';
 import '../errors.dart';
 import 'database.dart';
 
-/// Immutable public request metadata without host resources or credentials.
+/// Immutable request metadata excluding hop-by-hop proxy credentials.
 final class ServerRequest {
   ServerRequest({
     required this.method,
@@ -23,30 +23,15 @@ final class ServerRequest {
   final Map<String, String> headers;
 }
 
-/// A verified session and its public user identity.
-final class Session {
-  const Session({required this.id, required this.user});
-  final String id;
-  final SessionUser user;
-}
-
-/// Public user identity, distinct from the session identity.
-final class SessionUser {
-  const SessionUser({required this.id, required this.email});
-  final String id;
-  final String email;
-}
-
 /// Request context for an application without selected resources.
 class Context {
   const Context(this.request);
   final ServerRequest request;
-  Session? get session => null;
 }
 
-/// Requires a verified session before protected application work.
-Session requireSession(Context context) =>
-    context.session ?? (throw const OperationError('unauthenticated', 401));
+final class ApplicationOptions {
+  const ApplicationOptions();
+}
 
 /// Internal response consumed by the platform connection.
 final class ServerResponse {
@@ -64,6 +49,7 @@ final class Application {
     >
     operations, {
     this._contextFactory,
+    this._setup,
   }) : _operations = Map.unmodifiable(operations);
 
   final Map<
@@ -72,6 +58,8 @@ final class Application {
   >
   _operations;
   final Context Function(ServerRequest, DatabaseConnection?)? _contextFactory;
+  final Future<ApplicationOptions> Function()? _setup;
+  Future<ApplicationOptions>? _setupResult;
   static const maxRequestBytes = 4 << 20;
   static final _code = RegExp(r'^[a-z_]{1,64}$');
   static const _statuses = {400, 401, 403, 404, 409, 413, 429, 503};
@@ -83,6 +71,14 @@ final class Application {
     DatabaseConnection? connection,
   }) async {
     try {
+      final setup = _setup;
+      if (setup != null) {
+        try {
+          await (_setupResult ??= Future<ApplicationOptions>.sync(setup));
+        } catch (_) {
+          return _error('operation_failed', 500);
+        }
+      }
       final operation =
           _operations[request.uri.path.substring(
             request.uri.path.isEmpty ? 0 : 1,
@@ -121,9 +117,6 @@ final class Application {
         return _error('invalid_json', 400);
       }
       if (input is! Map<String, Object?>) return _error('invalid_input', 400);
-      if (request.headers.containsKey('authorization')) {
-        return _error('invalid_token', 401);
-      }
       final output = await operation(
         _contextFactory?.call(request, connection) ?? Context(request),
         input,

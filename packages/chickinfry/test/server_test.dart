@@ -19,8 +19,6 @@ void main() {
         switch (input['message']) {
           case 'business':
             throw const OperationError('conflict', 409);
-          case 'protected':
-            requireSession(context);
           case 'sentinel':
             throw StateError('SECRET_SENTINEL');
           case 'badcode':
@@ -44,17 +42,13 @@ void main() {
     String method = 'POST',
     String path = '/demo.echo',
     String contentType = 'application/json',
-    String? authorization,
     Object? input,
     List<int>? bytes,
   }) => app.handle(
     ServerRequest(
       method: method,
       uri: Uri.parse('https://example.test$path'),
-      headers: {
-        'Content-Type': contentType,
-        if (authorization != null) 'authorization': authorization,
-      },
+      headers: {'Content-Type': contentType},
     ),
     Stream.value(
       bytes ??
@@ -67,19 +61,16 @@ void main() {
     rawUri: 'https://example.test$path',
   );
 
-  test(
-    'wire values remain strings and anonymous contexts have no session',
-    () async {
-      final response = await call();
-      expect(response.status, 200);
-      expect(jsonDecode(response.body), {
-        'request_id': 'not-a-uuid',
-        'message': '\uC548\uB155\uD558\uC138\uC694',
-      });
-      expect(calls, 1);
-      expect(() => runApplication(app), throwsUnsupportedError);
-    },
-  );
+  test('wire values remain strings without setup', () async {
+    final response = await call();
+    expect(response.status, 200);
+    expect(jsonDecode(response.body), {
+      'request_id': 'not-a-uuid',
+      'message': '\uC548\uB155\uD558\uC138\uC694',
+    });
+    expect(calls, 1);
+    expect(() => runApplication(app), throwsUnsupportedError);
+  });
   test(
     'non-object input never invokes even an unvalidated operation',
     () async {
@@ -102,6 +93,84 @@ void main() {
       expect(invoked, 0);
     },
   );
+  test(
+    'setup gates concurrent requests once per application instance',
+    () async {
+      final started = Completer<void>();
+      final release = Completer<ApplicationOptions>();
+      var setupCalls = 0;
+      var handlerCalls = 0;
+      Application createApplication() => Application(
+        {
+          'demo.echo': (context, input) async {
+            handlerCalls++;
+            return input;
+          },
+        },
+        setup: () {
+          setupCalls++;
+          if (!started.isCompleted) started.complete();
+          return release.future;
+        },
+      );
+      app = createApplication();
+      expect(setupCalls, 0);
+      final first = call();
+      final second = call();
+      await started.future;
+      expect(setupCalls, 1);
+      expect(handlerCalls, 0);
+      release.complete(const ApplicationOptions());
+      for (final response in await Future.wait([first, second])) {
+        expect(response.status, 200);
+      }
+      expect((await call()).status, 200);
+      expect(setupCalls, 1);
+      expect(handlerCalls, 3);
+      app = createApplication();
+      expect((await call()).status, 200);
+      expect(setupCalls, 2);
+      expect(handlerCalls, 4);
+    },
+  );
+  for (final synchronous in [false, true]) {
+    test('setup failure is latched (synchronous: $synchronous)', () async {
+      final started = Completer<void>();
+      final release = Completer<ApplicationOptions>();
+      var setupCalls = 0;
+      var handlerCalls = 0;
+      app = Application(
+        {
+          'demo.echo': (context, input) async {
+            handlerCalls++;
+            return input;
+          },
+        },
+        setup: () {
+          setupCalls++;
+          if (!started.isCompleted) started.complete();
+          if (synchronous) {
+            throw const OperationError('setup_sentinel', 409);
+          }
+          return release.future;
+        },
+      );
+      final first = call();
+      final second = call();
+      await started.future;
+      expect(handlerCalls, 0);
+      if (!synchronous) release.completeError(StateError('SETUP_SENTINEL'));
+      final responses = await Future.wait([first, second]);
+      responses.add(await call());
+      for (final response in responses) {
+        expect(response.status, 500);
+        expect(response.body, '{"error":"operation_failed"}');
+        expect(response.body.toLowerCase(), isNot(contains('sentinel')));
+      }
+      expect(setupCalls, 1);
+      expect(handlerCalls, 0);
+    });
+  }
   test('HTTP and malformed input fail before handler work', () async {
     for (final response in [
       await call(method: 'GET'),
@@ -115,7 +184,6 @@ void main() {
       await call(input: {'message': 'x'}),
       await call(input: {'request_id': null, 'message': 'x'}),
       await call(input: {'request_id': 4, 'message': 'x'}),
-      await call(authorization: 'Bearer wrong'),
     ]) {
       expect(response.status, isNot(200));
     }
@@ -169,7 +237,6 @@ void main() {
     () async {
       for (final message in [
         'business',
-        'protected',
         'sentinel',
         'badcode',
         'badstatus',
@@ -185,8 +252,6 @@ void main() {
           response.status,
           message == 'business'
               ? 409
-              : message == 'protected'
-              ? 401
               : message == 'notimplemented'
               ? 501
               : 500,
@@ -195,8 +260,6 @@ void main() {
           response.body,
           message == 'business'
               ? '{"error":"conflict"}'
-              : message == 'protected'
-              ? '{"error":"unauthenticated"}'
               : message == 'notimplemented'
               ? '{"error":"not_implemented"}'
               : '{"error":"operation_failed"}',
@@ -237,7 +300,6 @@ void main() {
       expect(jsonDecode(second.body), {'message': 'B', 'header': 'B'});
       release.complete();
       expect(jsonDecode((await first).body), {'message': 'A', 'header': 'A'});
-      expect(contexts[0].session, isNull);
       expect(
         () => contexts[0].request.headers['x-request'] = 'changed',
         throwsUnsupportedError,
@@ -252,7 +314,8 @@ void main() {
           headers: const {
             'content-type': 'application/json',
             'Proxy-Authorization': 'Basic transport-only',
-            'cookie': 'session=transport-only',
+            'Authorization': 'Bearer application-only',
+            'Cookie': 'session=transport-only',
             'x-request': 'kept',
           },
         ),
@@ -262,20 +325,28 @@ void main() {
     expect(headers.containsKey('proxy-authorization'), isFalse);
     expect(headers['proxy-authorization'], isNull);
     expect(headers.containsKey('cookie'), isTrue);
+    expect(headers['authorization'] == 'Bearer application-only', isTrue);
+    expect(headers['cookie'] == 'session=transport-only', isTrue);
     expect(headers.containsKey('x-request'), isTrue);
   }
 
-  test('Proxy-Authorization never reaches handlers', () async {
-    Map<String, String>? handlerHeaders;
-    final app = Application({
-      'demo.echo': (context, input) async {
-        handlerHeaders = context.request.headers;
-        return {};
-      },
-    });
-    expect((await callWithProxyCredentials(app)).status, 200);
-    expectNoProxyCredentials(handlerHeaders!);
-  });
+  test(
+    'application credentials reach handlers without proxy credentials',
+    () async {
+      Map<String, String>? handlerHeaders;
+      var calls = 0;
+      final app = Application({
+        'demo.echo': (context, input) async {
+          calls++;
+          handlerHeaders = context.request.headers;
+          return {};
+        },
+      });
+      expect((await callWithProxyCredentials(app)).status, 200);
+      expectNoProxyCredentials(handlerHeaders!);
+      expect(calls, 1);
+    },
+  );
   test('Proxy-Authorization never reaches context factories', () async {
     ServerRequest? factoryRequest;
     final app = Application(
