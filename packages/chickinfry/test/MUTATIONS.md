@@ -34,6 +34,7 @@ Run a targeted check with
 | Remove original origin string validation | C-02: reject paths and encoded hosts before URI normalization | `http_test.dart`: `origin validation and normalization` | Detected: a dot path returned a transport instead of `invalid_origin` |
 | Drop the explicit 501 exception (original status set) | DX-08: explicit `not_implemented`/501 business error surfaces as 501 with its code | `server_test.dart`: `only permitted business errors` | Detected: expected status 501, observed 500 with `operation_failed` |
 | Allow 501 regardless of code | DX-08: other-code 501 stays `operation_failed`/500 | `server_test.dart`: `only permitted business errors` | Detected: expected status 500, observed 501 with `conflict` |
+| Keep Proxy-Authorization in handler headers | Proxy credentials never reach handlers or context factories (RFC 9110 11.7.2) | `server_test.dart`: `Proxy-Authorization never reaches` | Detected: both paths expected the key absent and observed it present |
 
 The deletion variant reads the latest record and conditionally deletes that
 record, deliberately ignoring the request's expected credentials. The store

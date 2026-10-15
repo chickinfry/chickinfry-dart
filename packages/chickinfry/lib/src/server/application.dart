@@ -12,8 +12,10 @@ final class ServerRequest {
     required this.uri,
     required Map<String, String> headers,
   }) : headers = Map.unmodifiable({
+         // Proxy credentials are hop-by-hop (RFC 9110 11.7.2) and must not reach handlers.
          for (final entry in headers.entries)
-           entry.key.toLowerCase(): entry.value,
+           if (entry.key.toLowerCase() != 'proxy-authorization')
+             entry.key.toLowerCase(): entry.value,
        });
 
   final String method;

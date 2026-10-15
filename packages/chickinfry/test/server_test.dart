@@ -244,4 +244,48 @@ void main() {
       );
     },
   );
+  Future<ServerResponse> callWithProxyCredentials(Application app) =>
+      app.handle(
+        ServerRequest(
+          method: 'POST',
+          uri: Uri.parse('https://example.test/demo.echo'),
+          headers: const {
+            'content-type': 'application/json',
+            'Proxy-Authorization': 'Basic transport-only',
+            'cookie': 'session=transport-only',
+            'x-request': 'kept',
+          },
+        ),
+        Stream.value(utf8.encode('{"message":"x"}')),
+      );
+  void expectNoProxyCredentials(Map<String, String> headers) {
+    expect(headers.containsKey('proxy-authorization'), isFalse);
+    expect(headers['proxy-authorization'], isNull);
+    expect(headers.containsKey('cookie'), isTrue);
+    expect(headers.containsKey('x-request'), isTrue);
+  }
+
+  test('Proxy-Authorization never reaches handlers', () async {
+    Map<String, String>? handlerHeaders;
+    final app = Application({
+      'demo.echo': (context, input) async {
+        handlerHeaders = context.request.headers;
+        return {};
+      },
+    });
+    expect((await callWithProxyCredentials(app)).status, 200);
+    expectNoProxyCredentials(handlerHeaders!);
+  });
+  test('Proxy-Authorization never reaches context factories', () async {
+    ServerRequest? factoryRequest;
+    final app = Application(
+      {'demo.echo': (context, input) async => {}},
+      contextFactory: (request, connection) {
+        factoryRequest = request;
+        return Context(request);
+      },
+    );
+    expect((await callWithProxyCredentials(app)).status, 200);
+    expectNoProxyCredentials(factoryRequest!.headers);
+  });
 }
