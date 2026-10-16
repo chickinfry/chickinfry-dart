@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:chickinfry/server.dart';
@@ -62,6 +63,7 @@ void main() {
   );
 
   test('wire values remain strings without setup', () async {
+    await app.prepare();
     final response = await call();
     expect(response.status, 200);
     expect(jsonDecode(response.body), {
@@ -115,16 +117,25 @@ void main() {
       );
       app = createApplication();
       expect(setupCalls, 0);
+      var prepared = 0;
+      final preparations = [
+        app.prepare().then((_) => prepared++),
+        app.prepare().then((_) => prepared++),
+      ];
       final first = call();
       final second = call();
       await started.future;
       expect(setupCalls, 1);
       expect(handlerCalls, 0);
+      expect(prepared, 0);
       release.complete(const ApplicationOptions());
+      await Future.wait(preparations);
+      expect(prepared, 2);
       for (final response in await Future.wait([first, second])) {
         expect(response.status, 200);
       }
       expect((await call()).status, 200);
+      await app.prepare();
       expect(setupCalls, 1);
       expect(handlerCalls, 3);
       app = createApplication();
@@ -139,6 +150,9 @@ void main() {
       final release = Completer<ApplicationOptions>();
       var setupCalls = 0;
       var handlerCalls = 0;
+      final failure = synchronous
+          ? const OperationError('setup_sentinel', 409)
+          : StateError('SETUP_SENTINEL');
       app = Application(
         {
           'demo.echo': (context, input) async {
@@ -150,16 +164,19 @@ void main() {
           setupCalls++;
           if (!started.isCompleted) started.complete();
           if (synchronous) {
-            throw const OperationError('setup_sentinel', 409);
+            throw failure;
           }
           return release.future;
         },
       );
       final first = call();
+      final preparation = expectLater(app.prepare(), throwsA(same(failure)));
       final second = call();
       await started.future;
       expect(handlerCalls, 0);
-      if (!synchronous) release.completeError(StateError('SETUP_SENTINEL'));
+      if (!synchronous) release.completeError(failure);
+      await preparation;
+      await expectLater(app.prepare(), throwsA(same(failure)));
       final responses = await Future.wait([first, second]);
       responses.add(await call());
       for (final response in responses) {
@@ -171,6 +188,43 @@ void main() {
       expect(handlerCalls, 0);
     });
   }
+  test(
+    'platform registration and readiness are not public server API',
+    () async {
+      final build = Directory('build')..createSync(recursive: true);
+      final probe = build.createTempSync('ready_public_api_');
+      addTearDown(() {
+        print(
+          'Removing API probe: ${probe.listSync().map((entry) => entry.path)}',
+        );
+        probe.deleteSync(recursive: true);
+      });
+      final source = File('${probe.path}/negative.dart')
+        ..writeAsStringSync('''
+import 'package:chickinfry/server.dart' as server;
+
+void main() {
+  server.__chikDartRegister;
+  server._register;
+  server.ready;
+}
+''');
+      final result = await Process.run(Platform.resolvedExecutable, [
+        'analyze',
+        '--format=machine',
+        source.path,
+      ]);
+      expect(result.exitCode, 3);
+      final diagnostics = (result.stdout as String).trim().split('\n');
+      expect(diagnostics, hasLength(3));
+      for (final name in ['__chikDartRegister', '_register', 'ready']) {
+        expect(
+          diagnostics.singleWhere((line) => line.contains("'$name'")),
+          contains('|UNDEFINED_PREFIXED_NAME|'),
+        );
+      }
+    },
+  );
   test('HTTP and malformed input fail before handler work', () async {
     for (final response in [
       await call(method: 'GET'),

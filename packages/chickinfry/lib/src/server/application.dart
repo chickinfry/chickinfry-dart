@@ -64,6 +64,15 @@ final class Application {
   static final _code = RegExp(r'^[a-z_]{1,64}$');
   static const _statuses = {400, 401, 403, 404, 409, 413, 429, 503};
 
+  /// Called by the platform connection before reporting readiness.
+  /// Shares one setup result with [handle], retaining failures without retrying.
+  Future<void> prepare() async {
+    final setup = _setup;
+    if (setup != null) {
+      await (_setupResult ??= Future<ApplicationOptions>.sync(setup));
+    }
+  }
+
   Future<ServerResponse> handle(
     ServerRequest request,
     Stream<List<int>> body, {
@@ -71,13 +80,10 @@ final class Application {
     DatabaseConnection? connection,
   }) async {
     try {
-      final setup = _setup;
-      if (setup != null) {
-        try {
-          await (_setupResult ??= Future<ApplicationOptions>.sync(setup));
-        } catch (_) {
-          return _error('operation_failed', 500);
-        }
+      try {
+        await prepare();
+      } catch (_) {
+        return _error('operation_failed', 500);
       }
       final operation =
           _operations[request.uri.path.substring(

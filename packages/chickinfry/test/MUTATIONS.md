@@ -39,6 +39,23 @@ Run a targeted check with
 | Clear the setup failure cache so the next request retries setup | DX-12: a failed setup stays latched with exact 500 responses and no handler work | `server_test.dart`: `setup failure is latched` | Detected: expected setup count 1, observed 2 after the retried request |
 | Return 401 `invalid_token` when an `authorization` header is present | DX-AUTH-NONE-03: auth-free apps pass credentials through to a 200 business call | `server_test.dart`: `application credentials reach handlers` | Detected: expected status 200, observed 401; handler not called |
 | Drop `cookie` from request headers | DX-AUTH-NONE-03: both credential headers reach handlers unchanged | `server_test.dart`: `application credentials reach handlers` | Detected: cookie equality check flipped from true to false (value mismatch) |
+| Run setup on every `prepare` call without caching the result | Readiness and requests share one setup per instance; concurrent prepares wait on one setup | `server_test.dart`: `setup gates concurrent requests once` | Detected: expected setup count 1, observed 4 before release (latched variants observed 5) |
+| Clear the cached setup failure so the next `prepare` retries | A failed setup stays latched with the same failure object and one setup call | `server_test.dart`: `setup failure is latched` | Detected: expected setup count 1, observed 3 after retried prepares |
+| Resolve the ready promise even when setup fails | Setup failure rejects the ready promise with the fixed reason and no handler work | `build/ready_probe` WASM probe (`runner.mjs`) | Detected: failure mode resolved `{ok: true, value: undefined}` instead of rejecting; node exited 1 |
+
+The readiness checks on 2026-10-16 used the 12-test `server_test.dart`
+baseline on Dart 3.13.5 (macOS arm64, Node 26.8.2). Each variant was applied
+alone to a package copy under `/private/tmp/dart-239-p10b-mut/m1..m3` after
+`dart pub get --offline --enforce-lockfile`, and the production source stayed
+unchanged. The first two variants ran `dart test test/server_test.dart
+--reporter expanded` in the foreground. The ready callback has no VM unit
+test, so its variant recompiled the existing `build/ready_probe` probe
+(`heavy-slot -- dart compile wasm build/ready_probe/main.dart -o
+build/ready_probe/main.wasm`) and ran `heavy-slot -- node
+build/ready_probe/runner.mjs`; the mutated module compiled successfully and
+node exited 1 on the failure-mode assertion, so detection is an expectation
+mismatch rather than a build failure. The temporary copies were deleted after
+listing.
 
 The deletion variant reads the latest record and conditionally deletes that
 record, deliberately ignoring the request's expected credentials. The store

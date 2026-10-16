@@ -10,7 +10,7 @@ import 'database.dart';
 external JSPromise<JSUint8Array> _database(JSUint8Array frame);
 
 @JS('__chikDartRegister')
-external void _register(JSFunction dispatch);
+external void _register(JSFunction dispatch, JSFunction ready);
 
 @JS('__chikSnapshotObserved')
 external void _snapshotObserved(JSUint8Array chunk);
@@ -99,5 +99,17 @@ void runApplication(Application application) {
           return dispatch().toJS;
         })
         .toJS,
+    (() => JSPromise<JSAny?>(
+      ((JSFunction resolve, JSFunction reject) {
+        application.prepare().then(
+          (_) {
+            resolve.callAsFunction();
+          },
+          onError: (Object _, StackTrace _) {
+            reject.callAsFunction(null, 'Application setup failed.'.toJS);
+          },
+        );
+      }).toJS,
+    )).toJS,
   );
 }
