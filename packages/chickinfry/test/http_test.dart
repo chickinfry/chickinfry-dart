@@ -662,7 +662,7 @@ void main() {
   test('error messages render code-specific guidance and generic fallback', () {
     expect(
       const ClientException('unsupported_platform').toString(),
-      contains('browser support is planned'),
+      contains('OS secure session storage'),
     );
     expect(
       const ClientException('invalid_token').toString(),

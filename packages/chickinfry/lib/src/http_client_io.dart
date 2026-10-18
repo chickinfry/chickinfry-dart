@@ -9,6 +9,7 @@ import 'package:http/io_client.dart';
 import 'testing/conformance.dart';
 
 const isNative = true;
+const isSupported = true;
 final _abortKey = Object();
 
 const _readCap = 8192;

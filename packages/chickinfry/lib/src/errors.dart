@@ -24,8 +24,11 @@ final class ClientException implements Exception {
   String toString() {
     final guidance = switch (code) {
       'unsupported_platform' =>
-        'Flutter Web and browser targets are not supported yet; browser '
-            'support is planned. Use a native (non-web) platform for now.',
+        'This operation requires a supported native platform. OS secure '
+            'session storage is not available in browsers.',
+      'unsupported_auth_transport' =>
+        'Browser transport uses cookies only. Bearer credentials and native '
+            'session stores cannot be attached.',
       'invalid_token' =>
         'Invalid bearer token: pass the access token string from your login '
             'result unchanged.',

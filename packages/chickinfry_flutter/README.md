@@ -100,12 +100,12 @@ credential data; obtain a fresh login to intentionally replace an invalid record
 | Android | minSdk 24 | Not yet verified |
 | Windows | — | Not supported yet |
 | Linux | — | Not supported yet |
-| Web | — | Not supported |
+| Web | — | Cookie transport only; no OS session store |
 
 Minimum-OS device execution is **not verified** on any platform. The package
 requires Dart 3.13 and Flutter 3.47 or newer; the minimum toolchain combination
-has not been executed. Web construction and operations fail with
-`unsupported_platform` before storage access. Windows, Linux and Fuchsia are
+has not been executed. Web `SecureSessionStore` construction and operations
+fail with `unsupported_platform` before storage access. Windows, Linux and Fuchsia are
 also rejected. Public imports alone do not imply platform support.
 
 Set the consuming app's Android `minSdk` to 24, iOS deployment target to 15.0, and
@@ -145,3 +145,24 @@ loopback HTTP peer. It checks a newly created store reading the same Keychain
 record, runtime refresh, and logout preserving another origin. A new store
 instance does not prove a full process restart. Generated SDK consumption and
 the complete customer flow require separate verification.
+
+## Web without native storage
+
+On Flutter Web, construct `HttpTransport` with an explicit server origin and
+pass it directly to the operation client. Do not construct `SecureSessionStore`
+or attach `withSession` or `withBearer`. Fetch includes browser-managed cookies;
+the SDK does not copy them into the storage plugin or web storage.
+
+```dart
+final transport = HttpTransport('https://api.example.com');
+final publicSession = await transport.invoke('auth.session', {});
+// Keep public session metadata in memory; close transport with your app.
+```
+
+Browser login must decode the public response and confirm it with `auth.session`.
+Generated browser auth names and default paths remain pending; native generated
+login decoders expect credentials and cannot decode these public responses.
+Handle `OperationError` status 401 by showing sign-in and 403 as an authorization
+error. Neither case automatically refreshes, retries, logs out, or clears cookies.
+Registration-attempt persistence is a separate pending integration; this preview
+does not implement it or claim that policy is complete.

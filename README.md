@@ -51,8 +51,8 @@ Future<void> main() async {
 }
 ```
 
-Use `transport.withBearer(token)` or `transport.withSession(sessions)` for an
-authenticated copy. Close the original transport when the application finishes.
+On native targets, use `transport.withBearer(token)` or
+`transport.withSession(sessions)` for an authenticated copy. Close the original transport when the application finishes.
 Copies share its connections; closing a copy does not close the original.
 
 The application supplies a `SessionStore`. Successful login results are saved
@@ -89,13 +89,44 @@ unsupported. After a refresh with an unknown outcome, automatic refresh for that
 credential remains suspended in that isolate until a different credential is read.
 Store read failures preserve the record and fail the call.
 
-Native Dart is the current execution boundary. Flutter Web and browser targets
-are not supported yet. Public types remain importable and compile for the web,
-but `HttpTransport.invoke` fails with `unsupported_platform` before any network
-request. Use a native platform for now. Requests have a 30-second default
-deadline, a 4 MiB UTF-8 request limit and a 1 MiB response limit. Redirects are
+Native Dart supports bearer credentials and session stores. Browser Fetch
+uses cookies only, as described below. Requests have a 30-second default deadline, a 4 MiB UTF-8 request limit and a 1 MiB response limit. Redirects are
 rejected. Server errors preserve their code and HTTP status through
 `OperationError`; local failures use
 `ClientException`.
 
 Proxy connections preserve SDK routing and caller deadlines; connection/TLS socket cancellation remains SDK-managed.
+
+## Browser transport preview
+
+`HttpTransport` selects cookie-only Fetch in browsers. Pass an explicit server
+origin; default web paths and generated browser authentication entry points are
+not finalized. Requests use JSON POST, credentials inclusion, no-store caching,
+and manual redirect rejection. Native bearer and session-store attachment are
+rejected in browsers, without a fallback. Do not use native generated login
+result decoders for browser session responses.
+
+The browser does not refresh, replay business operations, or log out on 401/403.
+Applications handle 401 by requesting sign-in and 403 as an authorization error.
+The SDK never reads or persists the authentication cookie. Browser authentication
+helpers remain internal while their generated API names are being settled.
+
+The real browser fixture is `packages/chickinfry/tool/test_browser.dart`.
+It accepts an existing scratch directory for compiled restore-page assets and
+uses `CHROME_EXECUTABLE` to select an installed Chrome. No browser is installed.
+
+Strict cookies require an IP loopback test-page origin as well as an IP loopback
+API origin. The installed `package:test` runner advertises `localhost` for both
+its host and suite pages, without a host option. Local verification uses an
+isolated package configuration pointing at a scratch copy of Shelf whose
+loopback URL advertises `127.0.0.1`. This is a local test harness, not the product
+or CI path; leave the package cache, lockfile, browser security, and cookie
+attributes unchanged.
+
+```sh
+cd packages/chickinfry
+CHROME_EXECUTABLE=/path/to/chrome dart --packages=/path/to/ip-loopback/package_config.json tool/test_browser.dart /path/to/scratch
+```
+
+This fixture does not certify a deployed server, generated browser SDK, or
+production ingress.

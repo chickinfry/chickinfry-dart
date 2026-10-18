@@ -7,6 +7,7 @@ import 'package:http/http.dart' as http;
 import 'errors.dart';
 import 'http_client_stub.dart'
     if (dart.library.io) 'http_client_io.dart'
+    if (dart.library.js_interop) 'http_client_web.dart'
     as platform;
 import 'origin.dart';
 import 'session.dart';
@@ -28,7 +29,8 @@ class _RefreshFlight {
   final result = Completer<SessionCredentials>();
 }
 
-/// HttpTransport uses a fixed native origin with a finite per-request deadline.
+/// HttpTransport uses a fixed origin and a finite per-request deadline.
+/// Browsers use cookies only; native targets can attach bearer credentials.
 final class HttpTransport implements ClientTransport {
   factory HttpTransport(
     String origin, {
@@ -71,6 +73,9 @@ final class HttpTransport implements ClientTransport {
 
   /// withBearer returns an independent authentication context sharing this connection.
   HttpTransport withBearer(String token) {
+    if (!platform.isNative) {
+      throw const ClientException('unsupported_auth_transport');
+    }
     if (!tokenPattern.hasMatch(token)) {
       throw const ClientException('invalid_token');
     }
@@ -79,6 +84,9 @@ final class HttpTransport implements ClientTransport {
 
   /// withSession reads fresh credentials for every call to this origin.
   HttpTransport withSession(SessionStore store) {
+    if (!platform.isNative) {
+      throw const ClientException('unsupported_auth_transport');
+    }
     if (normalizeOrigin(store.origin) != origin ||
         store.coordinationKey.isEmpty) {
       throw const ClientException('invalid_origin');
@@ -101,7 +109,7 @@ final class HttpTransport implements ClientTransport {
       );
       if (barrier != null) await barrier;
     }
-    if (!platform.isNative) {
+    if (!platform.isSupported) {
       throw const ClientException('unsupported_platform');
     }
     if (!_operationPattern.hasMatch(operation)) {

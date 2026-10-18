@@ -30,7 +30,7 @@ Run a targeted check with
 | Delete only `if (abort != null) unawaited(abort.then((_) => cancel()));` | C-05: request cancellation closes stalled TLS before the longer connection timeout | `http_test.dart`: `deadline closes stalled TLS` | Detected: caller returned at 222 ms; no peer closure within the following 600 ms; connection timeout 2,000 ms |
 | Delete only `if (socket != null) unawaited(socket.close());` from `cancel` (the retained `raw` socket) | C-05: cancellation actually closes the stalled TCP socket | `http_test.dart`: `deadline closes stalled TLS` | Detected: caller returned at 216 ms; no peer closure within the following 600 ms; connection timeout 2,000 ms |
 | Add `..findProxy = ((_) => 'DIRECT')` after `connectionTimeout` | Preserve the selected proxy without contacting the origin directly | `http_test.dart`: `Proxy selection preserves the environment route` | Detected: expected origin 0 / proxy 1, observed origin 1 / proxy 0 |
-| Remove web platform rejection | Unsupported native bearer requests fail before any fetch | `web_transport_probe.dart` with `web_runner.cjs` | Detected: expected fetch count 0, observed 2; no `unsupported_platform` |
+| Allow native credentials on browser transport | Native bearer attachment fails before Fetch | `web_transport_probe.dart` with `web_runner.cjs` | Recheck after changes; cookie transport is verified by the real Chrome suite |
 | Remove original origin string validation | C-02: reject paths and encoded hosts before URI normalization | `http_test.dart`: `origin validation and normalization` | Detected: a dot path returned a transport instead of `invalid_origin` |
 | Drop the explicit 501 exception (original status set) | DX-08: explicit `not_implemented`/501 business error surfaces as 501 with its code | `server_test.dart`: `only permitted business errors` | Detected: expected status 501, observed 500 with `operation_failed` |
 | Allow 501 regardless of code | DX-08: other-code 501 stays `operation_failed`/500 | `server_test.dart`: `only permitted business errors` | Detected: expected status 500, observed 501 with `conflict` |
@@ -109,7 +109,8 @@ closure timestamp. The unmutated proxy checks observed origin 0 / proxy 1,
 rejected an untrusted certificate before HTTP, completed a trusted HTTPS
 CONNECT request, and returned `request_timeout` at 205 ms for stalled proxy TLS.
 
-The web check compiles and runs with the existing Node installation:
+The native-auth rejection probe compiles and runs with the existing Node
+installation. It does not verify browser Fetch or cookie behavior:
 
 ```sh
 dart compile js -o build/web_transport_probe.js test/web_transport_probe.dart

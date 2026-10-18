@@ -5,7 +5,7 @@ final _timestampPattern = RegExp(
   r'^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d{1,6})?(?:Z|[+-](\d{2}):(\d{2}))$',
 );
 
-bool _validTimestamp(String value) {
+bool validTimestamp(String value) {
   final match = _timestampPattern.firstMatch(value);
   if (match == null || DateTime.tryParse(value) == null) return false;
   final parts = [for (var i = 1; i <= 6; i++) int.parse(match.group(i)!)];
@@ -34,8 +34,8 @@ final class SessionCredentials {
         !tokenPattern.hasMatch(refreshToken) ||
         userId.isEmpty ||
         sessionId.isEmpty ||
-        !_validTimestamp(expiresAt) ||
-        !_validTimestamp(refreshExpiresAt)) {
+        !validTimestamp(expiresAt) ||
+        !validTimestamp(refreshExpiresAt)) {
       throw const ClientException('invalid_session_record');
     }
   }
