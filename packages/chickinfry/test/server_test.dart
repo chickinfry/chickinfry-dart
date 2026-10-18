@@ -55,7 +55,11 @@ void main() {
       bytes ??
           utf8.encode(
             jsonEncode(
-              input ?? {'request_id': 'not-a-uuid', 'message': '\uC548\uB155\uD558\uC138\uC694'},
+              input ??
+                  {
+                    'request_id': 'not-a-uuid',
+                    'message': '\uC548\uB155\uD558\uC138\uC694',
+                  },
             ),
           ),
     ),
