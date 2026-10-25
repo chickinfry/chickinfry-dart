@@ -60,6 +60,10 @@ final class ClientException implements Exception {
       'session_storage_error' =>
         'The session store failed while reading or writing credentials; '
             'check your SessionStore implementation and its backing storage.',
+      'device_storage_unavailable' => 'Could not use device storage for the session. Check that the storage location is writable, or set persist to another directory or turn it off.',
+      'device_storage_corrupt' => 'Stored session data could not be read. Sign out to clear it, then sign in again.',
+      'device_storage_full' => 'Device storage for sign-in is full. Finish or cancel pending sign-ups, then try again.',
+      'device_storage_version_unsupported' => 'Stored session data was written by a newer SDK. Update the SDK, or sign out and sign in again.',
       'session_changed' =>
         'The stored session changed during the call; re-read the session '
             'and call again with the current credentials.',

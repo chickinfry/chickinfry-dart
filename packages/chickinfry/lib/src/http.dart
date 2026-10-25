@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 import 'errors.dart';
+import 'device/store.dart';
 import 'http_client_stub.dart'
     if (dart.library.io) 'http_client_io.dart'
     if (dart.library.js_interop) 'http_client_web.dart'
@@ -132,6 +133,13 @@ final class HttpTransport implements ClientTransport {
       uncertain?.removeWhere((value) => value != credentials);
       if (uncertain?.isEmpty ?? false) _uncertain.remove(key);
     }
+    if (operation == 'auth.refresh' && store is DeviceStore) {
+      if (credentials == null ||
+          input['refresh_token'] != credentials.refreshToken) {
+        throw const ClientException('session_changed');
+      }
+      return (await _refresh(store, credentials)).toJson();
+    }
     final token = operation == 'auth.refresh'
         ? null
         : credentials?.accessToken ?? _bearer;
@@ -170,9 +178,16 @@ final class HttpTransport implements ClientTransport {
 
   Future<SessionCredentials?> _read(SessionStore store) async {
     try {
-      return await store.read();
+      return store is DeviceStore
+          ? await store.waitForSession(timeout)
+          : await store.read();
     } on ClientException catch (error) {
-      if (error.code == 'invalid_session_record') rethrow;
+      if (error.code == 'invalid_session_record' ||
+          (store is DeviceStore &&
+              (error.code.startsWith('device_storage_') ||
+                  error.code == 'session_changed'))) {
+        rethrow;
+      }
       throw const ClientException('session_storage_error');
     } catch (_) {
       throw const ClientException('session_storage_error');
@@ -187,6 +202,11 @@ final class HttpTransport implements ClientTransport {
   }) async {
     try {
       return await store.compareAndSet(expected, next);
+    } on ClientException catch (error) {
+      if (store is DeviceStore && error.code.startsWith('device_storage_')) {
+        throw ClientException(error.code, operationError: failure);
+      }
+      throw ClientException('session_storage_error', operationError: failure);
     } catch (_) {
       throw ClientException('session_storage_error', operationError: failure);
     }
@@ -244,6 +264,19 @@ final class HttpTransport implements ClientTransport {
       throw const ClientException('session_changed');
     }
     if (latest != expected) return latest;
+    DeviceState? claimed;
+    if (store is DeviceStore) {
+      claimed = await store.claimRefresh(expected);
+      if (claimed == null) {
+        final winner = await _read(store);
+        if (winner == null ||
+            !_sameSession(winner, expected) ||
+            winner == expected) {
+          throw const ClientException('session_changed');
+        }
+        return winner;
+      }
+    }
     final key = (origin, store.coordinationKey);
     var confirmed = false;
     try {
@@ -264,7 +297,10 @@ final class HttpTransport implements ClientTransport {
       if (conformanceEnabled) {
         currentConformanceCall?.refreshObservation?.credentialsValidated = true;
       }
-      if (!await _replace(store, expected, refreshed)) {
+      final saved = store is DeviceStore
+          ? await store.finishRefresh(claimed!, refreshed)
+          : await _replace(store, expected, refreshed);
+      if (!saved) {
         throw const ClientException('session_changed');
       }
       confirmed = true;
@@ -278,7 +314,15 @@ final class HttpTransport implements ClientTransport {
         if (conformanceEnabled) {
           currentConformanceCall?.refreshObservation?.rejected401 = true;
         }
-        await _replace(store, expected, null, failure: error);
+        if (store is DeviceStore) {
+          try {
+            await store.finishRefresh(claimed!, null);
+          } on ClientException catch (failure) {
+            throw ClientException(failure.code, operationError: error);
+          }
+        } else {
+          await _replace(store, expected, null, failure: error);
+        }
       }
       rethrow;
     } finally {
