@@ -3,6 +3,7 @@ import 'dart:ffi';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:typed_data';
 
 import 'package:chickinfry/chickinfry.dart';
 import 'package:chickinfry/src/device/bridge.dart';
@@ -14,6 +15,576 @@ import 'package:test/test.dart';
 import 'support.dart';
 
 void main() {
+  for (final outcome in [
+    'before send',
+    'mark write fails',
+    'definite failure',
+    'saved success',
+    'unsaved success',
+    'unknown response',
+    'first login',
+  ]) {
+    test('auth transition: $outcome', () async {
+      for (final operation in [
+        'auth.signin',
+        'auth.verify_email',
+        'auth.signin_with_code',
+        'auth.identity',
+        'auth.signup',
+      ]) {
+        final root = await scratch();
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        final origin = 'http://127.0.0.1:${server.port}';
+        final original = credentials();
+        final issued = credentials();
+        final persistent = device(root, origin);
+        if (outcome != 'first login') await persistent.write(original);
+        if (outcome == 'saved success') {
+          final current = await persistent.load();
+          final now = DateTime.now().millisecondsSinceEpoch;
+          await persistent.commit(
+            current,
+            DeviceState.fromJson({
+              ...current.toJson(),
+              'generation': current.generation + 1,
+              'attempts': {
+                'matching': DeviceAttempt(
+                  randomId(),
+                  'user@example.test',
+                  now,
+                ).toJson(),
+                'other': DeviceAttempt(
+                  randomId(),
+                  'other@example.test',
+                  now,
+                ).toJson(),
+              },
+            }),
+          );
+        }
+        final initial = await persistent.load();
+        Future<bool> marked() async {
+          final file = File('${persistent.directory}/auth.json');
+          if (!await file.exists()) return false;
+          final bundle =
+              jsonDecode(await file.readAsString()) as Map<String, Object?>;
+          return (bundle['auth']
+                  as Map<String, Object?>)['auth_transition_unknown'] ==
+              true;
+        }
+
+        final store = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: outcome == 'mark write fails'
+              ? (operation == 'auth.signin' ? FullFiles() : UnavailableFiles())
+              : outcome == 'unsaved success'
+              ? FailWrite(2)
+              : null,
+        );
+        final client = DeviceTransport(store);
+        addTearDown(client.close);
+        var retrying = false;
+        var ownerAuthenticated = false;
+        var sends = 0;
+        var markedBeforeSend = false;
+        server.listen((request) async {
+          await request.drain<void>();
+          if (request.uri.path == '/private.check') {
+            ownerAuthenticated =
+                request.headers.value('authorization') ==
+                'Bearer ${original.accessToken}';
+            request.response.headers.contentType = ContentType.json;
+            request.response.write(jsonEncode(<String, Object?>{}));
+            await request.response.close();
+            return;
+          }
+          sends++;
+          markedBeforeSend = await marked();
+          if (outcome == 'before send' && markedBeforeSend) {
+            expect(await store.read() == original, isTrue);
+            expect(
+              await store.waitForSession(const Duration(milliseconds: 20)) ==
+                  original,
+              isTrue,
+            );
+            expect(await persistent.read() == null, isTrue);
+            expect(
+              await persistent.waitForSession(
+                    const Duration(milliseconds: 20),
+                  ) ==
+                  null,
+              isTrue,
+            );
+            expect((await persistent.load()).session == original, isTrue);
+            await client.invoke('private.check', {});
+            expect(ownerAuthenticated, isTrue);
+          }
+          if (outcome == 'unknown response' && !retrying) {
+            final socket = await request.response.detachSocket(
+              writeHeaders: false,
+            );
+            socket.destroy();
+            return;
+          }
+          request.response.headers.contentType = ContentType.json;
+          if (outcome == 'definite failure') {
+            request.response.statusCode = 401;
+            request.response.write(
+              jsonEncode({'error': 'invalid_credentials'}),
+            );
+          } else {
+            request.response.write(jsonEncode(issued.toJson()));
+          }
+          await request.response.close();
+        });
+        final response = client.invoke(operation, {
+          'email': 'user@example.test',
+        });
+        if (outcome == 'mark write fails' ||
+            outcome == 'definite failure' ||
+            outcome == 'unknown response') {
+          final code = switch (outcome) {
+            'mark write fails' => 'device_storage_unavailable',
+            'definite failure' => 'invalid_credentials',
+            _ => 'network_error',
+          };
+          await expectLater(
+            response,
+            throwsA(
+              predicate<Object>(
+                (error) =>
+                    (error is ClientException && error.code == code) ||
+                    (error is OperationError && error.code == code),
+              ),
+            ),
+          );
+        } else {
+          expect(SessionCredentials.fromJson(await response) == issued, isTrue);
+        }
+        if (outcome == 'mark write fails') {
+          expect(sends == 0 && !await marked(), isTrue);
+          expect(await persistent.read() == original, isTrue);
+          continue;
+        }
+        expect(sends, 1);
+        if (outcome == 'before send') expect(markedBeforeSend, isTrue);
+        if (outcome == 'first login') expect(markedBeforeSend, isFalse);
+        if (outcome == 'definite failure') {
+          expect(
+            !await marked() && await persistent.read() == original,
+            isTrue,
+          );
+        } else if (outcome == 'unsaved success' ||
+            outcome == 'unknown response') {
+          expect(await marked(), isTrue);
+          if (outcome == 'unsaved success') {
+            expect(await store.read() == issued, isTrue);
+            await expectLater(
+              client.invoke(operation, {}),
+              throwsA(
+                isA<ClientException>().having(
+                  (error) => error.code,
+                  'code',
+                  'device_storage_unavailable',
+                ),
+              ),
+            );
+            expect(sends == 1 && await store.read() == issued, isTrue);
+          } else {
+            final unavailable = NativeDeviceStore(
+              scope(origin),
+              directory: root,
+              files: UnavailableFiles(),
+            );
+            expect(await unavailable.read() == null, isTrue);
+            expect(
+              await unavailable.waitForSession(
+                    const Duration(milliseconds: 20),
+                  ) ==
+                  null,
+              isTrue,
+            );
+            expect(await marked(), isTrue);
+          }
+          expect(await child('unresolved', root, origin), 0);
+          final restarted = device(root, origin);
+          expect(await restarted.read() == null, isTrue);
+          expect(
+            (await restarted.load()).toJson()['auth_transition_unknown'],
+            isTrue,
+          );
+          expect((await restarted.load()).session == original, isTrue);
+          if (outcome == 'unknown response') {
+            retrying = true;
+            final retryStore = NativeDeviceStore(
+              scope(origin),
+              directory: root,
+              files: FailWrite(2),
+            );
+            final retryClient = DeviceTransport(retryStore);
+            addTearDown(retryClient.close);
+            expect(
+              SessionCredentials.fromJson(
+                    await retryClient.invoke(operation, {}),
+                  ) ==
+                  issued,
+              isTrue,
+            );
+            final fenced = await persistent.load();
+            expect(
+              fenced.session == null &&
+                  fenced.authGeneration == initial.authGeneration + 1 &&
+                  fenced.toJson()['auth_transition_unknown'] == true,
+              isTrue,
+            );
+            expect(
+              await retryStore.read() == issued &&
+                  await persistent.read() == null &&
+                  sends == 2,
+              isTrue,
+            );
+            expect(await child('unresolved', root, origin), 0);
+          }
+        } else {
+          final state = await device(root, origin).load();
+          expect(
+            !await marked() &&
+                state.session == issued &&
+                state.authGeneration == initial.authGeneration + 1 &&
+                (outcome != 'saved success' ||
+                    (state.attempts.length == 1 &&
+                        state.attempts.containsKey('other'))),
+            isTrue,
+          );
+        }
+      }
+    }, skip: !Platform.isMacOS);
+  }
+
+  test(
+    'auth transition: malformed success never restores the previous session',
+    () async {
+      for (final operation in [
+        'auth.signin',
+        'auth.signin_with_code',
+        'auth.verify_email',
+        'auth.identity',
+        'auth.signup',
+      ]) {
+        for (final malformed in [false, true]) {
+          final root = await scratch();
+          final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+          addTearDown(() => server.close(force: true));
+          final origin = 'http://${server.address.address}:${server.port}';
+          final original = credentials();
+          final persistent = device(root, origin);
+          await persistent.write(original);
+          var sends = 0;
+          server.listen((request) async {
+            await request.drain<void>();
+            sends++;
+            request.response.headers.contentType = ContentType.json;
+            request.response.write(
+              jsonEncode(
+                malformed
+                    ? <String, Object?>{'access_token': false}
+                    : <String, Object?>{},
+              ),
+            );
+            await request.response.close();
+          });
+          final client = DeviceTransport(device(root, origin));
+          addTearDown(client.close);
+          await expectLater(
+            client.invoke(operation, {}),
+            throwsA(
+              isA<ClientException>().having(
+                (error) => error.code,
+                'code',
+                'invalid_response',
+              ),
+            ),
+          );
+          expect(sends, 1);
+          expect(
+            await client.store.read() == null &&
+                await persistent.read() == null,
+            isTrue,
+          );
+          final state = await persistent.load();
+          expect(
+            state.session == original &&
+                state.toJson()['auth_transition_unknown'] == true,
+            isTrue,
+          );
+          expect(await child('unresolved', root, origin), 0);
+        }
+      }
+    },
+    skip: !Platform.isMacOS,
+  );
+
+  for (final change in [
+    'signed out',
+    'new account',
+    'read unavailable',
+    'bundle only',
+  ]) {
+    test('E1 session follows disk auth generation: $change', () async {
+      final root = await scratch();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final origin = 'http://${server.address.address}:${server.port}';
+      final original = credentials();
+      final issued = credentials();
+      final replacement = credentials();
+      final external = device(root, origin);
+      await external.write(original);
+      final accepted = await external.load();
+      var protected = 0;
+      var refreshes = 0;
+      var usedIssued = false;
+      var usedReplacement = false;
+      server.listen((request) async {
+        await request.drain<void>();
+        request.response.headers.contentType = ContentType.json;
+        if (request.uri.path == '/auth.signin') {
+          request.response.write(jsonEncode(issued.toJson()));
+        } else if (request.uri.path == '/auth.refresh') {
+          refreshes++;
+          request.response.statusCode = 401;
+          request.response.write(jsonEncode({'error': 'unauthenticated'}));
+        } else {
+          protected++;
+          final bearer = request.headers.value('authorization');
+          usedIssued = bearer == 'Bearer ${issued.accessToken}';
+          usedReplacement = bearer == 'Bearer ${replacement.accessToken}';
+          final expected = change == 'new account'
+              ? usedReplacement
+              : usedIssued;
+          if (change == 'signed out' || !expected) {
+            request.response.statusCode = 401;
+            request.response.write(jsonEncode({'error': 'unauthenticated'}));
+          } else {
+            request.response.write(jsonEncode(<String, Object?>{}));
+          }
+        }
+        await request.response.close();
+      });
+      final files = FailWrite(2);
+      final store = NativeDeviceStore(
+        scope(origin),
+        directory: root,
+        files: files,
+      );
+      final client = DeviceTransport(store);
+      addTearDown(client.close);
+      expect(
+        SessionCredentials.fromJson(await client.invoke('auth.signin', {})) ==
+            issued,
+        isTrue,
+      );
+      expect(
+        (await store.load()).authGeneration == accepted.authGeneration + 1,
+        isTrue,
+      );
+      switch (change) {
+        case 'signed out':
+          await external.clear(await external.load());
+        case 'new account':
+          await external.write(replacement);
+        case 'read unavailable':
+          files.readUnavailable = true;
+        case 'bundle only':
+          final state = await external.load();
+          await external.commit(
+            state,
+            DeviceState(
+              generation: state.generation + 1,
+              authGeneration: state.authGeneration,
+              session: state.session,
+              refreshSent: state.refreshSent,
+              authTransitionUnknown: state.authTransitionUnknown,
+              attempts: {
+                ...state.attempts,
+                'other': DeviceAttempt(
+                  randomId(),
+                  '${randomId()}@example.test',
+                  DateTime.now().millisecondsSinceEpoch,
+                ),
+              },
+            ),
+          );
+      }
+      if (change == 'signed out' || change == 'new account') {
+        await expectLater(
+          client.invoke('private.check', {}),
+          throwsA(
+            isA<OperationError>().having(
+              (error) => error.code,
+              'code',
+              'unauthenticated',
+            ),
+          ),
+        );
+        expect(
+          !usedIssued && !usedReplacement && store.transientState == null,
+          isTrue,
+        );
+        if (change == 'new account') {
+          await client.invoke('private.check', {});
+          expect(usedReplacement && !usedIssued, isTrue);
+        } else {
+          expect(await store.read() == null, isTrue);
+        }
+      } else {
+        await client.invoke('private.check', {});
+        expect(usedIssued && await store.read() == issued, isTrue);
+      }
+      expect(
+        protected == (change == 'new account' ? 2 : 1) && refreshes == 0,
+        isTrue,
+      );
+    }, skip: !Platform.isMacOS);
+  }
+
+  for (final earlier in [
+    'rejection',
+    'unsaved success',
+    'unknown response',
+    'corrupt success',
+  ]) {
+    test(
+      'auth transition: owned $earlier preserves another unresolved call',
+      () async {
+        final root = await scratch();
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        final origin = 'http://${server.address.address}:${server.port}';
+        final original = credentials();
+        final issued = credentials();
+        final persistent = device(root, origin);
+        await persistent.write(original);
+        final firstRequest = Completer<HttpRequest>();
+        final secondRequest = Completer<HttpRequest>();
+        var sends = 0;
+        server.listen((request) async {
+          await request.drain<void>();
+          sends++;
+          (sends == 1 ? firstRequest : secondRequest).complete(request);
+        });
+        final shared = earlier == 'rejection';
+        final firstStore = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: shared ? FailWrite(3) : null,
+        );
+        final first = DeviceTransport(firstStore);
+        final secondStore = shared
+            ? firstStore
+            : NativeDeviceStore(
+                scope(origin),
+                directory: root,
+                files: FailWrite(2),
+              );
+        final second = DeviceTransport(secondStore);
+        addTearDown(first.close);
+        addTearDown(second.close);
+        final email = '${randomId()}@example.test';
+        final rejected = expectLater(
+          first.invoke('auth.signin', {'email': email}),
+          throwsA(
+            isA<OperationError>().having(
+              (error) => error.code,
+              'code',
+              'invalid_credentials',
+            ),
+          ),
+        );
+        final oldRequest = await firstRequest.future;
+        expect(await persistent.read() == null, isTrue);
+        final successful = second.invoke('auth.signin', {'email': email});
+        final settling =
+            earlier == 'unknown response' || earlier == 'corrupt success'
+            ? expectLater(
+                successful,
+                throwsA(
+                  isA<ClientException>().having(
+                    (error) => error.code,
+                    'code',
+                    earlier == 'corrupt success'
+                        ? 'invalid_response'
+                        : 'network_error',
+                  ),
+                ),
+              )
+            : successful.then((value) async {
+                expect(SessionCredentials.fromJson(value) == issued, isTrue);
+                expect(await secondStore.read() == issued, isTrue);
+              });
+        final newRequest = await secondRequest.future;
+        final marked = await persistent.load();
+        expect(
+          marked.session == original &&
+              marked.toJson()['auth_transition_unknown'] == true,
+          isTrue,
+        );
+        Future<void> rejectFirst() async {
+          oldRequest.response.headers.contentType = ContentType.json;
+          oldRequest.response.statusCode = 401;
+          oldRequest.response.write(
+            jsonEncode({'error': 'invalid_credentials'}),
+          );
+          await oldRequest.response.close();
+          await rejected;
+        }
+
+        Future<void> settleSecond() async {
+          if (earlier == 'unknown response') {
+            final socket = await newRequest.response.detachSocket(
+              writeHeaders: false,
+            );
+            socket.destroy();
+          } else {
+            newRequest.response.headers.contentType = ContentType.json;
+            newRequest.response.write(
+              jsonEncode(
+                earlier == 'corrupt success'
+                    ? <String, Object?>{}
+                    : issued.toJson(),
+              ),
+            );
+            await newRequest.response.close();
+          }
+          await settling;
+        }
+
+        if (earlier == 'rejection') {
+          await rejectFirst();
+          expect(
+            (await persistent.load()).toJson()['auth_transition_unknown'],
+            isTrue,
+          );
+          await settleSecond();
+        } else {
+          await settleSecond();
+          await rejectFirst();
+        }
+        expect(await persistent.read() == null && sends == 2, isTrue);
+        final after = await persistent.load();
+        expect(
+          after.session == original &&
+              after.toJson()['auth_transition_unknown'] == true,
+          isTrue,
+        );
+        expect(await child('unresolved', root, origin), 0);
+      },
+      skip: !Platform.isMacOS,
+    );
+  }
+
   test(
     'real processes restore session and signup, verify and logout',
     () async {
@@ -413,7 +984,7 @@ void main() {
     final store = NativeDeviceStore(
       scope(origin),
       directory: root,
-      files: FailSecondWrite(),
+      files: FailWrite(2),
     );
     final client = DeviceTransport(store);
     addTearDown(client.close);
@@ -1392,11 +1963,22 @@ class UnavailableFiles extends MacFiles {
       throw const ClientException('device_storage_unavailable');
 }
 
-class FailSecondWrite extends MacFiles {
+class FailWrite extends MacFiles {
+  FailWrite(this.at);
+  final int at;
   var writes = 0;
+  bool readUnavailable = false;
+  @override
+  Uint8List? read(int dir, String name) {
+    if (readUnavailable) {
+      throw const ClientException('device_storage_unavailable');
+    }
+    return super.read(dir, name);
+  }
+
   @override
   void syncFile(int fd) {
-    if (++writes == 2) {
+    if (++writes == at) {
       throw const ClientException('device_storage_unavailable');
     }
     super.syncFile(fd);

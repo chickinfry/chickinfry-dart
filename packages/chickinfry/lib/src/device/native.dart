@@ -110,11 +110,39 @@ final class NativeDeviceStore extends DeviceStore {
   }
 
   @override
+  Future<SessionCredentials?> read() async {
+    requireAvailable();
+    if (transientState?.session != null) {
+      try {
+        final current = await _files.locked(
+          directory,
+          (dir) async => _load(dir),
+          root: _root,
+        );
+        final accepted = transientBaseAuthGeneration;
+        if (accepted != null && current.authGeneration > accepted) {
+          transientState = null;
+          transientBaseGeneration = null;
+          transientBaseAuthGeneration = null;
+          _uncertainWrite = null;
+          return null;
+        }
+      } on ClientException {
+        return super.read();
+      }
+    }
+    return super.read();
+  }
+
+  @override
   Future<bool> commit(DeviceState expected, DeviceState next) {
     requireAvailable();
     final memory = transientState;
     if (memory != null) {
       if (memory.generation != expected.generation) return Future.value(false);
+      if (next.authTransitionUnknown) {
+        throw const ClientException('device_storage_unavailable');
+      }
       next = prepareWrite(next);
       transientState = next;
       return Future.value(true);
@@ -163,6 +191,7 @@ final class NativeDeviceStore extends DeviceStore {
       }
       transientState = null;
       transientBaseGeneration = null;
+      transientBaseAuthGeneration = null;
       _uncertainWrite = null;
     } on ClientException {
       blocked = true;

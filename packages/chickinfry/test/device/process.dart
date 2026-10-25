@@ -43,7 +43,14 @@ Future<void> main(List<String> arguments) async {
             'email': 'pending@example.test',
           });
           await transport.invoke('auth.logout', {});
+        case 'unresolved':
+          if (await store.read() != null ||
+              (await store.load()).toJson()['auth_transition_unknown'] !=
+                  true) {
+            exit(85);
+          }
         case 'empty':
+          if (await store.read() != null) exit(33);
           final state = await store.load();
           if (state.session != null || state.attempts.isNotEmpty) exit(33);
         case 'race':

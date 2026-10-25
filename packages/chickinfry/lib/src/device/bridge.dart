@@ -5,6 +5,16 @@ import 'open_stub.dart' if (dart.library.io) 'native.dart' as platform;
 import 'persist.dart';
 import 'store.dart';
 
+final _authTransitions = <String, _AuthTransitions>{};
+
+final class _AuthTransitions {
+  _AuthTransitions(this.authGeneration);
+  final int authGeneration;
+  final live = <DeviceState>{};
+  // A sibling rejection cannot undo an earlier uncertain account change.
+  bool unresolved = false;
+}
+
 // Generated clients supply identities; the runtime never infers them from URLs.
 DeviceTransport createDeviceTransport({
   required String app,
@@ -53,7 +63,7 @@ final class DeviceTransport implements ClientTransport {
     if (!auth.contains(operation)) {
       return _transport.invoke(operation, input);
     }
-    final before = await store.load();
+    var before = await store.load();
     final started = DateTime.now().millisecondsSinceEpoch;
     final attempts = Map<String, DeviceAttempt>.from(before.attempts)
       ..removeWhere((_, value) => value.expiredAt(started));
@@ -89,110 +99,213 @@ final class DeviceTransport implements ClientTransport {
         if (attempt.id == request['attempt']) consumed = attempt;
       }
     }
-    final result = await _connection.invoke(operation, request);
-    if (result is! Map<String, Object?>) {
-      throw const ClientException('invalid_response');
-    }
-    final email = request['email'] is String
-        ? (request['email']! as String).trim().toLowerCase()
-        : (consumed?.email ??
-              (saved != null && request['attempt'] == saved.id
-                  ? saved.email
-                  : null));
-    SessionCredentials? issued;
-    DeviceAttempt? pending;
-    if (result.containsKey('access_token')) {
-      try {
-        issued = SessionCredentials.fromJson(result);
-        DeviceState.fromJson(DeviceState(session: issued).toJson());
-      } on ClientException {
-        throw const ClientException('invalid_response');
-      }
-    } else if (operation == 'auth.signup' &&
-        result['accepted'] == true &&
-        result['attempt'] is String &&
-        email != null) {
-      try {
-        pending = DeviceAttempt.fromJson({
-          'id': result['attempt'],
-          'email': email,
-          'started_at': started,
-        });
-      } on ClientException {
-        throw const ClientException('invalid_response');
-      }
-    }
-    var current = before;
-    for (
-      var conflicts = 0;
-      conflicts <= deviceLocalRetryLimit + 1;
-      conflicts++
-    ) {
-      final attempts = {...current.attempts}
-        ..removeWhere(
-          (_, value) => value.expiredAt(DateTime.now().millisecondsSinceEpoch),
+    DeviceState? transition;
+    _AuthTransitions? owned;
+    final coordinationKey = store.coordinationKey;
+    final mayIssueSession = const {
+      'auth.signup',
+      'auth.signin',
+      'auth.signin_with_code',
+      'auth.identity',
+      'auth.verify_email',
+    }.contains(operation);
+    if (mayIssueSession &&
+        (before.session != null || before.authTransitionUnknown)) {
+      for (var conflicts = 0; ; conflicts++) {
+        final active = _authTransitions[coordinationKey];
+        final unowned =
+            before.authTransitionUnknown &&
+            (active == null ||
+                active.live.isEmpty ||
+                active.authGeneration != before.authGeneration);
+        final marked = DeviceState(
+          generation: before.generation + 1,
+          authGeneration: before.authGeneration + (unowned ? 1 : 0),
+          session: unowned ? null : before.session,
+          refreshSent: !unowned && before.refreshSent,
+          authTransitionUnknown: true,
+          attempts: before.attempts,
         );
-      final referenced = consumed;
-      final stillPresent =
-          referenced == null ||
-          current.attempts.values.any((value) => value.id == referenced.id);
-      final late =
-          current.authGeneration != before.authGeneration || !stillPresent;
-      DeviceState? next;
-      if (late) {
-        if (issued == null || referenced == null || !stillPresent) {
-          return result;
+        try {
+          if (await store.commit(before, marked)) {
+            owned =
+                active != null && active.authGeneration == marked.authGeneration
+                ? active
+                : _AuthTransitions(marked.authGeneration);
+            _authTransitions[coordinationKey] = owned;
+            owned.live.add(marked);
+            store.activeAuthTransitions.add(marked);
+            transition = marked;
+            before = marked;
+            break;
+          }
+        } on ClientException {
+          throw const ClientException('device_storage_unavailable');
         }
-        attempts.removeWhere((_, value) => value.id == referenced.id);
-        next = DeviceState(
-          generation: current.generation + 1,
-          authGeneration: current.authGeneration,
-          session: current.session,
-          refreshSent: current.refreshSent,
-          attempts: attempts,
-        );
-      } else if (issued != null) {
-        attempts.removeWhere(
-          (_, value) => value.email == email || value.id == request['attempt'],
-        );
-        next = DeviceState(
-          generation: current.generation + 1,
-          authGeneration:
-              current.authGeneration +
-              (current.session?.sessionId != issued.sessionId ||
-                      current.session?.userId != issued.userId
-                  ? 1
-                  : 0),
-          session: issued,
-          attempts: attempts,
-        );
-      } else if (pending != null) {
-        attempts[screen] = pending;
-        next = DeviceState(
-          generation: current.generation + 1,
-          authGeneration: current.authGeneration,
-          session: current.session,
-          refreshSent: current.refreshSent,
-          attempts: attempts,
-        );
-      } else if (attempts.length != current.attempts.length) {
-        next = DeviceState(
-          generation: current.generation + 1,
-          authGeneration: current.authGeneration,
-          session: current.session,
-          refreshSent: current.refreshSent,
-          attempts: attempts,
-        );
+        if (conflicts == deviceLocalRetryLimit) {
+          throw const ClientException('device_storage_unavailable');
+        }
+        before = await store.load();
+        if (before.session == null && !before.authTransitionUnknown) break;
       }
-      if (next == null) return result;
-      if (conflicts == deviceLocalRetryLimit + 1) {
-        store.transientBaseGeneration ??= current.generation;
-        store.transientState = next;
-        return result;
-      }
-      if (await store.commitAfterSuccess(current, next)) return result;
-      current = await store.load();
     }
-    return result;
+    var uncertain = true;
+    try {
+      Object? result;
+      OperationError? rejection;
+      try {
+        result = await _connection.invoke(operation, request);
+      } on OperationError catch (error) {
+        if (transition == null || error.code == 'redirect_not_allowed') rethrow;
+        rejection = error;
+        uncertain = false;
+      }
+      if (rejection == null && result is! Map<String, Object?>) {
+        throw const ClientException('invalid_response');
+      }
+      final email = request['email'] is String
+          ? (request['email']! as String).trim().toLowerCase()
+          : (consumed?.email ??
+                (saved != null && request['attempt'] == saved.id
+                    ? saved.email
+                    : null));
+      SessionCredentials? issued;
+      DeviceAttempt? pending;
+      if (result is Map<String, Object?> &&
+          result.containsKey('access_token')) {
+        try {
+          issued = SessionCredentials.fromJson(result);
+          DeviceState.fromJson(DeviceState(session: issued).toJson());
+        } on ClientException {
+          throw const ClientException('invalid_response');
+        }
+      } else if (result is Map<String, Object?> &&
+          operation == 'auth.signup' &&
+          result['accepted'] == true &&
+          result['attempt'] is String &&
+          email != null) {
+        try {
+          pending = DeviceAttempt.fromJson({
+            'id': result['attempt'],
+            'email': email,
+            'started_at': started,
+          });
+        } on ClientException {
+          throw const ClientException('invalid_response');
+        }
+      }
+      if (rejection == null &&
+          mayIssueSession &&
+          issued == null &&
+          pending == null) {
+        throw const ClientException('invalid_response');
+      }
+      if (issued == null) uncertain = false;
+      var current = before;
+      for (
+        var conflicts = 0;
+        conflicts <= deviceLocalRetryLimit + 1;
+        conflicts++
+      ) {
+        final attempts = {...current.attempts}
+          ..removeWhere(
+            (_, value) =>
+                value.expiredAt(DateTime.now().millisecondsSinceEpoch),
+          );
+        final referenced = consumed;
+        final stillPresent =
+            referenced == null ||
+            current.attempts.values.any((value) => value.id == referenced.id);
+        final late =
+            current.authGeneration != before.authGeneration || !stillPresent;
+        final keepMark = transition == null
+            ? current.authTransitionUnknown
+            : owned!.unresolved || owned.live.length > 1;
+        DeviceState? next;
+        if (late) {
+          if (issued == null || referenced == null || !stillPresent) {
+            break;
+          }
+          attempts.removeWhere((_, value) => value.id == referenced.id);
+          next = DeviceState(
+            generation: current.generation + 1,
+            authGeneration: current.authGeneration,
+            session: current.session,
+            refreshSent: current.refreshSent,
+            authTransitionUnknown: current.authTransitionUnknown,
+            attempts: attempts,
+          );
+        } else if (issued != null) {
+          attempts.removeWhere(
+            (_, value) =>
+                value.email == email || value.id == request['attempt'],
+          );
+          next = DeviceState(
+            generation: current.generation + 1,
+            authGeneration:
+                current.authGeneration +
+                (current.session?.sessionId != issued.sessionId ||
+                        current.session?.userId != issued.userId
+                    ? 1
+                    : 0),
+            session: issued,
+            attempts: attempts,
+          );
+        } else if (pending != null) {
+          attempts[screen] = pending;
+          next = DeviceState(
+            generation: current.generation + 1,
+            authGeneration: current.authGeneration,
+            session: current.session,
+            refreshSent: current.refreshSent,
+            authTransitionUnknown: keepMark,
+            attempts: attempts,
+          );
+        } else if (attempts.length != current.attempts.length ||
+            (transition != null && current.authTransitionUnknown != keepMark)) {
+          next = DeviceState(
+            generation: current.generation + 1,
+            authGeneration: current.authGeneration,
+            session: current.session,
+            refreshSent: current.refreshSent,
+            authTransitionUnknown: keepMark,
+            attempts: attempts,
+          );
+        }
+        if (next == null) break;
+        if (conflicts == deviceLocalRetryLimit + 1) {
+          if (rejection != null) {
+            throw ClientException(
+              'device_storage_unavailable',
+              operationError: rejection,
+            );
+          }
+          store.transientBaseGeneration ??= current.generation;
+          store.transientBaseAuthGeneration ??= current.authGeneration;
+          store.transientState = next;
+          break;
+        }
+        final saved = rejection == null
+            ? await store.commitAfterSuccess(current, next)
+            : await store.commit(current, next);
+        if (saved) {
+          if (issued != null && store.transientState == null) uncertain = false;
+          break;
+        }
+        current = await store.load();
+      }
+      if (rejection != null) throw rejection;
+      return result;
+    } finally {
+      if (transition != null && owned != null) {
+        store.activeAuthTransitions.remove(transition);
+        owned.live.remove(transition);
+        if (uncertain) owned.unresolved = true;
+        if (owned.live.isEmpty &&
+            identical(_authTransitions[coordinationKey], owned)) {
+          _authTransitions.remove(coordinationKey);
+        }
+      }
+    }
   }
 }

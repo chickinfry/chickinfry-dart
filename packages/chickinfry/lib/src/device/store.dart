@@ -93,12 +93,14 @@ final class DeviceState {
     this.authGeneration = 0,
     this.session,
     this.refreshSent = false,
+    this.authTransitionUnknown = false,
     Map<String, DeviceAttempt> attempts = const {},
   }) : attempts = Map.unmodifiable(attempts);
   final int generation;
   final int authGeneration;
   final SessionCredentials? session;
   final bool refreshSent;
+  final bool authTransitionUnknown;
   final Map<String, DeviceAttempt> attempts;
 
   Map<String, Object?> toJson() => {
@@ -106,6 +108,7 @@ final class DeviceState {
     'auth_generation': authGeneration,
     'session': session?.toJson(),
     'refresh_sent': refreshSent,
+    'auth_transition_unknown': authTransitionUnknown,
     'attempts': attempts.map((key, value) => MapEntry(key, value.toJson())),
   };
 
@@ -116,6 +119,8 @@ final class DeviceState {
         (value['auth_generation']! as int) < 0 ||
         (value['generation']! as int) < 0 ||
         value['refresh_sent'] is! bool ||
+        (value.containsKey('auth_transition_unknown') &&
+            value['auth_transition_unknown'] is! bool) ||
         value['attempts'] is! Map<String, Object?>) {
       throw const ClientException('device_storage_corrupt');
     }
@@ -143,6 +148,7 @@ final class DeviceState {
         authGeneration: value['auth_generation']! as int,
         session: session,
         refreshSent: value['refresh_sent']! as bool,
+        authTransitionUnknown: value['auth_transition_unknown'] == true,
         attempts: attempts,
       );
     } on ClientException {
@@ -158,6 +164,8 @@ abstract class DeviceStore implements SessionStore {
   bool blocked = false;
   DeviceState? transientState;
   int? transientBaseGeneration;
+  int? transientBaseAuthGeneration;
+  final activeAuthTransitions = <DeviceState>{};
 
   @override
   String get origin => scope.origin;
@@ -177,6 +185,7 @@ abstract class DeviceStore implements SessionStore {
         rethrow;
       }
       transientBaseGeneration ??= expected.generation;
+      transientBaseAuthGeneration ??= expected.authGeneration;
       transientState = next;
       return true;
     }
@@ -190,6 +199,12 @@ abstract class DeviceStore implements SessionStore {
   Future<SessionCredentials?> read() async {
     requireAvailable();
     final state = await load();
+    if (state.authTransitionUnknown &&
+        !activeAuthTransitions.any(
+          (active) => active.authGeneration == state.authGeneration,
+        )) {
+      return null;
+    }
     if (state.refreshSent) throw const ClientException('session_changed');
     return state.session;
   }
@@ -197,11 +212,12 @@ abstract class DeviceStore implements SessionStore {
   Future<SessionCredentials?> waitForSession(Duration timeout) async {
     final elapsed = Stopwatch()..start();
     while (true) {
-      requireAvailable();
-      final state = await load();
-      if (!state.refreshSent) return state.session;
-      if (elapsed.elapsed >= timeout) {
-        throw const ClientException('session_changed');
+      try {
+        return await read();
+      } on ClientException catch (error) {
+        if (error.code != 'session_changed' || elapsed.elapsed >= timeout) {
+          rethrow;
+        }
       }
       await Future<void>.delayed(const Duration(milliseconds: 20));
     }
@@ -260,6 +276,7 @@ abstract class DeviceStore implements SessionStore {
       session: expected,
       authGeneration: current.authGeneration,
       refreshSent: true,
+      authTransitionUnknown: current.authTransitionUnknown,
       attempts: current.attempts,
     );
     return await commit(current, claimed) ? claimed : null;
@@ -284,11 +301,13 @@ abstract class DeviceStore implements SessionStore {
         generation: current.generation + 1,
         authGeneration: current.authGeneration + (next == null ? 1 : 0),
         session: next,
+        authTransitionUnknown: next != null && current.authTransitionUnknown,
         attempts: current.attempts,
       );
       if (conflicts == deviceLocalRetryLimit + 1) {
         if (next == null) return false;
         transientBaseGeneration ??= current.generation;
+        transientBaseAuthGeneration ??= current.authGeneration;
         transientState = replacement;
         return true;
       }
@@ -333,6 +352,7 @@ abstract class DeviceStore implements SessionStore {
       authGeneration: next.authGeneration,
       session: next.session,
       refreshSent: next.refreshSent,
+      authTransitionUnknown: next.authTransitionUnknown,
       attempts: attempts,
     );
     if (next.authGeneration < 0 ||
@@ -368,6 +388,7 @@ final class MemoryDeviceStore extends DeviceStore {
     _state = next;
     transientState = null;
     transientBaseGeneration = null;
+    transientBaseAuthGeneration = null;
     return true;
   }
 }
