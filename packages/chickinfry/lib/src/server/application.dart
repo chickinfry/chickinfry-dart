@@ -118,11 +118,16 @@ final class Application {
       }
       Object? input;
       try {
-        input = jsonDecode(utf8.decode(bytes.takeBytes()));
+        final source = utf8.decode(bytes.takeBytes());
+        final error = _validateJson(source);
+        if (error != null) return _error(error, 400);
+        input = jsonDecode(source);
       } on FormatException {
         return _error('invalid_json', 400);
       }
-      if (input is! Map<String, Object?>) return _error('invalid_input', 400);
+      if (input is! Map<String, Object?>) {
+        return _error('invalid_input', 400);
+      }
       final output = await operation(
         _contextFactory?.call(request, connection) ?? Context(request),
         input,
@@ -139,6 +144,177 @@ final class Application {
     } catch (_) {
       return _error('operation_failed', 500);
     }
+  }
+
+  // Check raw values before decoding can discard duplicate object members.
+  static String? _validateJson(String source) {
+    const value = 0, arrayStart = 1, objectStart = 2;
+    const key = 3, colon = 4, afterValue = 5;
+    // Each open container needs a closing character, so half the input suffices.
+    // The request byte limit bounds this stack to at most 2 MiB.
+    final containers = Uint8List(source.length ~/ 2);
+    // Key storage is bounded by the body; stop collecting after a structure error.
+    final objectKeys = List<Set<String>?>.filled(64, null);
+    var invalidInput = false;
+    var depth = 0;
+    var state = value;
+    var index = 0;
+    bool at(int unit) =>
+        index < source.length && source.codeUnitAt(index) == unit;
+    bool digits() {
+      final start = index;
+      while (index < source.length) {
+        final unit = source.codeUnitAt(index);
+        if (unit < 0x30 || unit > 0x39) break;
+        index++;
+      }
+      return index > start;
+    }
+
+    bool string(bool isKey) {
+      final decoded = isKey && !invalidInput ? StringBuffer() : null;
+      var highSurrogate = false;
+      index++;
+      while (index < source.length) {
+        var unit = source.codeUnitAt(index++);
+        if (unit == 0x22) {
+          if (highSurrogate) invalidInput = true;
+          if (decoded != null && !invalidInput) {
+            if (!objectKeys[depth - 1]!.add(decoded.toString())) {
+              invalidInput = true;
+            }
+          }
+          return true;
+        }
+        if (unit < 0x20) return false;
+        if (unit == 0x5c) {
+          if (index == source.length) return false;
+          final escape = source.codeUnitAt(index++);
+          if (escape == 0x75) {
+            if (index + 4 > source.length) return false;
+            unit = 0;
+            for (var digit = 0; digit < 4; digit++) {
+              final hex = source.codeUnitAt(index++);
+              final value = switch (hex) {
+                >= 0x30 && <= 0x39 => hex - 0x30,
+                >= 0x41 && <= 0x46 => hex - 0x41 + 10,
+                >= 0x61 && <= 0x66 => hex - 0x61 + 10,
+                _ => -1,
+              };
+              if (value < 0) return false;
+              unit = unit * 16 + value;
+            }
+          } else {
+            unit = switch (escape) {
+              0x22 || 0x5c || 0x2f => escape,
+              0x62 => 0x08,
+              0x66 => 0x0c,
+              0x6e => 0x0a,
+              0x72 => 0x0d,
+              0x74 => 0x09,
+              _ => -1,
+            };
+            if (unit < 0) return false;
+          }
+        }
+        final lowSurrogate = unit >= 0xdc00 && unit <= 0xdfff;
+        if (highSurrogate != lowSurrogate) invalidInput = true;
+        highSurrogate = unit >= 0xd800 && unit <= 0xdbff;
+        decoded?.writeCharCode(unit);
+      }
+      return false;
+    }
+
+    while (index < source.length) {
+      final unit = source.codeUnitAt(index);
+      if (unit == 0x20 || unit == 0x09 || unit == 0x0a || unit == 0x0d) {
+        index++;
+        continue;
+      }
+      if ((state == arrayStart && unit == 0x5d) ||
+          (state == objectStart && unit == 0x7d)) {
+        depth--;
+        if (depth < 64) objectKeys[depth] = null;
+        state = afterValue;
+        index++;
+        continue;
+      }
+      if (state == afterValue) {
+        if (depth == 0) return 'invalid_json';
+        final closing = containers[depth - 1];
+        if (unit == closing) {
+          depth--;
+          if (depth < 64) objectKeys[depth] = null;
+        } else if (unit == 0x2c) {
+          state = closing == 0x7d ? key : value;
+        } else {
+          return 'invalid_json';
+        }
+        index++;
+        continue;
+      }
+      if (state == colon) {
+        if (unit != 0x3a) return 'invalid_json';
+        state = value;
+        index++;
+        continue;
+      }
+      if (unit == 0x22) {
+        if (!string(state == objectStart || state == key)) {
+          return 'invalid_json';
+        }
+        state = state == objectStart || state == key ? colon : afterValue;
+        continue;
+      }
+      if (state == objectStart || state == key) return 'invalid_json';
+      if (unit == 0x7b || unit == 0x5b) {
+        if (depth == containers.length) return 'invalid_json';
+        if (!invalidInput && depth < 64 && unit == 0x7b) {
+          objectKeys[depth] = <String>{};
+        }
+        containers[depth++] = unit == 0x7b ? 0x7d : 0x5d;
+        if (depth > 64) invalidInput = true;
+        state = unit == 0x7b ? objectStart : arrayStart;
+        index++;
+        continue;
+      }
+      if (unit == 0x2d || (unit >= 0x30 && unit <= 0x39)) {
+        final start = index;
+        if (at(0x2d)) index++;
+        if (at(0x30)) {
+          index++;
+        } else if (!digits()) {
+          return 'invalid_json';
+        }
+        if (at(0x2e)) {
+          index++;
+          if (!digits()) return 'invalid_json';
+        }
+        if (at(0x65) || at(0x45)) {
+          index++;
+          if (at(0x2b) || at(0x2d)) index++;
+          if (!digits()) return 'invalid_json';
+        }
+        if (!invalidInput &&
+            !double.parse(source.substring(start, index)).isFinite) {
+          invalidInput = true;
+        }
+      } else {
+        final literal = switch (unit) {
+          0x6e => 'null',
+          0x74 => 'true',
+          0x66 => 'false',
+          _ => null,
+        };
+        if (literal == null || !source.startsWith(literal, index)) {
+          return 'invalid_json';
+        }
+        index += literal.length;
+      }
+      state = afterValue;
+    }
+    if (depth != 0 || state != afterValue) return 'invalid_json';
+    return invalidInput ? 'invalid_input' : null;
   }
 
   static ServerResponse _error(String code, int status) =>

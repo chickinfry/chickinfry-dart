@@ -1,0 +1,263 @@
+{
+  "rootDepth": 1,
+  "maxDepth": 64,
+  "inputs": {
+    "catalog.create": {
+      "name": "structure",
+      "note": "ok"
+    },
+    "catalog.inspect_optional": {
+      "required_name": "required",
+      "nullable_name": null,
+      "entries": [],
+      "large_rows": [
+        {
+          "payload": "present"
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "name": "unknown-depth-65",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "depth": 65,
+        "leafJSON": "null"
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_input",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "unknown-depth-64",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "depth": 64,
+        "leafJSON": "null"
+      },
+      "expectedStatus": 200,
+      "expectedHandlerCalls": 1
+    },
+    {
+      "name": "declared-list-depth-64",
+      "operation": "catalog.inspect_optional",
+      "path": [
+        "large_rows",
+        0,
+        "ignored"
+      ],
+      "value": {
+        "depth": 64,
+        "leafJSON": "null"
+      },
+      "expectedStatus": 200,
+      "expectedHandlerCalls": 1
+    },
+    {
+      "name": "unknown-positive-overflow",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "rawJSON": "1e999"
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_input",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "nested-negative-overflow",
+      "operation": "catalog.inspect_optional",
+      "path": [
+        "large_rows",
+        0,
+        "ignored"
+      ],
+      "value": {
+        "rawJSON": "-1e999"
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_input",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "unknown-finite-double",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "rawJSON": "1e308"
+      },
+      "expectedStatus": 200,
+      "expectedHandlerCalls": 1
+    },
+    {
+      "name": "reject-before-serialization",
+      "operation": "catalog.inspect_optional",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "depth": 20000,
+        "leafJSON": "null"
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_input",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "malformed-unclosed-depth-65",
+      "operation": "catalog.create",
+      "path": [
+        "note"
+      ],
+      "value": {
+        "rawJSON": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[["
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_json",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "malformed-token-after-depth-65",
+      "operation": "catalog.create",
+      "path": [
+        "note"
+      ],
+      "value": {
+        "rawJSON": "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[null]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]!"
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_json",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "duplicate-key-overflow-overwritten",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "rawJSON": "1e999",
+        "duplicateFinalJSON": "0"
+      },
+      "expectedStatus": 400,
+      "expectedHandlerCalls": 0,
+      "expectedError": "invalid_input"
+    },
+    {
+      "name": "unknown-integer-5000-digits",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "integerDigits": 5000
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_input",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "unknown-integer-300-digits",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "integerDigits": 300
+      },
+      "expectedStatus": 200,
+      "expectedHandlerCalls": 1
+    },
+    {
+      "name": "duplicate-key-depth-20000-overwritten",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "depth": 20000,
+        "leafJSON": "null",
+        "duplicateFinalJSON": "0"
+      },
+      "expectedStatus": 400,
+      "expectedHandlerCalls": 0,
+      "expectedError": "invalid_input"
+    },
+    {
+      "name": "unknown-unpaired-high-surrogate-value",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "rawJSON": "\"\\ud800\""
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_input",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "unknown-unpaired-low-surrogate-key",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "rawJSON": "{\"\\udc00\":0}"
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_input",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "duplicate-key-note",
+      "operation": "catalog.create",
+      "path": [
+        "note"
+      ],
+      "value": {
+        "rawJSON": "\"a\"",
+        "duplicateFinalJSON": "\"b\""
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_input",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "duplicate-key-escaped-name",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "rawJSON": "{\"na\\u006de\":0,\"name\":1}"
+      },
+      "expectedStatus": 400,
+      "expectedError": "invalid_input",
+      "expectedHandlerCalls": 0
+    },
+    {
+      "name": "same-key-separate-objects-with-string-escapes",
+      "operation": "catalog.create",
+      "path": [
+        "ignored"
+      ],
+      "value": {
+        "rawJSON": "[{\"name\":\"a\\\"}:[{\\\\x\"},{\"name\":\"b\"}]"
+      },
+      "expectedStatus": 200,
+      "expectedHandlerCalls": 1
+    }
+  ]
+}

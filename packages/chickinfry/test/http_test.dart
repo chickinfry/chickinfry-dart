@@ -926,11 +926,49 @@ void main() {
     () async {
       final disconnected = Completer<int>();
       final watch = Stopwatch();
+      final context = SecurityContext()
+        ..useCertificateChain('test/fixtures/server_chain.pem')
+        ..usePrivateKey('test/fixtures/server_key.pem');
+      final next = await HttpServer.bindSecure(
+        InternetAddress.loopbackIPv4,
+        0,
+        context,
+      );
+      addTearDown(() => next.close(force: true));
+      var requests = 0;
+      var receivedBytes = 0;
+      next.listen((request) async {
+        requests++;
+        receivedBytes = await request.fold<int>(
+          0,
+          (length, chunk) => length + chunk.length,
+        );
+        await reply(request, {'value': 'a' * (256 * 1024)});
+      });
+      var resumeTls = false;
       final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
       final port = server.port;
       addTearDown(server.close);
-      server.listen((socket) {
+      server.listen((socket) async {
         addTearDown(socket.destroy);
+        if (resumeTls) {
+          final upstream = await Socket.connect(
+            InternetAddress.loopbackIPv4,
+            next.port,
+          );
+          addTearDown(upstream.destroy);
+          socket.listen(
+            upstream.add,
+            onError: (_) => upstream.destroy(),
+            onDone: upstream.destroy,
+          );
+          upstream.listen(
+            socket.add,
+            onError: (_) => socket.destroy(),
+            onDone: socket.destroy,
+          );
+          return;
+        }
         socket.listen(
           (_) {},
           onDone: () {
@@ -969,26 +1007,8 @@ void main() {
         inInclusiveRange(0, 800),
         reason: 'Request cancellation must close TLS before connectionTimeout.',
       );
-      await server.close();
-      final context = SecurityContext()
-        ..useCertificateChain('test/fixtures/server_chain.pem')
-        ..usePrivateKey('test/fixtures/server_key.pem');
-      final next = await HttpServer.bindSecure(
-        InternetAddress.loopbackIPv4,
-        port,
-        context,
-      );
-      addTearDown(() => next.close(force: true));
-      var requests = 0;
-      var receivedBytes = 0;
-      next.listen((request) async {
-        requests++;
-        receivedBytes = await request.fold<int>(
-          0,
-          (length, chunk) => length + chunk.length,
-        );
-        await reply(request, {'value': 'a' * (256 * 1024)});
-      });
+      // Keep the origin port bound while subsequent connections reach TLS.
+      resumeTls = true;
       await expectLater(
         transport.invoke('thing.get', {}),
         throwsA(clientFailure('network_error')),
