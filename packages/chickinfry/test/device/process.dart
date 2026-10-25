@@ -24,6 +24,32 @@ Future<void> main(List<String> arguments) async {
     );
     try {
       switch (action) {
+        case 'default-location':
+        case 'default-unavailable':
+          final automatic = createDeviceTransport(
+            app: 'device.test',
+            origin: origin,
+            project: 'project',
+            environment: 'test',
+            screen: screen,
+          );
+          try {
+            final native = automatic.store as NativeDeviceStore;
+            if (action == 'default-unavailable') {
+              try {
+                await native.load();
+                exit(86);
+              } on ClientException catch (error) {
+                if (error.code != 'device_storage_unavailable') exit(87);
+              }
+            } else {
+              if (!native.directory.startsWith('$root/')) exit(88);
+              await native.write(credentials());
+              if (await native.read() == null) exit(89);
+            }
+          } finally {
+            automatic.close();
+          }
         case 'seed':
           await transport.invoke('auth.signin', {'email': 'user@example.test'});
           await transport.invoke('auth.signup', {
@@ -145,12 +171,17 @@ Future<void> main(List<String> arguments) async {
     } finally {
       transport.close();
     }
-  } catch (_) {
+  } catch (error, stack) {
+    final label = stack.toString().split('\n').first;
+    if (error is ClientException &&
+        RegExp(r'^device storage check=[a-z_]+$').hasMatch(label)) {
+      stderr.writeln(label);
+    }
     exit(39);
   }
 }
 
-class CrashFiles extends MacFiles {
+class CrashFiles extends PosixFiles {
   CrashFiles(this.step);
   final String step;
   @override

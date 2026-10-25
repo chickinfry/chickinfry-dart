@@ -15,6 +15,9 @@ import 'package:test/test.dart';
 import 'support.dart';
 
 void main() {
+  final unsupportedPosix = Platform.isMacOS || Platform.isLinux
+      ? false
+      : 'Requires the macOS or Linux POSIX file device.';
   for (final outcome in [
     'before send',
     'mark write fails',
@@ -260,7 +263,7 @@ void main() {
           );
         }
       }
-    }, skip: !Platform.isMacOS);
+    }, skip: unsupportedPosix);
   }
 
   test(
@@ -323,7 +326,7 @@ void main() {
         }
       }
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
 
   for (final change in [
@@ -447,7 +450,7 @@ void main() {
         protected == (change == 'new account' ? 2 : 1) && refreshes == 0,
         isTrue,
       );
-    }, skip: !Platform.isMacOS);
+    }, skip: unsupportedPosix);
   }
 
   for (final earlier in [
@@ -581,7 +584,7 @@ void main() {
         );
         expect(await child('unresolved', root, origin), 0);
       },
-      skip: !Platform.isMacOS,
+      skip: unsupportedPosix,
     );
   }
 
@@ -641,7 +644,7 @@ void main() {
         0,
       );
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
 
   test(
@@ -706,7 +709,7 @@ void main() {
       );
       expect(sends, 1);
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
 
   test('atomic interruption leaves an old or new whole bundle', () async {
@@ -728,7 +731,7 @@ void main() {
       );
       expect(next.session != null, isTrue);
     }
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
 
   test('corruption, wrong owner and future version preserve files', () async {
     final root = await scratch();
@@ -771,7 +774,7 @@ void main() {
     await rejects('device_storage_corrupt', store);
     await file.writeAsBytes(original);
     expect(await store.read() == value, isTrue);
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
 
   test('processes and isolates serialize generation comparisons', () async {
     final root = await scratch();
@@ -805,7 +808,7 @@ void main() {
 
     await Future.wait([Isolate.run(increment), Isolate.run(increment)]);
     expect((await store.load()).generation, before + 20);
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
   test(
     'uncreatable path fails and failed refresh claim sends nothing',
     () async {
@@ -914,7 +917,7 @@ void main() {
       );
       expect((await Directory(store.directory).stat()).mode & 0x3f, isNot(0));
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
   test('server success survives a runtime write failure in this run without resending', () async {
     final root = await scratch();
@@ -952,7 +955,7 @@ void main() {
       isTrue,
     );
     expect(await device(root, origin).read() == null, isTrue);
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
   test('failed refreshed-session write retains memory and the durable unknown mark', () async {
     final root = await scratch();
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -998,7 +1001,7 @@ void main() {
         isA<ClientException>().having((e) => e.code, 'code', 'session_changed'),
       ),
     );
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
   test(
     'pre-existing broad intermediate directory is rejected without chmod',
     () async {
@@ -1027,7 +1030,7 @@ void main() {
       );
       expect((await intermediate.stat()).mode & 0x3f, 0x2d);
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
   test('fourth successful signup stays usable in memory without eviction or resend', () async {
     final root = await scratch();
@@ -1085,7 +1088,7 @@ void main() {
       isTrue,
     );
     expect((await device(root, origin).load()).attempts.length, 3);
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
   test(
     'directory flush failure reconciles logout and preserves a newer login',
     () async {
@@ -1150,7 +1153,7 @@ void main() {
         ),
       );
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
 
   test('owner paths remain distinct after case folding', () async {
@@ -1169,7 +1172,7 @@ void main() {
       }
     }
     expect(collision, isFalse);
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
 
   test(
     'future signup attempts are preserved while automatic selection waits',
@@ -1235,7 +1238,7 @@ void main() {
         isTrue,
       );
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
 
   test('FIFO records are rejected without waiting for a writer', () async {
@@ -1250,11 +1253,11 @@ void main() {
     ], includeParentEnvironment: false);
     expect(result.exitCode, 0);
     expect(await child('fifo', root, origin), 0);
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
 
   test('Darwin stat symbols match each supported ABI', () {
-    expect(darwinStatSymbol(Abi.macosArm64), 'fstat');
-    expect(darwinStatSymbol(Abi.macosX64), r'fstat$INODE64');
+    expect(posixStatSymbol(Abi.macosArm64), 'fstat');
+    expect(posixStatSymbol(Abi.macosX64), r'fstat$INODE64');
   });
   test(
     'extended ACL grants are rejected and deny entries are preserved',
@@ -1326,7 +1329,7 @@ void main() {
         ),
       );
     },
-    skip: !Platform.isMacOS,
+    skip: Platform.isMacOS ? false : 'Requires Darwin ACLs.',
   );
   test(
     'oversized valid JSON is rejected before the complete file is read',
@@ -1358,7 +1361,7 @@ void main() {
       expect(await file.length(), length);
       expect(counter.bytesRead < length, isTrue);
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
 
   test('failed remote logout still clears local session and attempts across restart', () async {
@@ -1399,7 +1402,7 @@ void main() {
     final after = await store.load();
     expect(after.session == null && after.attempts.isEmpty, isTrue);
     expect(await child('empty', root, origin), 0);
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
 
   test(
     'non-successor generation writes are rejected without touching the record',
@@ -1435,12 +1438,12 @@ void main() {
         isTrue,
       );
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
   test('relative persistence directory is fixed at construction and empty is rejected', () async {
     final root = await scratch();
     expect(await child('relative', root, 'https://relative.example.test'), 0);
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
   for (final initiallySignedIn in [false, true]) {
     test(
       initiallySignedIn
@@ -1502,7 +1505,7 @@ void main() {
           isTrue,
         );
       },
-      skip: !Platform.isMacOS,
+      skip: unsupportedPosix,
     );
   }
   for (final boundary in ['logout', 'switch']) {
@@ -1586,7 +1589,7 @@ void main() {
         await first.invoke('example.read', {});
       }
       expect(refreshes, 0);
-    }, skip: !Platform.isMacOS);
+    }, skip: unsupportedPosix);
   }
 
   test(
@@ -1662,7 +1665,7 @@ void main() {
       );
       expect(refreshes, 0);
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
 
   test('fourth local conflict keeps confirm result in memory with no network replay', () async {
@@ -1711,7 +1714,7 @@ void main() {
           (await persistent.load()).attempts['a']?.id == attempt,
       isTrue,
     );
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
 
   test('late second confirmation keeps the installed session and removes its consumed attempt', () async {
     final root = await scratch();
@@ -1775,7 +1778,7 @@ void main() {
           bCalls == 1,
       isTrue,
     );
-  }, skip: !Platform.isMacOS);
+  }, skip: unsupportedPosix);
 
   test(
     'first install and a new session ID advance the local auth generation',
@@ -1805,7 +1808,7 @@ void main() {
       expect((await store.load()).toJson()['auth_generation'], 2);
       expect(await store.read() == next, isTrue);
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
 
   test(
@@ -1867,7 +1870,7 @@ void main() {
         isTrue,
       );
     },
-    skip: !Platform.isMacOS,
+    skip: unsupportedPosix,
   );
   for (final operation in ['auth.verify_email', 'auth.signin_with_code']) {
     test(
@@ -1947,23 +1950,23 @@ void main() {
           isTrue,
         );
       },
-      skip: !Platform.isMacOS,
+      skip: unsupportedPosix,
     );
   }
 }
 
-class FullFiles extends MacFiles {
+class FullFiles extends PosixFiles {
   @override
   void syncFile(int fd) => throw const ClientException('device_storage_full');
 }
 
-class UnavailableFiles extends MacFiles {
+class UnavailableFiles extends PosixFiles {
   @override
   void syncFile(int fd) =>
       throw const ClientException('device_storage_unavailable');
 }
 
-class FailWrite extends MacFiles {
+class FailWrite extends PosixFiles {
   FailWrite(this.at);
   final int at;
   var writes = 0;
@@ -1985,7 +1988,7 @@ class FailWrite extends MacFiles {
   }
 }
 
-class FailDirectorySyncOnce extends MacFiles {
+class FailDirectorySyncOnce extends PosixFiles {
   var failed = false;
   @override
   void syncDirectory(int fd) {
@@ -1997,7 +2000,7 @@ class FailDirectorySyncOnce extends MacFiles {
   }
 }
 
-class CountingReads extends MacFiles {
+class CountingReads extends PosixFiles {
   var bytesRead = 0;
   @override
   int readChunk(int fd, Pointer<Uint8> buffer, int length) {

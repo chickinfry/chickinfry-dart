@@ -8,22 +8,69 @@ import 'package:ffi/ffi.dart';
 import '../errors.dart';
 import 'store.dart' show devicePayloadLimit;
 
-String darwinStatSymbol(Abi abi) =>
-    abi == Abi.macosX64 ? r'fstat$INODE64' : 'fstat';
+String posixStatSymbol(Abi abi) => switch (abi) {
+  Abi.macosX64 => r'fstat$INODE64',
+  Abi.macosArm64 || Abi.linuxX64 || Abi.linuxArm64 => 'fstat',
+  _ => throw const ClientException('device_storage_unavailable'),
+};
+
+Never _rejectStorage(String check) => Error.throwWithStackTrace(
+  const ClientException('device_storage_unavailable'),
+  StackTrace.fromString('device storage check=$check\n${StackTrace.current}'),
+);
+
+void checkLinuxAcl(Uint8List bytes, int uid) {
+  final data = ByteData.sublistView(bytes);
+  if (bytes.length < 28 ||
+      (bytes.length - 4) % 8 != 0 ||
+      data.getUint32(0, Endian.little) != 2) {
+    _rejectStorage('acl_format');
+  }
+  var mask = 7;
+  for (var offset = 4; offset < bytes.length; offset += 8) {
+    final tag = data.getUint16(offset, Endian.little);
+    final permission = data.getUint16(offset + 2, Endian.little);
+    if (permission > 7 || !const [1, 2, 4, 8, 16, 32].contains(tag)) {
+      _rejectStorage('acl_format');
+    }
+    if (tag == 16) mask = permission;
+  }
+  for (var offset = 4; offset < bytes.length; offset += 8) {
+    final tag = data.getUint16(offset, Endian.little);
+    if (tag == 16) continue;
+    final permission = data.getUint16(offset + 2, Endian.little);
+    final owner = data.getUint32(offset + 4, Endian.little);
+    final ownerEntry = tag == 1 || (tag == 2 && owner == uid);
+    final effective = const [2, 4, 8].contains(tag)
+        ? permission & mask
+        : permission;
+    if (!ownerEntry && effective != 0) _rejectStorage('acl_access');
+  }
+}
 
 // Darwin's flock and fcntl locks conflict, so they use separate sidecars.
-class MacFiles {
+class PosixFiles {
+  PosixFiles() {
+    posixStatSymbol(Abi.current());
+  }
+
+  static final _linux = Platform.isLinux;
+  static final _linuxArm64 = Abi.current() == Abi.linuxArm64;
   static final _lib = DynamicLibrary.process();
   static final _openat = _lib
       .lookupFunction<
         Int32 Function(Int32, Pointer<Utf8>, Int32, VarArgs<(Uint32,)>),
         int Function(int, Pointer<Utf8>, int, int)
       >('openat');
-  static final _mkdirat = _lib
-      .lookupFunction<
-        Int32 Function(Int32, Pointer<Utf8>, Uint16),
-        int Function(int, Pointer<Utf8>, int)
-      >('mkdirat');
+  static final _mkdirat = _linux
+      ? _lib.lookupFunction<
+          Int32 Function(Int32, Pointer<Utf8>, Uint32),
+          int Function(int, Pointer<Utf8>, int)
+        >('mkdirat')
+      : _lib.lookupFunction<
+          Int32 Function(Int32, Pointer<Utf8>, Uint16),
+          int Function(int, Pointer<Utf8>, int)
+        >('mkdirat');
   static final _close = _lib
       .lookupFunction<Int32 Function(Int32), int Function(int)>('close');
   static final _fsync = _lib
@@ -56,7 +103,12 @@ class MacFiles {
       .lookupFunction<
         Int32 Function(Int32, Pointer<Uint8>),
         int Function(int, Pointer<Uint8>)
-      >(darwinStatSymbol(Abi.current()));
+      >(posixStatSymbol(Abi.current()));
+  static final _fgetxattr = _lib
+      .lookupFunction<
+        IntPtr Function(Int32, Pointer<Utf8>, Pointer<Uint8>, Size),
+        int Function(int, Pointer<Utf8>, Pointer<Uint8>, int)
+      >('fgetxattr');
   static final _aclGetFd = _lib
       .lookupFunction<
         Pointer<Void> Function(Int32, Int32),
@@ -92,18 +144,21 @@ class MacFiles {
   );
   static final _errno = _lib
       .lookupFunction<Pointer<Int32> Function(), Pointer<Int32> Function()>(
-        '__error',
+        _linux ? '__errno_location' : '__error',
       );
   static final _pending = <String, Future<void>>{};
-  static const _nofollow = 0x100;
-  static const _cloexec = 0x1000000;
-  static const _directory = 0x100000;
-  static const _create = 0x200;
-  static const _exclusive = 0x800;
+  static final _nofollow = _linux ? (_linuxArm64 ? 0x8000 : 0x20000) : 0x100;
+  static final _cloexec = _linux ? 0x80000 : 0x1000000;
+  static final _directory = _linux
+      ? (_linuxArm64 ? 0x4000 : 0x10000)
+      : 0x100000;
+  static final _create = _linux ? 0x40 : 0x200;
+  static final _exclusive = _linux ? 0x80 : 0x800;
+  static final _nonblock = _linux ? 0x800 : 4;
   static const _readwrite = 2;
 
   Never _failure() => throw ClientException(
-    _errno().value == 28 || _errno().value == 69
+    _errno().value == 28 || _errno().value == (_linux ? 122 : 69)
         ? 'device_storage_full'
         : 'device_storage_unavailable',
   );
@@ -111,7 +166,12 @@ class MacFiles {
   int _open(int parent, String name, int flags, [int mode = 0]) {
     final path = name.toNativeUtf8();
     try {
-      final fd = _openat(parent, path, flags | _nofollow | _cloexec | 4, mode);
+      final fd = _openat(
+        parent,
+        path,
+        flags | _nofollow | _cloexec | _nonblock,
+        mode,
+      );
       if (fd < 0) _failure();
       return fd;
     } finally {
@@ -125,22 +185,43 @@ class MacFiles {
     bool private = true,
     bool userOwned = false,
   }) {
-    // Darwin stat64's fixed prefix: mode at byte 4, uid at byte 16.
+    // glibc and musl share these prefixes on Linux x86_64 and aarch64.
     final memory = calloc<Uint8>(256);
     try {
       if (_fstat(fd, memory) != 0) _failure();
       final data = ByteData.sublistView(memory.asTypedList(256));
-      final mode = data.getUint16(4, Endian.host);
-      final owner = data.getUint32(16, Endian.host);
+      final mode = _linux
+          ? data.getUint32(_linuxArm64 ? 16 : 24, Endian.host)
+          : data.getUint16(4, Endian.host);
+      final owner = data.getUint32(
+        _linux ? (_linuxArm64 ? 24 : 28) : 16,
+        Endian.host,
+      );
+      final links = _linux
+          ? (_linuxArm64
+                ? data.getUint32(20, Endian.host)
+                : data.getUint64(16, Endian.host))
+          : data.getUint16(6, Endian.host);
       final kind = mode & 0xf000;
-      if (kind != (directory ? 0x4000 : 0x8000) ||
-          (userOwned && owner != _uid()) ||
-          (private
-              ? owner != _uid() || (mode & 0x3f) != 0
-              : (owner != 0 && owner != _uid()) || (mode & 0x12) != 0) ||
-          (!directory && data.getUint16(6, Endian.host) != 1)) {
-        throw const ClientException('device_storage_unavailable');
+      final role = !directory
+          ? 'file'
+          : userOwned
+          ? 'root'
+          : private
+          ? 'private'
+          : 'ancestor';
+      if (kind != (directory ? 0x4000 : 0x8000)) {
+        _rejectStorage('${role}_type');
       }
+      if ((userOwned || private)
+          ? owner != _uid()
+          : owner != 0 && owner != _uid()) {
+        _rejectStorage('${role}_owner');
+      }
+      if (private ? (mode & 0x3f) != 0 : (mode & 0x12) != 0) {
+        _rejectStorage('${role}_mode');
+      }
+      if (!directory && links != 1) _rejectStorage('file_links');
       if (private || userOwned) _checkAcl(fd);
     } finally {
       calloc.free(memory);
@@ -148,6 +229,10 @@ class MacFiles {
   }
 
   void _checkAcl(int fd) {
+    if (_linux) {
+      _checkLinuxAcl(fd);
+      return;
+    }
     final acl = _aclGetFd(fd, 0x100);
     if (acl == nullptr) {
       // Darwin uses ENOENT for an absent ACL on an open descriptor.
@@ -189,13 +274,30 @@ class MacFiles {
     }
   }
 
+  void _checkLinuxAcl(int fd) {
+    final name = 'system.posix_acl_access'.toNativeUtf8();
+    // Linux limits each xattr to 64 KiB; one read avoids a size/read race.
+    final memory = calloc<Uint8>(65536);
+    try {
+      final size = _fgetxattr(fd, name, memory, 65536);
+      if (size < 0) {
+        if (_errno().value == 61) return; // ENODATA: no access ACL.
+        _failure();
+      }
+      checkLinuxAcl(memory.asTypedList(size), _uid());
+    } finally {
+      calloc.free(memory);
+      calloc.free(name);
+    }
+  }
+
   int _directoryFd(String path, String root) {
     if (!path.startsWith('/') ||
         path.contains('\x00') ||
         path.split('/').contains('..')) {
       throw const ClientException('device_storage_unavailable');
     }
-    var fd = _open(-2, '/', _directory);
+    var fd = _open(_linux ? -100 : -2, '/', _directory);
     try {
       final parts = path
           .split('/')
@@ -252,7 +354,7 @@ class MacFiles {
       _check(descriptor, directory: false);
       final elapsed = Stopwatch()..start();
       while (_flock(descriptor, 2 | 4) != 0) {
-        if (_errno().value != 35 ||
+        if (_errno().value != (_linux ? 11 : 35) ||
             elapsed.elapsed > const Duration(seconds: 5)) {
           _failure();
         }
@@ -304,7 +406,7 @@ class MacFiles {
     final path = name.toNativeUtf8();
     final int fd;
     try {
-      fd = _openat(directoryFd, path, _nofollow | _cloexec | 4, 0);
+      fd = _openat(directoryFd, path, _nofollow | _cloexec | _nonblock, 0);
       if (fd < 0) {
         if (_errno().value == 2) return null;
         _failure();

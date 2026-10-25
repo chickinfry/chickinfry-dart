@@ -20,18 +20,18 @@ String resolveDirectory(String directory) {
 }
 
 DeviceStore openDevice(DeviceScope scope, Persist? persist) {
-  if (!Platform.isMacOS) {
+  if (!Platform.isMacOS && !Platform.isLinux) {
     throw const ClientException('device_storage_unavailable');
   }
   return NativeDeviceStore(scope, directory: persist?.directory);
 }
 
 final class NativeDeviceStore extends DeviceStore {
-  NativeDeviceStore(super.scope, {String? directory, MacFiles? files})
+  NativeDeviceStore(super.scope, {String? directory, PosixFiles? files})
     : _base = directory,
-      _files = files ?? MacFiles();
+      _files = files ?? PosixFiles();
   final String? _base;
-  final MacFiles _files;
+  final PosixFiles _files;
   DeviceState? _uncertainWrite;
   late final String _slot = _scopePath(scope.owner);
 
@@ -56,17 +56,25 @@ final class NativeDeviceStore extends DeviceStore {
       }
       return base;
     }
-    final home = Platform.environment['HOME'];
-    if (home == null || !home.startsWith('/')) {
-      throw const ClientException('device_storage_unavailable');
-    }
     if (scope.app == '.' ||
         scope.app == '..' ||
         scope.app.contains('/') ||
         scope.app.contains('\x00')) {
       throw const ClientException('device_storage_unavailable');
     }
-    return '$home/Library/Application Support/${scope.app}';
+    if (Platform.isLinux) {
+      final xdg = Platform.environment['XDG_STATE_HOME'];
+      if (xdg != null && xdg.startsWith('/')) {
+        return '$xdg/chickinfry/${scope.app}';
+      }
+    }
+    final home = Platform.environment['HOME'];
+    if (home == null || !home.startsWith('/')) {
+      throw const ClientException('device_storage_unavailable');
+    }
+    return Platform.isLinux
+        ? '$home/.local/state/chickinfry/${scope.app}'
+        : '$home/Library/Application Support/${scope.app}';
   }
 
   @override
@@ -102,7 +110,7 @@ final class NativeDeviceStore extends DeviceStore {
   @override
   Future<DeviceState> load() {
     requireAvailable();
-    if (!Platform.isMacOS) {
+    if (!Platform.isMacOS && !Platform.isLinux) {
       throw const ClientException('device_storage_unavailable');
     }
     if (transientState != null) return Future.value(transientState!);
@@ -201,7 +209,7 @@ final class NativeDeviceStore extends DeviceStore {
 
   Future<bool> _commitPersistent(DeviceState expected, DeviceState next) {
     requireAvailable();
-    if (!Platform.isMacOS) {
+    if (!Platform.isMacOS && !Platform.isLinux) {
       throw const ClientException('device_storage_unavailable');
     }
     return _files.locked(directory, (dir) async {

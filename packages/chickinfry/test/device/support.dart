@@ -69,6 +69,8 @@ Future<int> child(
   String root,
   String origin, {
   String screen = 'signup',
+  String? home,
+  String? xdgStateHome,
 }) async {
   final process = await Process.start(
     Platform.resolvedExecutable,
@@ -94,12 +96,24 @@ Future<int> child(
       ])
         if (Platform.environment[name] != null)
           name: Platform.environment[name]!,
+      if (home != null) 'HOME': home,
+      if (xdgStateHome != null) 'XDG_STATE_HOME': xdgStateHome,
     },
   );
   final output = process.stdout.drain<void>();
-  final errors = process.stderr.drain<void>();
+  final errors = process.stderr
+      .transform(utf8.decoder)
+      .transform(const LineSplitter())
+      .where((line) => RegExp(r'^device storage check=[a-z_]+$').hasMatch(line))
+      .toList();
   await process.stdin.close();
   final result = await process.exitCode;
-  await Future.wait([output, errors]);
+  await output;
+  final labels = await errors;
+  if (result == 39) {
+    throw StateError(
+      'Device child $action failed: ${labels.isEmpty ? 'check=unknown' : labels.first}',
+    );
+  }
   return result;
 }
