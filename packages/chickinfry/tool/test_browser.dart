@@ -4,16 +4,30 @@ import 'dart:io';
 import 'dart:isolate';
 import 'dart:math';
 
+Map<String, String> get _environment => {
+  for (final name in const [
+    'HOME',
+    'PATH',
+    'TMPDIR',
+    'LANG',
+    'LC_ALL',
+    'PUB_CACHE',
+    'CHROME_EXECUTABLE',
+    'CHICKINFRY_DEVICE_TEST_ROOT',
+  ])
+    if (Platform.environment[name] != null) name: Platform.environment[name]!,
+};
+
 Future<void> main(List<String> args) async {
   if (args.isEmpty) throw ArgumentError('Pass an existing scratch directory.');
   final restore = File('${args.first}/browser_restore.js');
-  final compiled = await Process.start(Platform.resolvedExecutable, [
-    'compile',
-    'js',
-    '-o',
-    restore.path,
-    'test/browser_restore.dart',
-  ], mode: ProcessStartMode.inheritStdio);
+  final compiled = await Process.start(
+    Platform.resolvedExecutable,
+    ['compile', 'js', '-o', restore.path, 'test/browser_restore.dart'],
+    mode: ProcessStartMode.inheritStdio,
+    includeParentEnvironment: false,
+    environment: _environment,
+  );
   if (await compiled.exitCode != 0) {
     exitCode = 1;
     return;
@@ -34,17 +48,24 @@ Future<void> main(List<String> args) async {
     final runner = await Isolate.resolvePackageUri(
       Uri.parse('package:test/src/executable.dart'),
     );
-    final process = await Process.start(Platform.resolvedExecutable, [
-      if (Platform.packageConfig != null)
-        '--packages=${Platform.packageConfig}',
-      runner!.toFilePath(),
-      '--platform',
-      'chrome',
-      '--reporter',
-      'expanded',
-      'test/browser_http_test.dart',
-      ...args.skip(1),
-    ], mode: ProcessStartMode.inheritStdio);
+    final process = await Process.start(
+      Platform.resolvedExecutable,
+      [
+        '--packages=${Platform.packageConfig ?? '.dart_tool/package_config.json'}',
+        runner!.toFilePath(),
+        '--platform',
+        'chrome',
+        '--reporter',
+        'expanded',
+        'test/browser_http_test.dart',
+        'test/device/web_test.dart',
+        '--concurrency=1',
+        ...args.skip(1),
+      ],
+      mode: ProcessStartMode.inheritStdio,
+      includeParentEnvironment: false,
+      environment: _environment,
+    );
     exitCode = await process.exitCode;
   } finally {
     peer.releaseAll();
@@ -58,6 +79,8 @@ class _Peer {
   final calls = <String, int>{};
   final loads = <String, int>{};
   final sessions = <String, String>{};
+  final attempts = <String, String>{};
+  int attemptScreens = 0;
   final barriers = <String, Completer<void>>{};
   final arrived = <String>{};
   int destinations = 0;
@@ -65,6 +88,7 @@ class _Peer {
   bool validBoundary = true;
   String? mismatch;
   Object? restored;
+  String? restoreParent;
 
   void releaseAll() {
     for (final barrier in barriers.values) {
@@ -119,10 +143,16 @@ class _Peer {
         await request.response.close();
         return;
       }
-      // HttpServer defaults to SAMEORIGIN; allow only this test runner to embed.
+      if (parent!.origin != 'http://127.0.0.1:18739') {
+        restoreParent = parent.origin;
+      }
+      // Keep the test runner's frame origin across a child document reload.
       request.response.headers
         ..removeAll('x-frame-options')
-        ..set('content-security-policy', 'frame-ancestors ${parent!.origin}')
+        ..set(
+          'content-security-policy',
+          'frame-ancestors ${restoreParent ?? parent.origin}',
+        )
         ..contentType = ContentType.html;
       request.response.write('<script src="/restore.js"></script>');
       await request.response.close();
@@ -163,11 +193,14 @@ class _Peer {
         calls.clear();
         loads.clear();
         sessions.clear();
+        attempts.clear();
+        attemptScreens = 0;
         arrived.clear();
         destinations = 0;
         executions = 0;
         validBoundary = true;
         restored = null;
+        restoreParent = null;
         cookie(request.response, '', remove: true);
       }
       if (input['restored'] case final Map<String, Object?> value) {
@@ -183,6 +216,7 @@ class _Peer {
       }
       await json(request.response, {
         'calls': calls,
+        'attemptScreens': attemptScreens,
         'restored': restored,
         'loads': loads,
         'destinations': destinations,
@@ -215,9 +249,44 @@ class _Peer {
     }
 
     switch (operation) {
+      case 'auth.send_verification_email':
+        if (attempts.containsKey(input['attempt'])) {
+          attemptScreens++;
+          await json(request.response, {
+            'accepted': true,
+            'matches': attempts[input['attempt']] == input['expectedEmail'],
+          });
+        } else {
+          await json(request.response, {'error': 'invalid_code'}, 400);
+        }
+      case 'auth.verify_email':
+      case 'auth.signin_with_code':
+        if (!attempts.containsKey(input['attempt'])) {
+          await json(request.response, {'error': 'invalid_code'}, 400);
+          return;
+        }
+        attempts.remove(input['attempt']);
+        final value = base64Url.encode(
+          List.generate(32, (_) => Random.secure().nextInt(256)),
+        );
+        sessions[value] = 'a';
+        cookie(request.response, value);
+        await json(request.response, publicSession('a'));
       case 'auth.signin':
       case 'auth.signup':
       case 'auth.identity':
+        if (operation == 'auth.signup' && input['pending'] == true) {
+          final bytes = List.generate(16, (_) => Random.secure().nextInt(256));
+          final hex = bytes
+              .map((b) => b.toRadixString(16).padLeft(2, '0'))
+              .join();
+          final id =
+              '${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}';
+          attempts[id] = input['email'] as String;
+          await barrier();
+          await json(request.response, {'accepted': true, 'attempt': id});
+          return;
+        }
         final name = input['account'] as String? ?? 'a';
         if (captured != null) sessions.remove(captured);
         final value = base64Url.encode(

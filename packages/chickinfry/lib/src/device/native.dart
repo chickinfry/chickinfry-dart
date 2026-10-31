@@ -32,7 +32,6 @@ final class NativeDeviceStore extends DeviceStore {
       _files = files ?? PosixFiles();
   final String? _base;
   final PosixFiles _files;
-  DeviceState? _uncertainWrite;
   late final String _slot = _scopePath(scope.owner);
 
   static String _scopePath(List<String> owner) {
@@ -108,13 +107,33 @@ final class NativeDeviceStore extends DeviceStore {
   }
 
   @override
-  Future<DeviceState> load() {
+  Future<DeviceState> load() async {
     requireAvailable();
     if (!Platform.isMacOS && !Platform.isLinux) {
       throw const ClientException('device_storage_unavailable');
     }
-    if (transientState != null) return Future.value(transientState!);
-    return _files.locked(directory, (dir) async => _load(dir), root: _root);
+    try {
+      return await _files.locked(directory, (dir) async {
+        final current = _load(dir);
+        final memory = transientState;
+        if (memory == null) return lastPersistentState = current;
+        var recovered = reconcileRecovery(current, memory);
+        if (transientState == null) {
+          return lastPersistentState = current;
+        }
+        recovered = prepareWrite(recovered);
+        _write(dir, current, recovered);
+        return recovered;
+      }, root: _root);
+    } on ClientException catch (error) {
+      final memory = transientState;
+      if (memory == null ||
+          (error.code != 'device_storage_unavailable' &&
+              error.code != 'device_storage_full')) {
+        rethrow;
+      }
+      return memory;
+    }
   }
 
   @override
@@ -127,14 +146,7 @@ final class NativeDeviceStore extends DeviceStore {
           (dir) async => _load(dir),
           root: _root,
         );
-        final accepted = transientBaseAuthGeneration;
-        if (accepted != null && current.authGeneration > accepted) {
-          transientState = null;
-          transientBaseGeneration = null;
-          transientBaseAuthGeneration = null;
-          _uncertainWrite = null;
-          return null;
-        }
+        if (recoveryReadInvalidated(current)) return null;
       } on ClientException {
         return super.read();
       }
@@ -146,65 +158,40 @@ final class NativeDeviceStore extends DeviceStore {
   Future<bool> commit(DeviceState expected, DeviceState next) {
     requireAvailable();
     final memory = transientState;
-    if (memory != null) {
-      if (memory.generation != expected.generation) return Future.value(false);
-      if (next.authTransitionUnknown) {
-        throw const ClientException('device_storage_unavailable');
-      }
-      next = prepareWrite(next);
-      transientState = next;
-      return Future.value(true);
+    if (memory == null) return _commitPersistent(expected, next);
+    if (memory.generation != expected.generation ||
+        memory.authGeneration != expected.authGeneration ||
+        jsonEncode(memory.toJson()) != jsonEncode(expected.toJson())) {
+      return Future.value(false);
     }
-    return _commitPersistent(expected, next);
+    if (next.generation != expected.generation + 1 ||
+        next.authGeneration < expected.authGeneration) {
+      throw const ClientException('session_changed');
+    }
+    return _files.locked(directory, (dir) async {
+      if (!identical(memory, transientState)) return false;
+      final current = _load(dir);
+      final recovered = reconcileRecovery(current, next);
+      if (transientState == null) {
+        return false;
+      }
+      if (next.authTransitionUnknown &&
+          next.authTransitionId != memory.authTransitionId &&
+          recovered.authTransitionId != next.authTransitionId) {
+        return false;
+      }
+      _write(dir, current, prepareWrite(recovered));
+      return true;
+    }, root: _root);
   }
 
   @override
-  Future<DeviceState?> claimRefresh(SessionCredentials expected) {
+  Future<DeviceState?> claimRefresh(SessionCredentials expected) async {
+    await load();
     if (transientState != null) {
       throw const ClientException('device_storage_unavailable');
     }
     return super.claimRefresh(expected);
-  }
-
-  @override
-  Future<void> clear(DeviceState expected) async {
-    if (transientState == null) return super.clear(expected);
-    if (transientState!.generation != expected.generation) {
-      throw const ClientException('session_changed');
-    }
-    try {
-      final current = await _files.locked(
-        directory,
-        (dir) async => _load(dir),
-        root: _root,
-      );
-      final candidate = _uncertainWrite;
-      if (current.generation != transientBaseGeneration &&
-          (candidate == null ||
-              jsonEncode(current.toJson()) != jsonEncode(candidate.toJson()))) {
-        throw const ClientException('session_changed');
-      }
-      if (!await _commitPersistent(
-        current,
-        DeviceState(
-          generation: current.generation + 1,
-          authGeneration:
-              (current.authGeneration > expected.authGeneration
-                  ? current.authGeneration
-                  : expected.authGeneration) +
-              1,
-        ),
-      )) {
-        throw const ClientException('session_changed');
-      }
-      transientState = null;
-      transientBaseGeneration = null;
-      transientBaseAuthGeneration = null;
-      _uncertainWrite = null;
-    } on ClientException {
-      blocked = true;
-      rethrow;
-    }
   }
 
   Future<bool> _commitPersistent(DeviceState expected, DeviceState next) {
@@ -214,22 +201,43 @@ final class NativeDeviceStore extends DeviceStore {
     }
     return _files.locked(directory, (dir) async {
       final current = _load(dir);
-      if (current.generation != expected.generation) return false;
-      if (next.generation != current.generation + 1) {
+      if (current.generation != expected.generation ||
+          current.authGeneration != expected.authGeneration ||
+          jsonEncode(current.toJson()) != jsonEncode(expected.toJson())) {
+        return false;
+      }
+      if (next.generation != current.generation + 1 ||
+          next.authGeneration < current.authGeneration) {
         throw const ClientException('session_changed');
       }
       next = prepareWrite(next);
-      try {
-        _files.writeAtomic(
-          dir,
-          'auth.json',
-          Uint8List.fromList(utf8.encode(jsonEncode(bundle(next)))),
-        );
-      } on ClientException {
-        _uncertainWrite = next;
-        rethrow;
-      }
+      _write(dir, current, next);
       return true;
     }, root: _root);
+  }
+
+  void _write(int dir, DeviceState current, DeviceState next) {
+    try {
+      _files.writeAtomic(
+        dir,
+        'auth.json',
+        Uint8List.fromList(utf8.encode(jsonEncode(bundle(next)))),
+      );
+      finishRecovery(current);
+      lastPersistentState = next;
+    } on ClientException {
+      uncertainWrite = next;
+      if (consumedAttemptEmails.isNotEmpty) {
+        try {
+          recoveryWasApplied(_load(dir));
+        } on ClientException catch (error) {
+          if (error.code != 'device_storage_unavailable' &&
+              error.code != 'device_storage_full') {
+            rethrow;
+          }
+        }
+      }
+      rethrow;
+    }
   }
 }

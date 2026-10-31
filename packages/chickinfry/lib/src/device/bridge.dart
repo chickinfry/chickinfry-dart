@@ -1,9 +1,15 @@
+import '../browser_session.dart';
 import '../errors.dart';
 import '../http.dart';
 import '../session.dart';
-import 'open_stub.dart' if (dart.library.io) 'native.dart' as platform;
+import 'open_stub.dart'
+    if (dart.library.io) 'native.dart'
+    if (dart.library.js_interop) 'web.dart'
+    as platform;
 import 'persist.dart';
 import 'store.dart';
+
+const _browser = bool.fromEnvironment('dart.library.js_interop');
 
 final _authTransitions = <String, _AuthTransitions>{};
 
@@ -11,6 +17,7 @@ final class _AuthTransitions {
   _AuthTransitions(this.authGeneration);
   final int authGeneration;
   final live = <DeviceState>{};
+  String? markId;
   // A sibling rejection cannot undo an earlier uncertain account change.
   bool unresolved = false;
 }
@@ -41,7 +48,7 @@ DeviceTransport createDeviceTransport({
 final class DeviceTransport implements ClientTransport {
   DeviceTransport(this.store, {Duration timeout = const Duration(seconds: 30)})
     : _connection = HttpTransport(store.origin, timeout: timeout) {
-    _transport = _connection.withSession(store);
+    _transport = _browser ? _connection : _connection.withSession(store);
   }
   final DeviceStore store;
   final HttpTransport _connection;
@@ -51,6 +58,7 @@ final class DeviceTransport implements ClientTransport {
 
   @override
   Future<Object?> invoke(String operation, Map<String, Object?> input) async {
+    store.requireAvailable();
     final auth = const {
       'auth.signup',
       'auth.signin',
@@ -63,7 +71,29 @@ final class DeviceTransport implements ClientTransport {
     if (!auth.contains(operation)) {
       return _transport.invoke(operation, input);
     }
-    var before = await store.load();
+    final explicitAuthentication = const {
+      'auth.signup',
+      'auth.signin',
+      'auth.signin_with_code',
+      'auth.identity',
+    }.contains(operation);
+    DeviceState before;
+    var baseKnown = true;
+    try {
+      before = await store.load();
+    } on ClientException catch (error) {
+      if (!_browser || error.code != 'device_storage_unavailable') rethrow;
+      // Browser credentials remain in cookies when local storage is blocked.
+      before =
+          store.transientState ?? store.lastPersistentState ?? DeviceState();
+      baseKnown = store.lastPersistentState != null;
+    }
+    if (identical(before, store.transientState)) {
+      baseKnown = store.transientBaseAuthGeneration != null;
+    }
+    if (!store.hasObservedPeerAuth(before)) {
+      store.forgetObservedPeerAuth();
+    }
     final started = DateTime.now().millisecondsSinceEpoch;
     final attempts = Map<String, DeviceAttempt>.from(before.attempts)
       ..removeWhere((_, value) => value.expiredAt(started));
@@ -83,7 +113,9 @@ final class DeviceTransport implements ClientTransport {
     if (operation == 'auth.logout') {
       Object? result;
       try {
-        if (before.session != null) {
+        if (_browser) {
+          result = await _connection.invoke(operation, input);
+        } else if (before.session != null) {
           result = await _connection
               .withBearer(before.session!.accessToken)
               .invoke(operation, input);
@@ -113,26 +145,38 @@ final class DeviceTransport implements ClientTransport {
         (before.session != null || before.authTransitionUnknown)) {
       for (var conflicts = 0; ; conflicts++) {
         final active = _authTransitions[coordinationKey];
+        final clearObserved =
+            explicitAuthentication && store.hasObservedPeerAuth(before);
         final unowned =
-            before.authTransitionUnknown &&
-            (active == null ||
-                active.live.isEmpty ||
-                active.authGeneration != before.authGeneration);
+            clearObserved ||
+            (before.authTransitionUnknown &&
+                (active == null ||
+                    active.live.isEmpty ||
+                    active.authGeneration != before.authGeneration ||
+                    active.markId != before.authTransitionId));
         final marked = DeviceState(
           generation: before.generation + 1,
           authGeneration: before.authGeneration + (unowned ? 1 : 0),
           session: unowned ? null : before.session,
           refreshSent: !unowned && before.refreshSent,
+          refreshId: !unowned ? before.refreshId : null,
           authTransitionUnknown: true,
+          authTransitionId: newDeviceRequestId(),
           attempts: before.attempts,
         );
         try {
           if (await store.commit(before, marked)) {
+            if (clearObserved) {
+              store.authInvalidations++;
+              store.finishRecovery(marked);
+              store.forgetObservedPeerAuth();
+            }
             owned =
                 active != null && active.authGeneration == marked.authGeneration
                 ? active
                 : _AuthTransitions(marked.authGeneration);
             _authTransitions[coordinationKey] = owned;
+            owned.markId = marked.authTransitionId;
             owned.live.add(marked);
             store.activeAuthTransitions.add(marked);
             transition = marked;
@@ -149,6 +193,7 @@ final class DeviceTransport implements ClientTransport {
         if (before.session == null && !before.authTransitionUnknown) break;
       }
     }
+    final invalidations = store.authInvalidations;
     var uncertain = true;
     try {
       Object? result;
@@ -170,8 +215,20 @@ final class DeviceTransport implements ClientTransport {
                     ? saved.email
                     : null));
       SessionCredentials? issued;
+      BrowserSession? browserIssued;
       DeviceAttempt? pending;
-      if (result is Map<String, Object?> &&
+      if (_browser &&
+          mayIssueSession &&
+          result is Map<String, Object?> &&
+          result['accepted'] != true) {
+        browserIssued = BrowserSession.fromJson(result);
+        final confirmed = await BrowserAuth(_connection).session();
+        if (browserIssued.id != confirmed.id ||
+            browserIssued.sessionId != confirmed.sessionId) {
+          throw const ClientException('session_changed');
+        }
+      } else if (!_browser &&
+          result is Map<String, Object?> &&
           result.containsKey('access_token')) {
         try {
           issued = SessionCredentials.fromJson(result);
@@ -197,10 +254,12 @@ final class DeviceTransport implements ClientTransport {
       if (rejection == null &&
           mayIssueSession &&
           issued == null &&
+          browserIssued == null &&
           pending == null) {
         throw const ClientException('invalid_response');
       }
-      if (issued == null) uncertain = false;
+      final issuedSession = issued != null || browserIssued != null;
+      if (!issuedSession) uncertain = false;
       var current = before;
       for (
         var conflicts = 0;
@@ -217,13 +276,19 @@ final class DeviceTransport implements ClientTransport {
             referenced == null ||
             current.attempts.values.any((value) => value.id == referenced.id);
         final late =
-            current.authGeneration != before.authGeneration || !stillPresent;
-        final keepMark = transition == null
+            store.authInvalidations != invalidations ||
+            current.authGeneration != before.authGeneration ||
+            !stillPresent;
+        final peerMark =
+            transition != null &&
+            current.authTransitionUnknown &&
+            current.authTransitionId != owned!.markId;
+        final keepMark = transition == null || peerMark
             ? current.authTransitionUnknown
             : owned!.unresolved || owned.live.length > 1;
         DeviceState? next;
         if (late) {
-          if (issued == null || referenced == null || !stillPresent) {
+          if (!issuedSession || referenced == null || !stillPresent) {
             break;
           }
           attempts.removeWhere((_, value) => value.id == referenced.id);
@@ -232,10 +297,12 @@ final class DeviceTransport implements ClientTransport {
             authGeneration: current.authGeneration,
             session: current.session,
             refreshSent: current.refreshSent,
+            refreshId: current.refreshId,
             authTransitionUnknown: current.authTransitionUnknown,
+            authTransitionId: current.authTransitionId,
             attempts: attempts,
           );
-        } else if (issued != null) {
+        } else if (issuedSession) {
           attempts.removeWhere(
             (_, value) =>
                 value.email == email || value.id == request['attempt'],
@@ -244,11 +311,14 @@ final class DeviceTransport implements ClientTransport {
             generation: current.generation + 1,
             authGeneration:
                 current.authGeneration +
-                (current.session?.sessionId != issued.sessionId ||
+                (browserIssued != null ||
+                        current.session?.sessionId != issued!.sessionId ||
                         current.session?.userId != issued.userId
                     ? 1
                     : 0),
             session: issued,
+            authTransitionUnknown: peerMark,
+            authTransitionId: peerMark ? current.authTransitionId : null,
             attempts: attempts,
           );
         } else if (pending != null) {
@@ -258,7 +328,9 @@ final class DeviceTransport implements ClientTransport {
             authGeneration: current.authGeneration,
             session: current.session,
             refreshSent: current.refreshSent,
+            refreshId: current.refreshId,
             authTransitionUnknown: keepMark,
+            authTransitionId: keepMark ? current.authTransitionId : null,
             attempts: attempts,
           );
         } else if (attempts.length != current.attempts.length ||
@@ -268,7 +340,9 @@ final class DeviceTransport implements ClientTransport {
             authGeneration: current.authGeneration,
             session: current.session,
             refreshSent: current.refreshSent,
+            refreshId: current.refreshId,
             authTransitionUnknown: keepMark,
+            authTransitionId: keepMark ? current.authTransitionId : null,
             attempts: attempts,
           );
         }
@@ -280,19 +354,30 @@ final class DeviceTransport implements ClientTransport {
               operationError: rejection,
             );
           }
-          store.transientBaseGeneration ??= current.generation;
-          store.transientBaseAuthGeneration ??= current.authGeneration;
+          if (baseKnown && store.transientState == null) {
+            store.lastPersistentState = current;
+            store.transientBaseAuthGeneration = current.authGeneration;
+          }
           store.transientState = next;
+          if (issuedSession && !late && email != null) {
+            store.recordAttemptConsumption(email, next);
+          }
           break;
         }
         final saved = rejection == null
-            ? await store.commitAfterSuccess(current, next)
+            ? await store.commitAfterSuccess(
+                current,
+                next,
+                baseKnown: baseKnown,
+                consumedEmail: issuedSession && !late ? email : null,
+              )
             : await store.commit(current, next);
         if (saved) {
-          if (issued != null && store.transientState == null) uncertain = false;
+          if (issuedSession && store.transientState == null) uncertain = false;
           break;
         }
         current = await store.load();
+        if (!baseKnown && !identical(current, store.transientState)) break;
       }
       if (rejection != null) throw rejection;
       return result;

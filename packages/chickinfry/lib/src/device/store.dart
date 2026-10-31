@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import '../errors.dart';
 import '../origin.dart';
@@ -15,6 +16,13 @@ final _generationLimit = int.parse('7fffffffffffffff', radix: 16);
 final _uuid = RegExp(
   r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
 );
+final _requestId = RegExp(r'^[0-9a-f]{32}$');
+final _requestRandom = Random.secure();
+
+String newDeviceRequestId() => List.generate(
+  16,
+  (_) => _requestRandom.nextInt(256).toRadixString(16).padLeft(2, '0'),
+).join();
 
 bool _validScreen(String value) =>
     value.isNotEmpty &&
@@ -93,14 +101,18 @@ final class DeviceState {
     this.authGeneration = 0,
     this.session,
     this.refreshSent = false,
+    this.refreshId,
     this.authTransitionUnknown = false,
+    this.authTransitionId,
     Map<String, DeviceAttempt> attempts = const {},
   }) : attempts = Map.unmodifiable(attempts);
   final int generation;
   final int authGeneration;
   final SessionCredentials? session;
   final bool refreshSent;
+  final String? refreshId;
   final bool authTransitionUnknown;
+  final String? authTransitionId;
   final Map<String, DeviceAttempt> attempts;
 
   Map<String, Object?> toJson() => {
@@ -108,7 +120,9 @@ final class DeviceState {
     'auth_generation': authGeneration,
     'session': session?.toJson(),
     'refresh_sent': refreshSent,
+    if (refreshId != null) 'refresh_id': refreshId,
     'auth_transition_unknown': authTransitionUnknown,
+    if (authTransitionId != null) 'auth_transition_id': authTransitionId,
     'attempts': attempts.map((key, value) => MapEntry(key, value.toJson())),
   };
 
@@ -121,6 +135,14 @@ final class DeviceState {
         value['refresh_sent'] is! bool ||
         (value.containsKey('auth_transition_unknown') &&
             value['auth_transition_unknown'] is! bool) ||
+        (value['auth_transition_id'] != null &&
+            (value['auth_transition_id'] is! String ||
+                !_requestId.hasMatch(value['auth_transition_id']! as String) ||
+                value['auth_transition_unknown'] != true)) ||
+        (value['refresh_id'] != null &&
+            (value['refresh_id'] is! String ||
+                !_requestId.hasMatch(value['refresh_id']! as String) ||
+                value['refresh_sent'] != true)) ||
         value['attempts'] is! Map<String, Object?>) {
       throw const ClientException('device_storage_corrupt');
     }
@@ -148,7 +170,9 @@ final class DeviceState {
         authGeneration: value['auth_generation']! as int,
         session: session,
         refreshSent: value['refresh_sent']! as bool,
+        refreshId: value['refresh_id'] as String?,
         authTransitionUnknown: value['auth_transition_unknown'] == true,
+        authTransitionId: value['auth_transition_id'] as String?,
         attempts: attempts,
       );
     } on ClientException {
@@ -157,14 +181,54 @@ final class DeviceState {
   }
 }
 
-// This is the only storage boundary consumed by native authentication.
+final class _AttemptConsumption {
+  _AttemptConsumption(this.result);
+  final DeviceState result;
+  bool settled = false;
+}
+
+// Authentication uses this storage boundary on every supported device.
 abstract class DeviceStore implements SessionStore {
   DeviceStore(this.scope);
   final DeviceScope scope;
   bool blocked = false;
+  int authInvalidations = 0;
   DeviceState? transientState;
-  int? transientBaseGeneration;
+  DeviceState? lastPersistentState;
   int? transientBaseAuthGeneration;
+  DeviceState? _uncertainWrite;
+  bool _uncertainWriteApplied = false;
+  Map<String, _AttemptConsumption> _uncertainConsumption = {};
+  DeviceState? get uncertainWrite => _uncertainWrite;
+  set uncertainWrite(DeviceState? candidate) {
+    _uncertainWrite = candidate;
+    _uncertainWriteApplied = false;
+    _uncertainConsumption = candidate == null ? {} : {...consumedAttemptEmails};
+  }
+
+  final consumedAttemptEmails = <String, _AttemptConsumption>{};
+
+  void recordAttemptConsumption(String email, DeviceState result) {
+    consumedAttemptEmails[email] = _AttemptConsumption(result);
+  }
+
+  final _observedPeerAuthIds = <String?>{};
+  final _observedPeerRefreshIds = <String?>{};
+
+  bool get observedPeerAuth =>
+      _observedPeerAuthIds.isNotEmpty || _observedPeerRefreshIds.isNotEmpty;
+
+  bool hasObservedPeerAuth(DeviceState current) =>
+      (current.authTransitionUnknown &&
+          _observedPeerAuthIds.contains(current.authTransitionId)) ||
+      (current.refreshSent &&
+          _observedPeerRefreshIds.contains(current.refreshId));
+
+  void forgetObservedPeerAuth() {
+    _observedPeerAuthIds.clear();
+    _observedPeerRefreshIds.clear();
+  }
+
   final activeAuthTransitions = <DeviceState>{};
 
   @override
@@ -174,21 +238,280 @@ abstract class DeviceStore implements SessionStore {
 
   Future<bool> commitAfterSuccess(
     DeviceState expected,
-    DeviceState next,
-  ) async {
+    DeviceState next, {
+    bool baseKnown = true,
+    String? consumedEmail,
+  }) async {
+    final memory = transientState;
+    final previousConsumption = consumedAttemptEmails[consumedEmail];
+    final consumption = consumedEmail == null
+        ? null
+        : _AttemptConsumption(next);
+    if (consumedEmail != null) {
+      consumedAttemptEmails[consumedEmail] = consumption!;
+    }
+    var accepted = false;
     try {
       next = DeviceState.fromJson(next.toJson());
-      return await commit(expected, next);
+      // Recovery cannot retroactively establish an unobserved request base.
+      if (!baseKnown && !identical(await load(), transientState)) return false;
+      accepted = await commit(expected, next);
+      return accepted;
     } on ClientException catch (error) {
       if (error.code != 'device_storage_unavailable' &&
           error.code != 'device_storage_full') {
         rethrow;
       }
-      transientBaseGeneration ??= expected.generation;
-      transientBaseAuthGeneration ??= expected.authGeneration;
-      transientState = next;
+      if (transientState == null && baseKnown) {
+        lastPersistentState = expected;
+        transientBaseAuthGeneration = expected.authGeneration;
+      }
+      if (identical(transientState, memory)) transientState = next;
+      accepted = true;
       return true;
+    } finally {
+      if (transientState == null) {
+        consumedAttemptEmails.clear();
+      } else if (!accepted &&
+          consumedEmail != null &&
+          identical(consumedAttemptEmails[consumedEmail], consumption)) {
+        if (previousConsumption != null && !previousConsumption.settled) {
+          consumedAttemptEmails[consumedEmail] = previousConsumption;
+        } else {
+          consumedAttemptEmails.remove(consumedEmail);
+        }
+      }
     }
+  }
+
+  bool _sameAuthentication(DeviceState a, DeviceState b) =>
+      a.authGeneration == b.authGeneration &&
+      a.session == b.session &&
+      a.refreshSent == b.refreshSent &&
+      a.refreshId == b.refreshId &&
+      a.authTransitionUnknown == b.authTransitionUnknown &&
+      a.authTransitionId == b.authTransitionId;
+
+  bool recoveryWasApplied(DeviceState current) {
+    final candidate = uncertainWrite;
+    if (candidate == null ||
+        current.authGeneration != candidate.authGeneration) {
+      return false;
+    }
+    if (!_uncertainWriteApplied) {
+      final base = lastPersistentState;
+      // A new native session identifies our auth write despite peer attempts.
+      final sameAuth =
+          base != null &&
+          candidate.session != null &&
+          candidate.session != base.session &&
+          current.generation >= candidate.generation &&
+          _sameAuthentication(current, candidate);
+      if (!sameAuth &&
+          jsonEncode(current.toJson()) != jsonEncode(candidate.toJson())) {
+        return false;
+      }
+      _uncertainWriteApplied = true;
+      for (final consumption in _uncertainConsumption.values) {
+        consumption.settled = true;
+      }
+    }
+    return true;
+  }
+
+  void _observeRecoveryPeerMarks(DeviceState current) {
+    final memory = transientState;
+    if (memory == null) return;
+    final base = recoveryWasApplied(current)
+        ? uncertainWrite
+        : lastPersistentState;
+    final expectedSession =
+        base != null &&
+        current.session == base.session &&
+        current.refreshSent == base.refreshSent &&
+        current.refreshId == base.refreshId;
+    _observedPeerAuthIds.removeWhere(
+      (id) => !current.authTransitionUnknown || id != current.authTransitionId,
+    );
+    _observedPeerRefreshIds.removeWhere(
+      (id) => !current.refreshSent || id != current.refreshId,
+    );
+    final completingOwnAuth =
+        base != null &&
+        base.authTransitionUnknown &&
+        !memory.authTransitionUnknown &&
+        base.authTransitionId != null &&
+        current.authTransitionId == base.authTransitionId;
+    if (current.authTransitionUnknown &&
+        !completingOwnAuth &&
+        !activeAuthTransitions.any(
+          (active) => active.authTransitionId == current.authTransitionId,
+        )) {
+      _observedPeerAuthIds.add(current.authTransitionId);
+    }
+    if (current.refreshSent &&
+        !(expectedSession && base.refreshSent && !memory.refreshSent)) {
+      _observedPeerRefreshIds.add(current.refreshId);
+    }
+  }
+
+  void finishRecovery(DeviceState current) {
+    _observeRecoveryPeerMarks(current);
+    transientState = null;
+    transientBaseAuthGeneration = null;
+    uncertainWrite = null;
+    consumedAttemptEmails.clear();
+  }
+
+  bool recoveryReadInvalidated(DeviceState current) {
+    final accepted = transientBaseAuthGeneration;
+    if (accepted == null ||
+        current.authGeneration <= accepted ||
+        recoveryWasApplied(current)) {
+      return false;
+    }
+    authInvalidations++;
+    finishRecovery(current);
+    lastPersistentState = current;
+    return true;
+  }
+
+  DeviceState reconcileRecovery(
+    DeviceState current,
+    DeviceState next, {
+    bool retain = true,
+  }) {
+    final memory = transientState!;
+    final applied = recoveryWasApplied(current);
+    final base = applied ? uncertainWrite : lastPersistentState;
+    final accepted = transientBaseAuthGeneration;
+    final expectedSession =
+        base != null &&
+        current.session == base.session &&
+        current.refreshSent == base.refreshSent &&
+        current.refreshId == base.refreshId;
+    if (retain) _observeRecoveryPeerMarks(current);
+    if (base == null ||
+        (!applied &&
+            (accepted == null || current.authGeneration != accepted))) {
+      final accountChanged = memory.authGeneration > (accepted ?? 0);
+      authInvalidations++;
+      finishRecovery(current);
+      lastPersistentState = current;
+      if (accountChanged) {
+        blocked = true;
+        throw const ClientException('session_changed');
+      }
+      return current;
+    }
+    if (retain) {
+      consumedAttemptEmails.removeWhere(
+        (_, consumption) => consumption.settled,
+      );
+    }
+    if (applied && jsonEncode(next.toJson()) == jsonEncode(base.toJson())) {
+      finishRecovery(current);
+      return lastPersistentState = current;
+    }
+
+    // A proven start may be newer than the last successful in-memory result.
+    final currentBoundary = next.authGeneration >= base.authGeneration;
+    final ownRefresh =
+        currentBoundary &&
+        expectedSession &&
+        base.refreshSent &&
+        !next.refreshSent;
+    final startingAuth =
+        next.authTransitionUnknown &&
+        next.authTransitionId != memory.authTransitionId;
+    final explicitStart =
+        hasObservedPeerAuth(current) &&
+        startingAuth &&
+        next.authGeneration > memory.authGeneration;
+    final ownAccount =
+        explicitStart ||
+        (expectedSession && next.authGeneration > base.authGeneration);
+    final clearing =
+        !startingAuth &&
+        ownAccount &&
+        next.authGeneration > memory.authGeneration &&
+        next.session == null &&
+        next.attempts.isEmpty;
+    var unknown = current.authTransitionUnknown;
+    var transitionId = current.authTransitionId;
+    if (explicitStart) {
+      unknown = true;
+      transitionId = next.authTransitionId;
+    } else if (currentBoundary &&
+        expectedSession &&
+        next.authTransitionUnknown != base.authTransitionUnknown) {
+      if ((!current.authTransitionUnknown && next.authTransitionUnknown) ||
+          (base.authTransitionId != null &&
+              current.authTransitionId == base.authTransitionId)) {
+        unknown = next.authTransitionUnknown;
+        transitionId = next.authTransitionId;
+      }
+    }
+
+    final baseIds = {for (final attempt in base.attempts.values) attempt.id};
+    final ownIds = {for (final attempt in next.attempts.values) attempt.id};
+    final peerIds = {for (final attempt in current.attempts.values) attempt.id};
+    final attempts = {...current.attempts};
+    attempts.removeWhere(
+      (_, attempt) =>
+          baseIds.contains(attempt.id) && !ownIds.contains(attempt.id),
+    );
+    for (final entry in next.attempts.entries) {
+      if (baseIds.contains(entry.value.id) &&
+          !peerIds.contains(entry.value.id)) {
+        continue;
+      }
+      final selected = attempts[entry.key];
+      if (selected == null || entry.value.startedAt > selected.startedAt) {
+        attempts[entry.key] = entry.value;
+      }
+    }
+    final completedEmails = {
+      if (expectedSession)
+        for (final entry in consumedAttemptEmails.entries)
+          if (entry.value.result.authGeneration >= base.authGeneration &&
+              entry.value.result.authGeneration <= next.authGeneration)
+            entry.key,
+    };
+    final now = DateTime.now().millisecondsSinceEpoch;
+    attempts.removeWhere(
+      (_, attempt) =>
+          clearing ||
+          completedEmails.contains(attempt.email) ||
+          attempt.expiredAt(now),
+    );
+    final recovered = DeviceState(
+      generation: current.generation + 1,
+      authGeneration: ownAccount ? next.authGeneration : current.authGeneration,
+      session: ownAccount || ownRefresh ? next.session : current.session,
+      refreshSent: clearing || ownRefresh || explicitStart
+          ? false
+          : current.refreshSent,
+      refreshId: clearing || ownRefresh || explicitStart
+          ? null
+          : current.refreshId,
+      authTransitionUnknown: !clearing && unknown,
+      authTransitionId: !clearing && unknown ? transitionId : null,
+      attempts: attempts,
+    );
+    if (recovered.authGeneration < current.authGeneration) {
+      throw const ClientException('session_changed');
+    }
+    if (retain) {
+      // An unsaved start mark is not a successful authentication result.
+      final remembered = startingAuth
+          ? reconcileRecovery(current, memory, retain: false)
+          : recovered;
+      lastPersistentState = current;
+      transientBaseAuthGeneration = current.authGeneration;
+      transientState = remembered;
+    }
+    return recovered;
   }
 
   void requireAvailable() {
@@ -201,7 +524,9 @@ abstract class DeviceStore implements SessionStore {
     final state = await load();
     if (state.authTransitionUnknown &&
         !activeAuthTransitions.any(
-          (active) => active.authGeneration == state.authGeneration,
+          (active) =>
+              active.authGeneration == state.authGeneration &&
+              active.authTransitionId == state.authTransitionId,
         )) {
       return null;
     }
@@ -276,7 +601,9 @@ abstract class DeviceStore implements SessionStore {
       session: expected,
       authGeneration: current.authGeneration,
       refreshSent: true,
+      refreshId: newDeviceRequestId(),
       authTransitionUnknown: current.authTransitionUnknown,
+      authTransitionId: current.authTransitionId,
       attempts: current.attempts,
     );
     return await commit(current, claimed) ? claimed : null;
@@ -294,6 +621,7 @@ abstract class DeviceStore implements SessionStore {
     ) {
       if (current.authGeneration != claimed.authGeneration ||
           current.session != claimed.session ||
+          current.refreshId != claimed.refreshId ||
           !current.refreshSent) {
         return false;
       }
@@ -302,11 +630,12 @@ abstract class DeviceStore implements SessionStore {
         authGeneration: current.authGeneration + (next == null ? 1 : 0),
         session: next,
         authTransitionUnknown: next != null && current.authTransitionUnknown,
+        authTransitionId: next != null ? current.authTransitionId : null,
         attempts: current.attempts,
       );
       if (conflicts == deviceLocalRetryLimit + 1) {
         if (next == null) return false;
-        transientBaseGeneration ??= current.generation;
+        if (transientState == null) lastPersistentState = current;
         transientBaseAuthGeneration ??= current.authGeneration;
         transientState = replacement;
         return true;
@@ -352,7 +681,9 @@ abstract class DeviceStore implements SessionStore {
       authGeneration: next.authGeneration,
       session: next.session,
       refreshSent: next.refreshSent,
+      refreshId: next.refreshId,
       authTransitionUnknown: next.authTransitionUnknown,
+      authTransitionId: next.authTransitionId,
       attempts: attempts,
     );
     if (next.authGeneration < 0 ||
@@ -386,9 +717,7 @@ final class MemoryDeviceStore extends DeviceStore {
     }
     next = prepareWrite(next);
     _state = next;
-    transientState = null;
-    transientBaseGeneration = null;
-    transientBaseAuthGeneration = null;
+    finishRecovery(expected);
     return true;
   }
 }

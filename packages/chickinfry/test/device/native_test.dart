@@ -18,6 +18,345 @@ void main() {
   final unsupportedPosix = Platform.isMacOS || Platform.isLinux
       ? false
       : 'Requires the macOS or Linux POSIX file device.';
+  for (final outcome in ['rejected', 'same-session']) {
+    test(
+      'business read recovery observes peer before explicit signin $outcome',
+      () async {
+        final root = await scratch();
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        final origin = 'http://127.0.0.1:${server.port}';
+        final first = credentials();
+        final second = credentials();
+        final lateSession = credentials();
+        final arrived = Completer<void>();
+        final release = Completer<void>();
+        addTearDown(() {
+          if (!release.isCompleted) release.complete();
+        });
+        var signins = 0;
+        var signups = 0;
+        var business = 0;
+        var cleanups = 0;
+        server.listen((request) async {
+          await request.drain<void>();
+          request.response.headers.contentType = ContentType.json;
+          if (request.uri.path == '/auth.signin') {
+            signins++;
+            if (signins <= 2 || outcome == 'same-session') {
+              request.response.write(
+                jsonEncode((signins == 1 ? first : second).toJson()),
+              );
+            } else {
+              request.response.statusCode = 401;
+              request.response.write(
+                jsonEncode({'error': 'invalid_credentials'}),
+              );
+            }
+          } else if (request.uri.path == '/auth.signup') {
+            signups++;
+            arrived.complete();
+            await release.future;
+            request.response.write(jsonEncode(lateSession.toJson()));
+          } else if (request.uri.path == '/catalog.list') {
+            business++;
+            request.response.statusCode = 401;
+            request.response.write(jsonEncode({'error': 'invalid_token'}));
+          } else {
+            cleanups++;
+            request.response.write(jsonEncode({'accepted': true}));
+          }
+          await request.response.close();
+        });
+        final peerStore = device(root, origin, screen: 'peer8');
+        final peer = DeviceTransport(peerStore);
+        addTearDown(peer.close);
+        await peer.invoke('auth.signin', {'email': 'first@example.test'});
+        final file = File('${peerStore.directory}/auth.json');
+        final fixture =
+            jsonDecode(await file.readAsString()) as Map<String, Object?>;
+        (fixture['auth'] as Map<String, Object?>)['attempts'] = {
+          'old': DeviceAttempt(
+            randomId(),
+            'expired@example.test',
+            DateTime.now()
+                .subtract(const Duration(hours: 25))
+                .millisecondsSinceEpoch,
+          ).toJson(),
+        };
+        await file.writeAsString(jsonEncode(fixture));
+        final store = NativeDeviceStore(
+          scope(origin, screen: 'actor8'),
+          directory: root,
+          files: FailWrite(1),
+        );
+        final actor = DeviceTransport(store);
+        addTearDown(actor.close);
+        await actor.invoke('auth.send_verification_email', {
+          'email': 'first@example.test',
+        });
+        expect(store.transientState?.session == first, isTrue);
+        final anchorGeneration = store.transientBaseAuthGeneration!;
+        await peer.invoke('auth.signin', {'email': 'second@example.test'});
+        final pending = peer.invoke('auth.signup', {
+          'email': 'late@example.test',
+        });
+        await arrived.future;
+        final marked = await peerStore.load();
+        expect(marked.authTransitionUnknown, isTrue);
+        expect(marked.authGeneration > anchorGeneration, isTrue);
+        await expectLater(
+          actor.invoke('catalog.list', {}),
+          throwsA(
+            isA<OperationError>().having(
+              (e) => e.code,
+              'code',
+              'invalid_token',
+            ),
+          ),
+        );
+        expect(store.transientState, isNull);
+        final observed = store.observedPeerAuth;
+        if (outcome == 'rejected') {
+          await expectLater(
+            actor.invoke('auth.signin', {'email': 'own@example.test'}),
+            throwsA(
+              isA<OperationError>().having(
+                (e) => e.code,
+                'code',
+                'invalid_credentials',
+              ),
+            ),
+          );
+        } else {
+          await actor.invoke('auth.signin', {'email': 'second@example.test'});
+          expect(await device(root, origin).read() == second, isTrue);
+        }
+        final afterOwn = await peerStore.load();
+        release.complete();
+        await pending;
+        final after = await device(root, origin).load();
+        final advanced = afterOwn.authGeneration > marked.authGeneration;
+        final lateInstalled = after.session == lateSession;
+        expect(signins, 3);
+        expect(signups, 1);
+        expect(business, 1);
+        expect(cleanups, 1);
+        expect(
+          lateInstalled,
+          isFalse,
+          reason: 'Explicit authentication must invalidate peer requests observed by a business read.',
+        );
+        expect(observed && advanced, isTrue);
+      },
+      skip: unsupportedPosix,
+    );
+  }
+  for (final outcome in ['rejected', 'same-session']) {
+    test(
+      'verified recovery observes peer before explicit signin $outcome',
+      () async {
+        final root = await scratch();
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        final origin = 'http://127.0.0.1:${server.port}';
+        final first = credentials();
+        final peerIssued = credentials();
+        final peerArrived = Completer<void>();
+        final peerRelease = Completer<void>();
+        addTearDown(() {
+          if (!peerRelease.isCompleted) peerRelease.complete();
+        });
+        var signins = 0;
+        var signups = 0;
+        var resend = 0;
+        server.listen((request) async {
+          await request.drain<void>();
+          request.response.headers.contentType = ContentType.json;
+          if (request.uri.path == '/auth.signin') {
+            signins++;
+            if (signins == 1) {
+              request.response.write(jsonEncode(first.toJson()));
+            } else if (outcome == 'same-session') {
+              request.response.write(jsonEncode(first.toJson()));
+            } else {
+              request.response.statusCode = 401;
+              request.response.write(
+                jsonEncode({'error': 'invalid_credentials'}),
+              );
+            }
+          } else if (request.uri.path == '/auth.signup') {
+            signups++;
+            peerArrived.complete();
+            await peerRelease.future;
+            request.response.write(jsonEncode(peerIssued.toJson()));
+          } else {
+            resend++;
+            request.response.write(jsonEncode({'accepted': true}));
+          }
+          await request.response.close();
+        });
+        final store = NativeDeviceStore(
+          scope(origin, screen: 'actor7'),
+          directory: root,
+          files: FailDirectorySyncOnce(),
+        );
+        final actor = DeviceTransport(store);
+        final peerStore = device(root, origin, screen: 'peer7');
+        final peer = DeviceTransport(peerStore);
+        addTearDown(actor.close);
+        addTearDown(peer.close);
+        await actor.invoke('auth.signin', {'email': 'a@example.test'});
+        expect(store.transientState != null, isTrue);
+        expect(store.consumedAttemptEmails.values.single.settled, isTrue);
+        final pending = peer.invoke('auth.signup', {
+          'email': 'peer@example.test',
+        });
+        await peerArrived.future;
+        final marked = await peerStore.load();
+        expect(marked.authTransitionUnknown, isTrue);
+        await actor.invoke('auth.send_verification_email', {
+          'email': 'a@example.test',
+        });
+        final observed = store.observedPeerAuth;
+        expect(store.transientState, isNull);
+        expect(await store.read() == null, isTrue);
+        if (outcome == 'rejected') {
+          await expectLater(
+            actor.invoke('auth.signin', {'email': 'own@example.test'}),
+            throwsA(
+              isA<OperationError>().having(
+                (e) => e.code,
+                'code',
+                'invalid_credentials',
+              ),
+            ),
+          );
+        } else {
+          await actor.invoke('auth.signin', {'email': 'a@example.test'});
+          expect(await device(root, origin).read() == first, isTrue);
+        }
+        final rejected = await peerStore.load();
+        peerRelease.complete();
+        await pending;
+        final after = await device(root, origin).load();
+        final lateInstalled = after.session == peerIssued;
+        final advanced = rejected.authGeneration > marked.authGeneration;
+        final cleared = rejected.session == null;
+
+        expect(signins, 2);
+        expect(signups, 1);
+        expect(resend, 1);
+        expect(
+          lateInstalled,
+          isFalse,
+          reason: 'Explicit authentication must invalidate peer requests observed during recovery.',
+        );
+        expect(
+          observed && advanced && (outcome == 'same-session' || cleared),
+          isTrue,
+        );
+      },
+      skip: unsupportedPosix,
+    );
+  }
+
+  test(
+    'verified signin write preserves peer pending without losing own boundary',
+    () async {
+      final root = await scratch();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final origin = 'http://127.0.0.1:${server.port}';
+      final issued = credentials();
+      final arrived = Completer<void>();
+      final release = Completer<void>();
+      addTearDown(() {
+        if (!release.isCompleted) release.complete();
+      });
+      var signins = 0;
+      var signups = 0;
+      server.listen((request) async {
+        await utf8.decoder.bind(request).join();
+        request.response.headers.contentType = ContentType.json;
+        if (request.uri.path == '/auth.signin') {
+          signins++;
+          request.response.write(jsonEncode(issued.toJson()));
+        } else if (request.uri.path == '/auth.send_verification_email') {
+          request.response.write(jsonEncode({'accepted': true}));
+        } else {
+          signups++;
+          arrived.complete();
+          await release.future;
+          request.response.write(
+            jsonEncode({'accepted': true, 'attempt': randomId()}),
+          );
+        }
+        await request.response.close();
+      });
+      final files = FailDirectorySyncOnce();
+      final store = NativeDeviceStore(
+        scope(origin, screen: 'actor6'),
+        directory: root,
+        files: files,
+      );
+      final actor = DeviceTransport(store);
+      final peerStore = device(root, origin, screen: 'peer6');
+      final peer = DeviceTransport(peerStore);
+      addTearDown(actor.close);
+      addTearDown(peer.close);
+      final before = await store.load();
+      await actor.invoke('auth.signin', {'email': 'a@example.test'});
+      expect(store.transientState != null, isTrue);
+      expect(store.consumedAttemptEmails.values.single.settled, isTrue);
+      final persisted = await peerStore.load();
+      expect(store.recoveryWasApplied(persisted), isTrue);
+      expect(persisted.authGeneration, before.authGeneration + 1);
+      final pending = peer.invoke('auth.signup', {
+        'email': 'peer@example.test',
+      });
+      await arrived.future;
+      final marked = await peerStore.load();
+      expect(marked.authTransitionUnknown, isTrue);
+      expect(marked.authGeneration, persisted.authGeneration);
+      String? code;
+      try {
+        await actor.invoke('auth.send_verification_email', {
+          'email': 'a@example.test',
+        });
+      } on ClientException catch (error) {
+        code = error.code;
+      }
+      final after = await peerStore.load();
+      final retained =
+          after.authTransitionId == marked.authTransitionId &&
+          after.authTransitionUnknown;
+
+      release.complete();
+      await pending;
+      expect(signins, 1);
+      expect(signups, 1);
+      expect(retained, isTrue);
+      String? laterCode;
+      try {
+        await actor.invoke('auth.send_verification_email', {
+          'email': 'a@example.test',
+        });
+      } on ClientException catch (error) {
+        laterCode = error.code;
+      }
+
+      expect(
+        code,
+        isNull,
+        reason: 'Verified own writes must preserve peer marks in the same auth generation.',
+      );
+      expect(laterCode, isNull);
+      expect(store.blocked, isFalse);
+      expect(await store.read() == issued, isTrue);
+    },
+    skip: unsupportedPosix,
+  );
   for (final outcome in [
     'before send',
     'mark write fails',
@@ -77,14 +416,13 @@ void main() {
               true;
         }
 
+        final failureFiles = outcome == 'unsaved success' ? FailWrite(2) : null;
         final store = NativeDeviceStore(
           scope(origin),
           directory: root,
           files: outcome == 'mark write fails'
               ? (operation == 'auth.signin' ? FullFiles() : UnavailableFiles())
-              : outcome == 'unsaved success'
-              ? FailWrite(2)
-              : null,
+              : failureFiles,
         );
         final client = DeviceTransport(store);
         addTearDown(client.close);
@@ -183,6 +521,7 @@ void main() {
             outcome == 'unknown response') {
           expect(await marked(), isTrue);
           if (outcome == 'unsaved success') {
+            failureFiles!.readUnavailable = true;
             expect(await store.read() == issued, isTrue);
             await expectLater(
               client.invoke(operation, {}),
@@ -219,12 +558,19 @@ void main() {
             isTrue,
           );
           expect((await restarted.load()).session == original, isTrue);
+          if (failureFiles != null) {
+            failureFiles.readUnavailable = false;
+            expect(await store.read() == issued, isTrue);
+            expect(await persistent.read() == issued, isTrue);
+            expect(sends, 1);
+          }
           if (outcome == 'unknown response') {
             retrying = true;
+            final retryFiles = FailWrite(2);
             final retryStore = NativeDeviceStore(
               scope(origin),
               directory: root,
-              files: FailWrite(2),
+              files: retryFiles,
             );
             final retryClient = DeviceTransport(retryStore);
             addTearDown(retryClient.close);
@@ -235,6 +581,7 @@ void main() {
                   issued,
               isTrue,
             );
+            retryFiles.readUnavailable = true;
             final fenced = await persistent.load();
             expect(
               fenced.session == null &&
@@ -249,6 +596,10 @@ void main() {
               isTrue,
             );
             expect(await child('unresolved', root, origin), 0);
+            retryFiles.readUnavailable = false;
+            expect(await retryStore.read() == issued, isTrue);
+            expect(await persistent.read() == issued, isTrue);
+            expect(sends, 2);
           }
         } else {
           final state = await device(root, origin).load();
@@ -389,10 +740,12 @@ void main() {
             issued,
         isTrue,
       );
+      files.readUnavailable = true;
       expect(
         (await store.load()).authGeneration == accepted.authGeneration + 1,
         isTrue,
       );
+      files.readUnavailable = false;
       switch (change) {
         case 'signed out':
           await external.clear(await external.load());
@@ -409,7 +762,9 @@ void main() {
               authGeneration: state.authGeneration,
               session: state.session,
               refreshSent: state.refreshSent,
+              refreshId: state.refreshId,
               authTransitionUnknown: state.authTransitionUnknown,
+              authTransitionId: state.authTransitionId,
               attempts: {
                 ...state.attempts,
                 'other': DeviceAttempt(
@@ -479,10 +834,13 @@ void main() {
           (sends == 1 ? firstRequest : secondRequest).complete(request);
         });
         final shared = earlier == 'rejection';
+        final firstFiles = shared ? FailWrite(3) : null;
+        final secondFiles = shared ? firstFiles! : FailWrite(2);
+        var unsaved = false;
         final firstStore = NativeDeviceStore(
           scope(origin),
           directory: root,
-          files: shared ? FailWrite(3) : null,
+          files: firstFiles,
         );
         final first = DeviceTransport(firstStore);
         final secondStore = shared
@@ -490,7 +848,7 @@ void main() {
             : NativeDeviceStore(
                 scope(origin),
                 directory: root,
-                files: FailWrite(2),
+                files: secondFiles,
               );
         final second = DeviceTransport(secondStore);
         addTearDown(first.close);
@@ -525,6 +883,8 @@ void main() {
               )
             : successful.then((value) async {
                 expect(SessionCredentials.fromJson(value) == issued, isTrue);
+                secondFiles.readUnavailable = true;
+                unsaved = true;
                 expect(await secondStore.read() == issued, isTrue);
               });
         final newRequest = await secondRequest.future;
@@ -583,6 +943,12 @@ void main() {
           isTrue,
         );
         expect(await child('unresolved', root, origin), 0);
+        if (unsaved) {
+          secondFiles.readUnavailable = false;
+          expect(await secondStore.read() == issued, isTrue);
+          expect(await persistent.read() == issued, isTrue);
+          expect(sends, 2);
+        }
       },
       skip: unsupportedPosix,
     );
@@ -772,6 +1138,23 @@ void main() {
     };
     await file.writeAsString(jsonEncode(changed));
     await rejects('device_storage_corrupt', store);
+    for (final field in ['auth_transition_id', 'refresh_id']) {
+      for (final orphan in [false, true]) {
+        await file.writeAsString(
+          jsonEncode({
+            ...envelope,
+            'auth': {
+              ...(envelope['auth']! as Map<String, Object?>),
+              'auth_transition_unknown':
+                  !orphan && field == 'auth_transition_id',
+              'refresh_sent': !orphan && field == 'refresh_id',
+              field: orphan ? 'a' * 32 : 'invalid',
+            },
+          }),
+        );
+        await rejects('device_storage_corrupt', store);
+      }
+    }
     await file.writeAsBytes(original);
     expect(await store.read() == value, isTrue);
   }, skip: unsupportedPosix);
@@ -919,6 +1302,1832 @@ void main() {
     },
     skip: unsupportedPosix,
   );
+  group('recovery contract STORE-REJOIN', () {
+    for (final priorAttempt in [false, true]) {
+      test(
+        'unsaved consumption is not settled by peer replacement prior=$priorAttempt',
+        () async {
+          final root = await scratch();
+          final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+          addTearDown(() => server.close(force: true));
+          final origin = 'http://127.0.0.1:${server.port}';
+          final issued = credentials();
+          var signins = 0;
+          var signups = 0;
+          server.listen((request) async {
+            await request.drain<void>();
+            request.response.headers.contentType = ContentType.json;
+            if (request.uri.path == '/auth.signin') {
+              signins++;
+              request.response.write(jsonEncode(issued.toJson()));
+            } else {
+              signups++;
+              request.response.write(
+                jsonEncode({'accepted': true, 'attempt': randomId()}),
+              );
+            }
+            await request.response.close();
+          });
+          final peerStore = device(root, origin, screen: 'peer');
+          final peer = DeviceTransport(peerStore);
+          addTearDown(peer.close);
+          await peerStore.commit(
+            await peerStore.load(),
+            DeviceState(generation: 1),
+          );
+          if (priorAttempt) {
+            await peer.invoke('auth.signup', {'email': 'a@example.test'});
+          }
+          final files = FailWrite(999)..writeUnavailable = true;
+          final actorStore = NativeDeviceStore(
+            scope(origin, screen: 'actor'),
+            directory: root,
+            files: files,
+          );
+          final actor = DeviceTransport(actorStore);
+          addTearDown(actor.close);
+          final base = await actorStore.load();
+          final fixture = File('${peerStore.directory}/auth.json');
+          final rawBefore = await fixture.readAsString();
+          await actor.invoke('auth.signin', {'email': 'a@example.test'});
+          expect(actorStore.transientState?.session == issued, isTrue);
+          expect(
+            actorStore.consumedAttemptEmails.containsKey('a@example.test'),
+            isTrue,
+          );
+          expect(await fixture.readAsString() == rawBefore, isTrue);
+          files.writeUnavailable = false;
+          final result = await peer.invoke('auth.signup', {
+            'email': 'a@example.test',
+          }) as Map;
+          final beforeRecovery = await peerStore.load();
+          expect(beforeRecovery.authGeneration, base.authGeneration);
+          expect(
+            beforeRecovery.attempts['peer']?.id == result['attempt'],
+            isTrue,
+          );
+          expect(
+            beforeRecovery.generation >= actorStore.uncertainWrite!.generation,
+            isTrue,
+          );
+          expect(actorStore.recoveryWasApplied(beforeRecovery), isFalse);
+          await actorStore.load();
+          final after = await peerStore.load();
+          expect(signins, 1);
+          expect(signups, priorAttempt ? 2 : 1);
+          expect(after.authGeneration, base.authGeneration + 1);
+          expect(after.session == issued, isTrue);
+          expect(actorStore.transientState, isNull);
+          expect(
+            after.attempts['peer']?.id == result['attempt'],
+            isFalse,
+            reason:
+                'Unsaved consumption must apply to the first successful write.',
+          );
+        },
+      );
+    }
+    for (final sameSession in [false, true]) {
+      test(
+        'persisted consumption preserves a later peer signup with same session=$sameSession',
+        () async {
+          final root = await scratch();
+          final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+          addTearDown(() => server.close(force: true));
+          final origin = 'http://127.0.0.1:${server.port}';
+          final firstAttempt = randomId();
+          final secondAttempt = randomId();
+          final laterAttempt = randomId();
+          final firstSession = credentials();
+          final secondSession = sameSession ? firstSession : credentials();
+          final secondArrived = Completer<void>();
+          final releaseSecond = Completer<void>();
+          addTearDown(() {
+            if (!releaseSecond.isCompleted) releaseSecond.complete();
+          });
+          var signups = 0;
+          var firstConfirms = 0;
+          var secondConfirms = 0;
+          server.listen((request) async {
+            final input =
+                jsonDecode(await utf8.decoder.bind(request).join()) as Map;
+            request.response.headers.contentType = ContentType.json;
+            if (request.uri.path == '/auth.signup') {
+              signups++;
+              final attempt = signups == 1
+                  ? firstAttempt
+                  : signups == 2
+                  ? secondAttempt
+                  : laterAttempt;
+              request.response.write(
+                jsonEncode({'accepted': true, 'attempt': attempt}),
+              );
+            } else if (input['attempt'] == secondAttempt) {
+              secondConfirms++;
+              secondArrived.complete();
+              await releaseSecond.future;
+              request.response.write(jsonEncode(secondSession.toJson()));
+            } else {
+              firstConfirms++;
+              request.response.write(jsonEncode(firstSession.toJson()));
+            }
+            await request.response.close();
+          });
+          if (sameSession) await device(root, origin).write(firstSession);
+          final seedA = DeviceTransport(device(root, origin, screen: 'a'));
+          final seedB = DeviceTransport(device(root, origin, screen: 'b'));
+          addTearDown(seedA.close);
+          addTearDown(seedB.close);
+          await seedA.invoke('auth.signup', {'email': 'a@example.test'});
+          await seedB.invoke('auth.signup', {'email': 'b@example.test'});
+          final files = FailDirectorySyncOnce(at: sameSession ? 3 : 1);
+          final actorStore = NativeDeviceStore(
+            scope(origin, screen: 'a'),
+            directory: root,
+            files: files,
+          );
+          final actor = DeviceTransport(actorStore);
+          final observer = device(root, origin, screen: 'later');
+          final peer = DeviceTransport(observer);
+          addTearDown(actor.close);
+          addTearDown(peer.close);
+          final second = actor.invoke('auth.verify_email', {
+            'attempt': secondAttempt,
+            'code': '123456',
+          });
+          await secondArrived.future;
+          await actor.invoke('auth.verify_email', {
+            'attempt': firstAttempt,
+            'code': '123456',
+          });
+          final firstPersisted = await observer.load();
+          expect(firstPersisted.session == firstSession, isTrue);
+          expect(firstPersisted.attempts.containsKey('a'), isFalse);
+          expect(actorStore.uncertainWrite != null, isTrue);
+          expect(actorStore.consumedAttemptEmails.keys, ['a@example.test']);
+          files.readUnavailable = true;
+          await peer.invoke('auth.signup', {'email': 'a@example.test'});
+          final afterPeer = await observer.load();
+          expect(afterPeer.attempts['later']?.id == laterAttempt, isTrue);
+          expect(afterPeer.authGeneration, firstPersisted.authGeneration);
+          expect(afterPeer.session == firstSession, isTrue);
+          releaseSecond.complete();
+          await second;
+          expect(actorStore.transientState?.attempts.containsKey('b'), isFalse);
+          expect(actorStore.uncertainWrite?.attempts.containsKey('b'), isTrue);
+          files.readUnavailable = false;
+          await actorStore.load();
+          final recovered = await observer.load();
+          final kept = recovered.attempts['later']?.id == laterAttempt;
+          expect(recovered.session == firstSession, isTrue);
+          expect(recovered.attempts.containsKey('b'), isFalse);
+          expect(signups, 3);
+          expect(firstConfirms, 1);
+          expect(secondConfirms, 1);
+          expect(
+            kept,
+            isTrue,
+            reason: 'Persisted consumption must not consume a later peer signup again.',
+          );
+        },
+      );
+    }
+    test(
+      'uncertain explicit start retains durable authentication boundary',
+      () async {
+        final root = await scratch();
+        final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+        addTearDown(() => server.close(force: true));
+        final origin = 'http://127.0.0.1:${server.port}';
+        final signupArrived = Completer<void>();
+        final signupRelease = Completer<void>();
+        final peerArrived = Completer<void>();
+        final peerRelease = Completer<void>();
+        final ownArrived = Completer<void>();
+        final ownRelease = Completer<void>();
+        addTearDown(() {
+          for (final c in [signupRelease, peerRelease, ownRelease]) {
+            if (!c.isCompleted) c.complete();
+          }
+        });
+        final attempt = randomId();
+        final ownIssued = credentials();
+        final peerIssued = credentials();
+        var signinSends = 0;
+        server.listen((request) async {
+          final body = jsonDecode(
+            await utf8.decoder.bind(request).join(),
+          ) as Map<String, Object?>;
+          request.response.headers.contentType = ContentType.json;
+          if (request.uri.path == '/auth.signup') {
+            signupArrived.complete();
+            await signupRelease.future;
+            request.response.write(
+              jsonEncode({'accepted': true, 'attempt': attempt}),
+            );
+          } else {
+            signinSends++;
+            final peer = body['email'] == 'peer@example.test';
+            (peer ? peerArrived : ownArrived).complete();
+            await (peer ? peerRelease : ownRelease).future;
+            request.response.write(
+              jsonEncode((peer ? peerIssued : ownIssued).toJson()),
+            );
+          }
+          await request.response.close();
+        });
+        final peerStore = device(root, origin);
+        await peerStore.write(credentials());
+        final files = UncertainAuthenticationStart();
+        final actorStore = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: files,
+        );
+        final actor = DeviceTransport(actorStore);
+        final peer = DeviceTransport(peerStore);
+        addTearDown(actor.close);
+        addTearDown(peer.close);
+        final signup = actor.invoke('auth.signup', {
+          'email': 'signup@example.test',
+        });
+        await signupArrived.future;
+        final peerReply = peer
+            .invoke('auth.signin', {'email': 'peer@example.test'})
+            .then<Object?>((v) => v, onError: (Object e) => e);
+        await peerArrived.future;
+        signupRelease.complete();
+        expect((await signup as Map<String, Object?>)['accepted'], isTrue);
+        expect(
+          actorStore.transientState?.attempts['signup']?.id == attempt,
+          isTrue,
+        );
+        files.writeUnavailable = true;
+        await actorStore.load();
+        expect(actorStore.observedPeerAuth, isTrue);
+        expect(
+          actorStore.transientState?.attempts['signup']?.id == attempt,
+          isTrue,
+        );
+        expect((await peerStore.load()).attempts.isEmpty, isTrue);
+        expect(await child('unresolved', root, origin), 0);
+        files.writeUnavailable = false;
+        files.failRecoveryThenCleanup = true;
+        final beforeCleanup = await peerStore.load();
+        await expectLater(
+          actor.invoke('auth.signin', {'email': 'own@example.test'}),
+          throwsA(
+            isA<ClientException>().having(
+              (e) => e.code,
+              'code',
+              'device_storage_unavailable',
+            ),
+          ),
+        );
+        final committedStart = await peerStore.load();
+        expect(committedStart.authGeneration, beforeCleanup.authGeneration + 1);
+        expect(
+          actorStore.uncertainWrite?.authGeneration,
+          committedStart.authGeneration,
+        );
+        expect(actorStore.transientState != null, isTrue);
+        final recovered = await actorStore.load();
+        final afterRecovery = await peerStore.load();
+        peerRelease.complete();
+        await peerReply;
+        final afterLate = await peerStore.load();
+        final peerInstalled = afterLate.session == peerIssued;
+        expect(
+          afterRecovery.authGeneration >= committedStart.authGeneration,
+          isTrue,
+          reason: 'A persisted authentication boundary must never roll back.',
+        );
+        expect(
+          recovered.authGeneration >= committedStart.authGeneration,
+          isTrue,
+        );
+        expect(peerInstalled, isFalse);
+        expect(afterRecovery.session, isNull);
+        expect(afterRecovery.authTransitionUnknown, isTrue);
+        expect(
+          afterRecovery.authTransitionId == committedStart.authTransitionId,
+          isTrue,
+        );
+        expect(recovered.attempts['signup']?.id == attempt, isTrue);
+        expect(actorStore.transientState, isNull);
+        expect(await actorStore.read(), isNull);
+        expect(signinSends, 1);
+      },
+    );
+    for (final sameEmail in [false, true]) {
+      test(
+        sameEmail
+            ? 'authentication consumption clears peer attempt for matching email'
+            : 'expiry cleanup retains peer attempt after unrelated signin',
+        () async {
+          final root = await scratch();
+          final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+          addTearDown(() => server.close(force: true));
+          final origin = 'http://127.0.0.1:${server.port}';
+          final arrived = Completer<void>();
+          final release = Completer<void>();
+          addTearDown(() {
+            if (!release.isCompleted) release.complete();
+          });
+          final issued = credentials();
+          final peerAttempt = randomId();
+          var signins = 0;
+          var signups = 0;
+          server.listen((request) async {
+            await request.drain<void>();
+            request.response.headers.contentType = ContentType.json;
+            if (request.uri.path == '/auth.signin') {
+              signins++;
+              arrived.complete();
+              await release.future;
+              request.response.write(jsonEncode(issued.toJson()));
+            } else {
+              signups++;
+              request.response.write(
+                jsonEncode({'accepted': true, 'attempt': peerAttempt}),
+              );
+            }
+            await request.response.close();
+          });
+          final peerStore = device(root, origin, screen: 'peer');
+          await peerStore.commit(
+            await peerStore.load(),
+            DeviceState(
+              generation: 1,
+              authGeneration: sameEmail ? 1 : 0,
+              session: sameEmail ? issued : null,
+              attempts: {
+                'old': DeviceAttempt(
+                  randomId(),
+                  'pending@example.test',
+                  DateTime.now().millisecondsSinceEpoch,
+                ),
+              },
+            ),
+          );
+          final fixture = File('${peerStore.directory}/auth.json');
+          final bundle =
+              jsonDecode(await fixture.readAsString()) as Map<String, Object?>;
+          final auth = bundle['auth']! as Map<String, Object?>;
+          final attempts = auth['attempts']! as Map<String, Object?>;
+          (attempts['old']! as Map<String, Object?>)['started_at'] =
+              DateTime.now().millisecondsSinceEpoch -
+              const Duration(hours: 25).inMilliseconds;
+          await fixture.writeAsString(jsonEncode(bundle));
+          final files = FailWrite(999);
+          final actorStore = NativeDeviceStore(
+            scope(origin),
+            directory: root,
+            files: files,
+          );
+          final actor = DeviceTransport(actorStore);
+          final peer = DeviceTransport(peerStore);
+          addTearDown(actor.close);
+          addTearDown(peer.close);
+          final signin = actor.invoke('auth.signin', {
+            'email': sameEmail
+                ? 'pending@example.test'
+                : 'signedin@example.test',
+          });
+          await arrived.future;
+          await peer.invoke('auth.signup', {'email': 'pending@example.test'});
+          final afterPeer = await peerStore.load();
+          expect(afterPeer.attempts['peer']?.id == peerAttempt, isTrue);
+          expect(afterPeer.attempts.containsKey('old'), isFalse);
+          files.readUnavailable = true;
+          release.complete();
+          await signin;
+          expect(actorStore.transientState?.session == issued, isTrue);
+          files.readUnavailable = false;
+          final recovered = await actorStore.load();
+          final durable = await device(root, origin).load();
+          if (sameEmail) {
+            expect(recovered.authGeneration, afterPeer.authGeneration);
+          }
+          final peerKept = durable.attempts['peer']?.id == peerAttempt;
+          expect(
+            peerKept,
+            !sameEmail,
+            reason: 'Only authentication for the matching email consumes peer attempts.',
+          );
+          expect(recovered.attempts['peer']?.id == peerAttempt, !sameEmail);
+          expect(signins, 1);
+          expect(signups, 1);
+        },
+      );
+    }
+
+    test('recovery 1 attempt kept after recovery', () async {
+      final root = await scratch();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final origin = 'http://127.0.0.1:${server.port}';
+      final external = device(root, origin);
+      await external.commit(
+        await external.load(),
+        DeviceState(generation: 1, authGeneration: 1),
+      );
+      var signups = 0;
+      server.listen((request) async {
+        await request.drain<void>();
+        signups++;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode({'accepted': true, 'attempt': randomId()}),
+        );
+        await request.response.close();
+      });
+      final files = FailWrite(1)..readUnavailable = true;
+      final store = NativeDeviceStore(
+        scope(origin),
+        directory: root,
+        files: files,
+      );
+      final client = DeviceTransport(store);
+      addTearDown(client.close);
+      await expectLater(
+        client.invoke('auth.signup', {'email': 'recovery@example.test'}),
+        throwsA(
+          isA<ClientException>().having(
+            (error) => error.code,
+            'code',
+            'device_storage_unavailable',
+          ),
+        ),
+      );
+      expect(signups, 0);
+      files.readUnavailable = false;
+      expect(
+        (await client.invoke('auth.signup', {'email': 'recovery@example.test'})
+            as Map)['accepted'],
+        isTrue,
+      );
+      expect((await external.load()).attempts.isEmpty, isTrue);
+      files.readUnavailable = true;
+      expect((await store.load()).attempts.length, 1);
+      expect((await store.load()).authGeneration, 1);
+      expect((await external.load()).attempts.isEmpty, isTrue);
+      expect(signups, 1);
+      files.readUnavailable = false;
+      expect((await store.load()).attempts.length, 1);
+      expect((await external.load()).attempts.length, 1);
+      expect(signups, 1);
+      expect(store.transientState, isNull);
+    });
+
+    test('recovery 3 generation collision cannot resurrect', () async {
+      final root = await scratch();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final origin = 'http://127.0.0.1:${server.port}';
+      final observer = device(root, origin);
+      await observer.commit(
+        await observer.load(),
+        DeviceState(generation: 1, authGeneration: 1),
+      );
+      final arrived = Completer<void>();
+      final release = Completer<void>();
+      addTearDown(() {
+        if (!release.isCompleted) release.complete();
+      });
+      var signups = 0;
+      server.listen((request) async {
+        await request.drain<void>();
+        if (++signups == 2) {
+          arrived.complete();
+          await release.future;
+        }
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode({'accepted': true, 'attempt': randomId()}),
+        );
+        await request.response.close();
+      });
+      final files = FailWrite(1);
+      final store = NativeDeviceStore(
+        scope(origin),
+        directory: root,
+        files: files,
+      );
+      final client = DeviceTransport(store);
+      addTearDown(client.close);
+      await client.invoke('auth.signup', {'email': 'first@example.test'});
+      files.readUnavailable = true;
+      expect((await store.load()).generation, 2);
+      final pending = client.invoke('auth.signup', {
+        'email': 'late@example.test',
+      });
+      await arrived.future;
+      files.readUnavailable = false;
+      await client.invoke('auth.logout', {});
+      expect((await observer.load()).authGeneration, 2);
+      expect((await observer.load()).attempts.isEmpty, isTrue);
+      release.complete();
+      expect((await pending as Map)['accepted'], isTrue);
+      final restored = await observer.load();
+      expect([restored.attempts.length, restored.authGeneration], [0, 2]);
+      expect(signups, 2);
+    });
+
+    test('recovery 2b other object logout drops memory', () async {
+      final root = await scratch();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final origin = 'http://127.0.0.1:${server.port}';
+      server.listen((request) async {
+        await request.drain<void>();
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode({'accepted': true, 'attempt': randomId()}),
+        );
+        await request.response.close();
+      });
+      final peer = device(root, origin);
+      await peer.commit(
+        await peer.load(),
+        DeviceState(generation: 1, authGeneration: 1),
+      );
+      final files = FailWrite(1);
+      final store = NativeDeviceStore(
+        scope(origin),
+        directory: root,
+        files: files,
+      );
+      final actor = DeviceTransport(store);
+      final other = DeviceTransport(peer);
+      addTearDown(actor.close);
+      addTearDown(other.close);
+      expect(
+        (await actor.invoke('auth.signup', {'email': 'actor@example.test'})
+            as Map)['accepted'],
+        isTrue,
+      );
+      files.readUnavailable = true;
+      expect((await store.load()).attempts.length, 1);
+      await other.invoke('auth.logout', {});
+      final durable = await peer.load();
+      expect(durable.authGeneration, 2);
+      files.readUnavailable = false;
+      expect((await store.load()).attempts.isEmpty, isTrue);
+      expect(store.transientState, isNull);
+      expect(await store.read() == null, isTrue);
+      expect((await peer.load()).toJson(), durable.toJson());
+    });
+
+    test('recovery 4 account change after recovery is persisted', () async {
+      final root = await scratch();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final origin = 'http://127.0.0.1:${server.port}';
+      final issued = credentials();
+      final arrived = Completer<void>();
+      final release = Completer<void>();
+      addTearDown(() {
+        if (!release.isCompleted) release.complete();
+      });
+      var signups = 0;
+      server.listen((request) async {
+        await request.drain<void>();
+        request.response.headers.contentType = ContentType.json;
+        if (request.uri.path == '/auth.signin') {
+          request.response.write(jsonEncode(issued.toJson()));
+        } else {
+          if (++signups == 2) {
+            arrived.complete();
+            await release.future;
+          }
+          request.response.write(
+            jsonEncode({'accepted': true, 'attempt': randomId()}),
+          );
+        }
+        await request.response.close();
+      });
+      final peer = device(root, origin);
+      await peer.commit(
+        await peer.load(),
+        DeviceState(generation: 1, authGeneration: 1),
+      );
+      final files = FailWrite(1);
+      final store = NativeDeviceStore(
+        scope(origin),
+        directory: root,
+        files: files,
+      );
+      final actor = DeviceTransport(store);
+      final pendingClient = DeviceTransport(
+        device(root, origin, screen: 'pending'),
+      );
+      addTearDown(actor.close);
+      addTearDown(pendingClient.close);
+      await actor.invoke('auth.signup', {'email': 'actor@example.test'});
+      files.readUnavailable = true;
+      expect((await store.load()).attempts.length, 1);
+      final pending = pendingClient.invoke('auth.signup', {
+        'email': 'pending@example.test',
+      });
+      await arrived.future;
+      files.readUnavailable = false;
+      await store.load();
+      expect(store.transientState, isNull);
+      await actor.invoke('auth.signin', {'email': 'account@example.test'});
+      final durable = await device(root, origin).load();
+      expect(durable.authGeneration, 2);
+      expect(durable.session == issued, isTrue);
+      release.complete();
+      final result = await pending as Map;
+      expect(result['accepted'], isTrue);
+      final restored = await device(root, origin).load();
+      expect(restored.session == issued, isTrue);
+      expect(restored.authGeneration, durable.authGeneration);
+      expect(
+        restored.attempts.values.any((a) => a.id == result['attempt']),
+        isFalse,
+      );
+      expect(signups, 2);
+    });
+
+    test(
+      'recovery 5 peer refresh and unknown marks are not overwritten',
+      () async {
+        final observations = <String, List<bool>>{};
+        for (final outcome in [
+          'refresh pending',
+          'refresh complete',
+          'account unknown',
+        ]) {
+          final root = await scratch();
+          final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+          addTearDown(() => server.close(force: true));
+          final origin = 'http://127.0.0.1:${server.port}';
+          final original = credentials();
+          final rotated = credentials(
+            user: original.userId,
+            session: original.sessionId,
+          );
+          final peer = device(root, origin);
+          await peer.write(original);
+          final file = File('${peer.directory}/auth.json');
+          final fixture =
+              jsonDecode(await file.readAsString()) as Map<String, Object?>;
+          (fixture['auth'] as Map<String, Object?>)['attempts'] = {
+            'old-screen': DeviceAttempt(
+              randomId(),
+              'expired@example.test',
+              DateTime.now()
+                  .subtract(const Duration(hours: 25))
+                  .millisecondsSinceEpoch,
+            ).toJson(),
+          };
+          await file.writeAsString(jsonEncode(fixture));
+          final arrived = Completer<void>();
+          final release = Completer<void>();
+          addTearDown(() {
+            if (!release.isCompleted) release.complete();
+          });
+          var cleanups = 0;
+          var refreshes = 0;
+          server.listen((request) async {
+            await request.drain<void>();
+            if (request.uri.path == '/auth.signin') {
+              final socket = await request.response.detachSocket(
+                writeHeaders: false,
+              );
+              socket.destroy();
+              return;
+            }
+            request.response.headers.contentType = ContentType.json;
+            if (request.uri.path == '/auth.send_verification_email') {
+              cleanups++;
+              request.response.write('{"accepted":true}');
+            } else {
+              refreshes++;
+              if (outcome == 'refresh pending') {
+                arrived.complete();
+                await release.future;
+              }
+              request.response.write(jsonEncode(rotated.toJson()));
+            }
+            await request.response.close();
+          });
+          final actor = NativeDeviceStore(
+            scope(origin),
+            directory: root,
+            files: FailWrite(1),
+          );
+          final client = DeviceTransport(actor);
+          final peerClient = DeviceTransport(peer);
+          addTearDown(client.close);
+          addTearDown(peerClient.close);
+          await client.invoke('auth.send_verification_email', {
+            'email': 'cleanup@example.test',
+          });
+          expect(cleanups, 1);
+          expect(actor.transientState != null, isTrue);
+          expect(actor.transientState!.session == original, isTrue);
+          expect(actor.transientState!.attempts.isEmpty, isTrue);
+          Future<Object?>? inFlight;
+          if (outcome == 'account unknown') {
+            await expectLater(
+              peerClient.invoke('auth.signin', {'email': 'new@example.test'}),
+              throwsA(
+                isA<ClientException>().having(
+                  (e) => e.code,
+                  'code',
+                  'network_error',
+                ),
+              ),
+            );
+            expect((await peer.load()).authTransitionUnknown, isTrue);
+          } else {
+            inFlight = peerClient
+                .invoke('auth.refresh', {
+                  'refresh_token': original.refreshToken,
+                })
+                .then<Object?>(
+                  (value) => value,
+                  onError: (Object error) => error,
+                );
+            if (outcome == 'refresh pending') {
+              await arrived.future;
+              expect((await peer.load()).refreshSent, isTrue);
+            } else {
+              final result = await inFlight;
+              expect(result is Map<String, Object?>, isTrue);
+              expect((await peer.load()).session == rotated, isTrue);
+            }
+          }
+          final before = await device(root, origin).load();
+          await actor.load();
+          final after = await device(root, origin).load();
+          if (outcome == 'refresh pending') {
+            release.complete();
+            await inFlight;
+            final canClaimAgain =
+                await device(root, origin).claimRefresh(original) != null;
+            observations[outcome] = [after.refreshSent, canClaimAgain];
+          } else if (outcome == 'refresh complete') {
+            observations[outcome] = [
+              after.session == rotated,
+              after.session == original,
+            ];
+          } else {
+            final readable = await device(root, origin).read() != null;
+            observations[outcome] = [after.authTransitionUnknown, readable];
+          }
+          expect(after.authGeneration, before.authGeneration);
+          expect(refreshes, outcome == 'account unknown' ? 0 : 1);
+        }
+        expect(observations, {
+          'refresh pending': [true, false],
+          'refresh complete': [true, false],
+          'account unknown': [true, false],
+        });
+      },
+    );
+
+    test(
+      'recovery 6 unchanged auth preserves peer attempt additions and removals',
+      () async {
+        for (final removed in [false, true]) {
+          final root = await scratch();
+          const origin = 'https://rejoin.example.test';
+          final peer = device(root, origin);
+          final now = DateTime.now().millisecondsSinceEpoch;
+          final old = DeviceAttempt(randomId(), 'old@example.test', now);
+          final mine = DeviceAttempt(randomId(), 'mine@example.test', now);
+          final theirs = DeviceAttempt(randomId(), 'peer@example.test', now);
+          await peer.commit(
+            await peer.load(),
+            DeviceState(generation: 1, attempts: {'old': old}),
+          );
+          final actor = NativeDeviceStore(
+            scope(origin),
+            directory: root,
+            files: FailWrite(1),
+          );
+          final base = await actor.load();
+          await actor.commitAfterSuccess(
+            base,
+            DeviceState(generation: 2, attempts: {'old': old, 'mine': mine}),
+          );
+          await peer.commit(
+            await peer.load(),
+            DeviceState(
+              generation: 2,
+              attempts: {if (!removed) 'old': old, 'peer': theirs},
+            ),
+          );
+          expect((await peer.load()).authGeneration, base.authGeneration);
+          final recovered = await actor.load();
+          expect(
+            recovered.attempts.keys,
+            unorderedEquals([if (!removed) 'old', 'mine', 'peer']),
+          );
+          expect(
+            (await device(root, origin).load()).attempts.keys,
+            unorderedEquals(recovered.attempts.keys),
+          );
+          expect(actor.transientState, isNull);
+        }
+      },
+    );
+
+    test(
+      'recovery 7 changed auth does not resurrect consumed attempts',
+      () async {
+        final root = await scratch();
+        const origin = 'https://rejoin.example.test';
+        final peer = device(root, origin);
+        final original = credentials();
+        final rotated = credentials(
+          user: original.userId,
+          session: original.sessionId,
+        );
+        final now = DateTime.now().millisecondsSinceEpoch;
+        final consumed = DeviceAttempt(
+          randomId(),
+          'consumed@example.test',
+          now,
+        );
+        final mine = DeviceAttempt(randomId(), 'mine@example.test', now);
+        final theirs = DeviceAttempt(randomId(), 'peer@example.test', now);
+        await peer.commit(
+          await peer.load(),
+          DeviceState(
+            generation: 1,
+            authGeneration: 1,
+            session: original,
+            attempts: {'consumed': consumed},
+          ),
+        );
+        final actor = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: FailWrite(1),
+        );
+        final base = await actor.load();
+        // The successful local cleanup consumed this id before storage failed.
+        await actor.commitAfterSuccess(
+          base,
+          DeviceState(
+            generation: 2,
+            authGeneration: 1,
+            session: original,
+            attempts: {'mine': mine},
+          ),
+        );
+        await peer.commit(
+          await peer.load(),
+          DeviceState(
+            generation: 2,
+            authGeneration: 1,
+            session: rotated,
+            attempts: {'consumed': consumed, 'peer': theirs},
+          ),
+        );
+        final recovered = await actor.load();
+        expect(recovered.session == rotated, isTrue);
+        expect(recovered.attempts.keys, unorderedEquals(['mine', 'peer']));
+        expect(
+          (await peer.load()).attempts.keys,
+          unorderedEquals(['mine', 'peer']),
+        );
+        expect(actor.transientState, isNull);
+      },
+    );
+
+    test('own refresh preserves peer cleanup and pending', () async {
+      for (final pending in [false, true]) {
+        final root = await scratch();
+        const origin = 'https://rejoin.example.test';
+        final peer = device(root, origin);
+        final original = credentials();
+        final rotated = credentials(
+          user: original.userId,
+          session: original.sessionId,
+        );
+        final now = DateTime.now().millisecondsSinceEpoch;
+        final old = DeviceAttempt(randomId(), 'old@example.test', now);
+        final theirs = DeviceAttempt(randomId(), 'peer@example.test', now);
+        await peer.commit(
+          await peer.load(),
+          DeviceState(
+            generation: 1,
+            authGeneration: 1,
+            session: original,
+            attempts: {'old': old},
+          ),
+        );
+        final files = FailWrite(2);
+        final actor = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: files,
+        );
+        final claim = await actor.claimRefresh(original);
+        expect(claim != null, isTrue);
+        await actor.finishRefresh(claim!, rotated);
+        expect(actor.transientState?.session == rotated, isTrue);
+        final current = await peer.load();
+        await peer.commit(
+          current,
+          DeviceState(
+            generation: current.generation + 1,
+            authGeneration: 1,
+            session: original,
+            refreshSent: true,
+            authTransitionUnknown: pending,
+            refreshId: current.refreshId,
+            authTransitionId: pending ? randomId().replaceAll('-', '') : null,
+            attempts: {'peer': theirs},
+          ),
+        );
+        if (pending) {
+          files.writeUnavailable = true;
+          expect(await actor.read() == null, isTrue);
+          expect((await peer.load()).refreshSent, isTrue);
+          files.writeUnavailable = false;
+        }
+        final recovered = await actor.load();
+        expect(recovered.session == rotated, isTrue);
+        expect(recovered.refreshSent, isFalse);
+        expect(recovered.authTransitionUnknown, pending);
+        expect(recovered.attempts.keys, ['peer']);
+        expect(await peer.read() == (pending ? null : rotated), isTrue);
+        expect(await actor.read() == (pending ? null : rotated), isTrue);
+        expect(actor.transientState, isNull);
+        if (pending) {
+          final marked = await peer.load();
+          await peer.commit(
+            marked,
+            DeviceState.fromJson({
+              ...marked.toJson(),
+              'generation': marked.generation + 1,
+              'auth_transition_unknown': false,
+              'auth_transition_id': null,
+            }),
+          );
+          expect(await actor.read() == rotated, isTrue);
+        }
+      }
+    });
+
+    test('own refresh yields to a peer auth boundary or rotation', () async {
+      for (final boundary in [false, true]) {
+        final root = await scratch();
+        const origin = 'https://rejoin.example.test';
+        final peer = device(root, origin);
+        final original = credentials();
+        final rotated = credentials(
+          user: original.userId,
+          session: original.sessionId,
+        );
+        final latest = boundary
+            ? credentials()
+            : credentials(user: original.userId, session: original.sessionId);
+        await peer.write(original);
+        final actor = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: FailWrite(2),
+        );
+        await actor.finishRefresh(
+          (await actor.claimRefresh(original))!,
+          rotated,
+        );
+        final current = await peer.load();
+        await peer.commit(
+          current,
+          DeviceState(
+            generation: current.generation + 1,
+            authGeneration: current.authGeneration + (boundary ? 1 : 0),
+            session: latest,
+          ),
+        );
+        expect(await actor.read() == (boundary ? null : latest), isTrue);
+        expect(await peer.read() == latest, isTrue);
+        expect(actor.transientState, isNull);
+      }
+    });
+
+    test('STORE-REJOIN uncertain commit then refresh with new session during read outage', () async {
+      final root = await scratch();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final origin = 'http://127.0.0.1:${server.port}';
+      final attempt = randomId();
+      final issued = credentials();
+      var signups = 0;
+      var signins = 0;
+      server.listen((request) async {
+        await request.drain<void>();
+        request.response.headers.contentType = ContentType.json;
+        if (request.uri.path == '/auth.signup') {
+          signups++;
+          request.response.write(
+            jsonEncode({'accepted': true, 'attempt': attempt}),
+          );
+        } else {
+          signins++;
+          request.response.write(jsonEncode(issued.toJson()));
+        }
+        await request.response.close();
+      });
+      final peer = device(root, origin);
+      await peer.commit(
+        await peer.load(),
+        DeviceState(generation: 1, authGeneration: 3),
+      );
+      final files = FailDirectorySyncOnce();
+      final actor = NativeDeviceStore(
+        scope(origin),
+        directory: root,
+        files: files,
+      );
+      final client = DeviceTransport(actor);
+      addTearDown(client.close);
+      await client.invoke('auth.signup', {'email': 'signup@example.test'});
+      expect(actor.uncertainWrite?.authGeneration, 3);
+      expect((await peer.load()).attempts['signup']?.id == attempt, isTrue);
+      files.readUnavailable = true;
+      await client.invoke('auth.signin', {'email': 'own@example.test'});
+      expect(actor.uncertainWrite?.authGeneration, 3);
+      expect(actor.transientState?.authGeneration, 4);
+      expect(actor.transientState?.session == issued, isTrue);
+      files.readUnavailable = false;
+      expect(await actor.read() == issued, isTrue);
+      final recovered = await peer.load();
+      expect(recovered.session == issued, isTrue);
+      expect(recovered.authGeneration, 4);
+      expect(recovered.attempts['signup']?.id == attempt, isTrue);
+      expect(actor.transientState, isNull);
+      expect(signups, 1);
+      expect(signins, 1);
+    });
+
+    test('uncertain commit already applied keeps peer cleanup', () async {
+      final root = await scratch();
+      const origin = 'https://rejoin.example.test';
+      final actor = NativeDeviceStore(
+        scope(origin),
+        directory: root,
+        files: FailDirectorySyncOnce(),
+      );
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final old = DeviceAttempt(randomId(), 'old@example.test', now);
+      final theirs = DeviceAttempt(randomId(), 'peer@example.test', now);
+      final issued = credentials();
+      await actor.commitAfterSuccess(
+        await actor.load(),
+        DeviceState(
+          generation: 1,
+          authGeneration: 1,
+          session: issued,
+          attempts: {'old': old},
+        ),
+      );
+      final peer = device(root, origin);
+      final applied = await peer.load();
+      expect(applied.session == issued, isTrue);
+      await peer.commit(
+        applied,
+        DeviceState(
+          generation: applied.generation + 1,
+          authGeneration: 1,
+          session: issued,
+          attempts: {'peer': theirs},
+        ),
+      );
+      expect(await actor.read() == issued, isTrue);
+      final recovered = await actor.load();
+      expect(recovered.attempts.keys, ['peer']);
+      expect(recovered.session == issued, isTrue);
+      expect(actor.transientState, isNull);
+    });
+
+    test(
+      'a changed revision cannot prove ownership of a boolean pending mark',
+      () async {
+        final root = await scratch();
+        const origin = 'https://rejoin.example.test';
+        final peer = device(root, origin);
+        final original = credentials();
+        await peer.commit(
+          await peer.load(),
+          DeviceState(
+            generation: 1,
+            authGeneration: 1,
+            session: original,
+            authTransitionUnknown: true,
+          ),
+        );
+        final actor = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: FailWrite(1),
+        );
+        await actor.commitAfterSuccess(
+          await actor.load(),
+          DeviceState(generation: 2, authGeneration: 1, session: original),
+        );
+        await peer.commit(
+          await peer.load(),
+          DeviceState(
+            generation: 2,
+            authGeneration: 1,
+            session: original,
+            authTransitionUnknown: true,
+            attempts: {
+              'peer': DeviceAttempt(
+                randomId(),
+                'peer@example.test',
+                DateTime.now().millisecondsSinceEpoch,
+              ),
+            },
+          ),
+        );
+        final recovered = await actor.load();
+        expect(recovered.authTransitionUnknown, isTrue);
+        expect(await actor.read() == null, isTrue);
+        expect((await peer.load()).attempts.keys, ['peer']);
+      },
+    );
+
+    test('identified auth marks release only their owner', () async {
+      for (final peerReplaced in [false, true]) {
+        final root = await scratch();
+        const origin = 'https://rejoin.example.test';
+        final peer = device(root, origin);
+        final original = credentials();
+        final ownId = randomId().replaceAll('-', '');
+        final peerId = peerReplaced ? randomId().replaceAll('-', '') : ownId;
+        await peer.commit(
+          await peer.load(),
+          DeviceState.fromJson({
+            ...DeviceState(
+              generation: 1,
+              authGeneration: 1,
+              session: original,
+              authTransitionUnknown: true,
+            ).toJson(),
+            'auth_transition_id': ownId,
+          }),
+        );
+        final actor = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: FailWrite(1),
+        );
+        await actor.commitAfterSuccess(
+          await actor.load(),
+          DeviceState(generation: 2, authGeneration: 1, session: original),
+        );
+        await peer.commit(
+          await peer.load(),
+          DeviceState.fromJson({
+            ...DeviceState(
+              generation: 2,
+              authGeneration: 1,
+              session: original,
+              authTransitionUnknown: true,
+              attempts: {
+                'peer': DeviceAttempt(
+                  randomId(),
+                  'peer@example.test',
+                  DateTime.now().millisecondsSinceEpoch,
+                ),
+              },
+            ).toJson(),
+            'auth_transition_id': peerId,
+          }),
+        );
+        final recovered = await actor.load();
+        expect(recovered.authTransitionUnknown, peerReplaced);
+        expect(
+          recovered.toJson()['auth_transition_id'] ==
+              (peerReplaced ? peerId : null),
+          isTrue,
+        );
+        expect(await actor.read() == (peerReplaced ? null : original), isTrue);
+        expect((await peer.load()).attempts.keys, ['peer']);
+      }
+    });
+
+    test('refresh identifiers preserve a replaced peer claim', () async {
+      for (final marker in ['own', 'peer', 'legacy']) {
+        final root = await scratch();
+        const origin = 'https://rejoin.example.test';
+        final peer = device(root, origin);
+        final original = credentials();
+        final rotated = credentials(
+          user: original.userId,
+          session: original.sessionId,
+        );
+        final ownId = marker == 'legacy'
+            ? null
+            : randomId().replaceAll('-', '');
+        final peerId = marker == 'peer'
+            ? randomId().replaceAll('-', '')
+            : ownId;
+        await peer.commit(
+          await peer.load(),
+          DeviceState.fromJson({
+            ...DeviceState(
+              generation: 1,
+              authGeneration: 1,
+              session: original,
+              refreshSent: true,
+            ).toJson(),
+            'refresh_id': ownId,
+          }),
+        );
+        final actor = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: FailWrite(1),
+        );
+        await actor.commitAfterSuccess(
+          await actor.load(),
+          DeviceState(generation: 2, authGeneration: 1, session: rotated),
+        );
+        await peer.commit(
+          await peer.load(),
+          DeviceState.fromJson({
+            ...DeviceState(
+              generation: 2,
+              authGeneration: 1,
+              session: original,
+              refreshSent: true,
+            ).toJson(),
+            'refresh_id': peerId,
+          }),
+        );
+        final recovered = await actor.load();
+        expect(recovered.refreshSent, marker == 'peer');
+        expect(
+          recovered.session == (marker == 'peer' ? original : rotated),
+          isTrue,
+        );
+        expect(
+          recovered.toJson()['refresh_id'] ==
+              (marker == 'peer' ? peerId : null),
+          isTrue,
+        );
+        if (marker == 'peer') {
+          await expectLater(
+            actor.read(),
+            throwsA(
+              isA<ClientException>().having(
+                (e) => e.code,
+                'code',
+                'session_changed',
+              ),
+            ),
+          );
+        } else {
+          expect(await actor.read() == rotated, isTrue);
+        }
+        expect((await peer.load()).refreshSent, marker == 'peer');
+      }
+    });
+
+    test('logout failure remains blocked after storage recovers', () async {
+      final root = await scratch();
+      const origin = 'https://rejoin.example.test';
+      final peer = device(root, origin);
+      await peer.write(credentials());
+      final actor = NativeDeviceStore(
+        scope(origin),
+        directory: root,
+        files: FailWrite(1),
+      );
+      await expectLater(
+        actor.clear(await actor.load()),
+        throwsA(isA<ClientException>()),
+      );
+      final before = await peer.load();
+      await peer.commit(
+        before,
+        DeviceState.fromJson({
+          ...before.toJson(),
+          'generation': before.generation + 1,
+          'attempts': {
+            'peer': DeviceAttempt(
+              randomId(),
+              'peer@example.test',
+              DateTime.now().millisecondsSinceEpoch,
+            ).toJson(),
+          },
+        }),
+      );
+      await expectLater(
+        actor.read(),
+        throwsA(
+          isA<ClientException>().having(
+            (e) => e.code,
+            'code',
+            'device_storage_unavailable',
+          ),
+        ),
+      );
+      expect((await peer.load()).attempts.keys, ['peer']);
+    });
+
+    test(
+      'failed auth start keeps the previous successful memory usable',
+      () async {
+        final root = await scratch();
+        const origin = 'https://rejoin.example.test';
+        final peer = device(root, origin);
+        final original = credentials();
+        await peer.write(original);
+        final files = FailWrite(1);
+        final actor = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: files,
+        );
+        final base = await actor.load();
+        await actor.commitAfterSuccess(
+          base,
+          DeviceState.fromJson({
+            ...base.toJson(),
+            'generation': base.generation + 1,
+          }),
+        );
+        files.writeUnavailable = true;
+        final memory = actor.transientState!;
+        await expectLater(
+          actor.commit(
+            memory,
+            DeviceState.fromJson({
+              ...memory.toJson(),
+              'generation': memory.generation + 1,
+              'auth_transition_unknown': true,
+              'auth_transition_id': randomId().replaceAll('-', ''),
+            }),
+          ),
+          throwsA(isA<ClientException>()),
+        );
+        expect(await actor.read() == original, isTrue);
+        expect(actor.transientState!.authTransitionUnknown, isFalse);
+      },
+    );
+
+    for (final (peerGone, cleanupFails) in [
+      (false, false),
+      (true, false),
+      (false, true),
+    ]) {
+      test(
+        'explicit signin preserves unsaved signup and screen: peerGone=$peerGone cleanupFails=$cleanupFails',
+        () async {
+          final root = await scratch();
+          final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+          addTearDown(() => server.close(force: true));
+          final origin = 'http://127.0.0.1:${server.port}';
+          final signupArrived = Completer<void>();
+          final signupRelease = Completer<void>();
+          final peerArrived = Completer<void>();
+          final peerRelease = Completer<void>();
+          final ownArrived = Completer<void>();
+          final ownRelease = Completer<void>();
+          addTearDown(() {
+            for (final c in [signupRelease, peerRelease, ownRelease]) {
+              if (!c.isCompleted) c.complete();
+            }
+          });
+          final attempt = randomId();
+          final ownIssued = credentials();
+          final peerIssued = credentials();
+          var signupSends = 0;
+          var signinSends = 0;
+          server.listen((request) async {
+            final body =
+                jsonDecode(await utf8.decoder.bind(request).join()) as Map;
+            request.response.headers.contentType = ContentType.json;
+            if (request.uri.path == '/auth.signup') {
+              signupSends++;
+              signupArrived.complete();
+              await signupRelease.future;
+              request.response.write(
+                jsonEncode({'accepted': true, 'attempt': attempt}),
+              );
+            } else {
+              signinSends++;
+              final peer = body['email'] == 'peer@example.test';
+              (peer ? peerArrived : ownArrived).complete();
+              await (peer ? peerRelease : ownRelease).future;
+              request.response.write(
+                jsonEncode((peer ? peerIssued : ownIssued).toJson()),
+              );
+            }
+            await request.response.close();
+          });
+          final peerStore = device(root, origin);
+          await peerStore.write(credentials());
+          final files = FailWrite(2);
+          final actorStore = NativeDeviceStore(
+            scope(origin),
+            directory: root,
+            files: files,
+          );
+          final actor = DeviceTransport(actorStore);
+          final peer = DeviceTransport(peerStore);
+          addTearDown(actor.close);
+          addTearDown(peer.close);
+          final signup = actor.invoke('auth.signup', {
+            'email': 'signup@example.test',
+          });
+          await signupArrived.future;
+          final peerReply = peer
+              .invoke('auth.signin', {'email': 'peer@example.test'})
+              .then<Object?>((v) => v, onError: (Object e) => e);
+          await peerArrived.future;
+          signupRelease.complete();
+          expect((await signup as Map)['accepted'], isTrue);
+          expect(
+            actorStore.transientState?.attempts['signup']?.id == attempt,
+            isTrue,
+          );
+          files.writeUnavailable = true;
+          await actorStore.load();
+          expect(actorStore.observedPeerAuth, isTrue);
+          expect(
+            actorStore.transientState?.attempts['signup']?.id == attempt,
+            isTrue,
+          );
+          expect((await peerStore.load()).attempts.isEmpty, isTrue);
+          if (peerGone) {
+            final current = await peerStore.load();
+            await peerStore.commit(
+              current,
+              DeviceState(
+                generation: current.generation + 1,
+                authGeneration: current.authGeneration,
+                session: current.session,
+                attempts: current.attempts,
+              ),
+            );
+          }
+          final observed = await peerStore.load();
+          files.writeUnavailable = cleanupFails;
+          if (cleanupFails) {
+            await expectLater(
+              actor.invoke('auth.signin', {'email': 'own@example.test'}),
+              throwsA(
+                isA<ClientException>().having(
+                  (e) => e.code,
+                  'code',
+                  'device_storage_unavailable',
+                ),
+              ),
+            );
+            expect(
+              actorStore.transientState?.attempts['signup']?.id == attempt,
+              isTrue,
+            );
+            expect(signinSends, 1);
+            peerRelease.complete();
+            await peerReply;
+            return;
+          }
+          final ownReply = actor
+              .invoke('auth.signin', {'email': 'own@example.test'})
+              .then<Object?>((v) => v, onError: (Object e) => e);
+          await ownArrived.future;
+          final atStart = await peerStore.load();
+          if (!peerGone) {
+            peerRelease.complete();
+            await peerReply;
+          }
+          ownRelease.complete();
+          final result = await ownReply;
+          if (peerGone) {
+            peerRelease.complete();
+            await peerReply;
+          }
+          expect(result is Map, isTrue);
+          expect(await actorStore.read() == ownIssued, isTrue);
+          final finalState = await device(root, origin).load();
+          expect(atStart.attempts['signup']?.id == attempt, isTrue);
+          expect(finalState.attempts['signup']?.id == attempt, isTrue);
+          expect(
+            atStart.authGeneration,
+            observed.authGeneration + (peerGone ? 0 : 1),
+          );
+          expect(signupSends, 1);
+          expect(signinSends, 2);
+        },
+      );
+    }
+
+    test('explicit authentication clears observed peer marks', () async {
+      final root = await scratch();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final origin = 'http://127.0.0.1:${server.port}';
+      final original = credentials();
+      final rotated = credentials(
+        user: original.userId,
+        session: original.sessionId,
+      );
+      final peerIssued = credentials();
+      final ownIssued = credentials();
+      final arrived = [Completer<void>(), Completer<void>()];
+      final release = [Completer<void>(), Completer<void>()];
+      addTearDown(() {
+        for (final barrier in release) {
+          if (!barrier.isCompleted) barrier.complete();
+        }
+      });
+      var signins = 0;
+      server.listen((request) async {
+        await request.drain<void>();
+        final index = signins++;
+        arrived[index].complete();
+        await release[index].future;
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(
+          jsonEncode((index == 0 ? peerIssued : ownIssued).toJson()),
+        );
+        await request.response.close();
+      });
+      final peer = device(root, origin);
+      await peer.write(original);
+      final files = FailWrite(2);
+      final actor = NativeDeviceStore(
+        scope(origin),
+        directory: root,
+        files: files,
+      );
+      await actor.finishRefresh((await actor.claimRefresh(original))!, rotated);
+      final peerClient = DeviceTransport(peer);
+      final actorClient = DeviceTransport(actor);
+      addTearDown(peerClient.close);
+      addTearDown(actorClient.close);
+      final peerReply = peerClient
+          .invoke('auth.signin', {'email': 'peer@example.test'})
+          .then<Object?>((value) => value, onError: (Object error) => error);
+      await arrived[0].future;
+      files.writeUnavailable = true;
+      await actor.load();
+      expect(await actor.read() == null, isTrue);
+      final observed = await peer.load();
+      expect(actor.transientState != null, isTrue);
+      files.writeUnavailable = false;
+      final ownReply = actorClient
+          .invoke('auth.signin', {'email': 'own@example.test'})
+          .then<Object?>((value) => value, onError: (Object error) => error);
+      await arrived[1].future;
+      final started = await peer.load();
+      release[0].complete();
+      await peerReply;
+      final afterPeer = await peer.load();
+      release[1].complete();
+      final result = await ownReply;
+      expect(
+        started.authGeneration > observed.authGeneration &&
+            started.session == null &&
+            !started.refreshSent &&
+            started.authTransitionId != observed.authTransitionId,
+        isTrue,
+      );
+      expect(
+        afterPeer.session == null &&
+            afterPeer.authGeneration == started.authGeneration,
+        isTrue,
+      );
+      expect(result is Map<String, Object?>, isTrue);
+      expect(await actor.read() == ownIssued, isTrue);
+      expect(actor.transientState, isNull);
+      expect(signins, 2);
+    });
+
+    test('merge bounds retain committed storage and memory', () async {
+      final root = await scratch();
+      const origin = 'https://rejoin.example.test';
+      final peer = device(root, origin);
+      final now = DateTime.now().millisecondsSinceEpoch;
+      DeviceAttempt attempt(String email) =>
+          DeviceAttempt(randomId(), email, now);
+      await peer.commit(await peer.load(), DeviceState(generation: 1));
+      final actor = NativeDeviceStore(
+        scope(origin),
+        directory: root,
+        files: FailWrite(1),
+      );
+      await actor.commitAfterSuccess(
+        await actor.load(),
+        DeviceState(
+          generation: 2,
+          attempts: {'mine': attempt('mine@example.test')},
+        ),
+      );
+      final current = await peer.load();
+      await peer.commit(
+        current,
+        DeviceState(
+          generation: 2,
+          attempts: {
+            for (var i = 0; i < 3; i++)
+              'peer$i': attempt('peer$i@example.test'),
+          },
+        ),
+      );
+      final committed = jsonEncode((await peer.load()).toJson());
+      final recovered = await actor.load();
+      expect(recovered.attempts.containsKey('mine'), isTrue);
+      expect(actor.transientState != null, isTrue);
+      expect(jsonEncode((await peer.load()).toJson()) == committed, isTrue);
+    });
+
+    test(
+      'three individually valid attempts can exceed the merged UTF-8 bound',
+      () {
+        final actor = MemoryDeviceStore(
+          scope('https://${'a' * 5300}.example.test'),
+        );
+        final now = DateTime.now().millisecondsSinceEpoch;
+        DeviceAttempt attempt() =>
+            DeviceAttempt(randomId(), String.fromCharCode(0x754c) * 300, now);
+        final base = actor.prepareWrite(DeviceState(generation: 1));
+        final memory = actor.prepareWrite(
+          DeviceState(generation: 2, attempts: {'mine': attempt()}),
+        );
+        final current = actor.prepareWrite(
+          DeviceState(
+            generation: 2,
+            attempts: {'peer1': attempt(), 'peer2': attempt()},
+          ),
+        );
+        actor.lastPersistentState = base;
+        actor.transientBaseAuthGeneration = base.authGeneration;
+        actor.transientState = memory;
+        expect(
+          () => actor.prepareWrite(actor.reconcileRecovery(current, memory)),
+          throwsA(
+            isA<ClientException>().having(
+              (e) => e.code,
+              'code',
+              'device_storage_full',
+            ),
+          ),
+        );
+        expect(actor.transientState!.attempts.containsKey('mine'), isTrue);
+        expect(current.attempts.keys, ['peer1', 'peer2']);
+      },
+    );
+
+    test('same screen recovery keeps the later surviving request', () async {
+      for (final peerOrder in ['earlier', 'same', 'later']) {
+        final root = await scratch();
+        const origin = 'https://rejoin.example.test';
+        final peer = device(root, origin);
+        final actor = NativeDeviceStore(
+          scope(origin),
+          directory: root,
+          files: FailWrite(1),
+        );
+        final now = DateTime.now().millisecondsSinceEpoch;
+        final mine = DeviceAttempt(randomId(), 'mine@example.test', now - 2);
+        final theirs = DeviceAttempt(
+          randomId(),
+          'peer@example.test',
+          now -
+              switch (peerOrder) {
+                'earlier' => 3,
+                'same' => 2,
+                _ => 1,
+              },
+        );
+        await actor.commitAfterSuccess(
+          await actor.load(),
+          DeviceState(generation: 1, attempts: {'same': mine}),
+        );
+        await peer.commit(
+          await peer.load(),
+          DeviceState(generation: 1, attempts: {'same': theirs}),
+        );
+        final recovered = await actor.load();
+        expect(
+          recovered.attempts['same']?.id ==
+              (peerOrder == 'earlier' ? mine.id : theirs.id),
+          isTrue,
+        );
+      }
+    });
+  }, skip: unsupportedPosix);
+
+  test('native recovery orderings persist account changes and fence another object', () async {
+    for (final baseAuth in [0, 1]) {
+      for (final memoryAccount in [false, true]) {
+        for (final recoveredRead in [false, true]) {
+          for (final boundary in [
+            'signin',
+            'logout',
+            'signin with peer attempt',
+          ]) {
+            final root = await scratch();
+            final server = await HttpServer.bind(
+              InternetAddress.loopbackIPv4,
+              0,
+            );
+            addTearDown(() => server.close(force: true));
+            final origin = 'http://127.0.0.1:${server.port}';
+            final arrived = Completer<void>();
+            final release = Completer<void>();
+            var signups = 0;
+            server.listen((request) async {
+              await request.drain<void>();
+              request.response.headers.contentType = ContentType.json;
+              if (request.uri.path == '/auth.signin') {
+                request.response.write(jsonEncode(credentials().toJson()));
+              } else if (request.uri.path == '/auth.logout') {
+                request.response.write('{}');
+              } else {
+                if (++signups == 2) {
+                  arrived.complete();
+                  await release.future;
+                }
+                request.response.write(
+                  jsonEncode({'accepted': true, 'attempt': randomId()}),
+                );
+              }
+              await request.response.close();
+            });
+            final observer = device(root, origin);
+            await observer.commit(
+              await observer.load(),
+              DeviceState(generation: 1, authGeneration: baseAuth),
+            );
+            final files = FailWrite(1);
+            final actorStore = NativeDeviceStore(
+              scope(origin),
+              directory: root,
+              files: files,
+            );
+            final actor = DeviceTransport(actorStore);
+            final pendingClient = DeviceTransport(device(root, origin));
+            addTearDown(actor.close);
+            addTearDown(pendingClient.close);
+            await actor.invoke('auth.signup', {'email': 'actor@example.test'});
+            files.readUnavailable = true;
+            if (memoryAccount) {
+              await actor.invoke('auth.signin', {
+                'email': 'actor@example.test',
+              });
+            }
+            expect(
+              (await actorStore.load()).attempts.length,
+              memoryAccount ? 0 : 1,
+            );
+            final pending = pendingClient.invoke('auth.signup', {
+              'email': 'pending@example.test',
+            });
+            await arrived.future;
+            files.readUnavailable = false;
+            Object? peerAttempt;
+            if (boundary == 'signin with peer attempt') {
+              final peer = DeviceTransport(
+                device(root, origin, screen: 'peer'),
+              );
+              addTearDown(peer.close);
+              peerAttempt = (await peer.invoke('auth.signup', {
+                'email': 'peer@example.test',
+              }) as Map)['attempt'];
+            }
+            if (recoveredRead) await actorStore.load();
+            await actor.invoke(
+              boundary == 'logout' ? 'auth.logout' : 'auth.signin',
+              boundary == 'logout' ? {} : {'email': 'actor@example.test'},
+            );
+            final durable = await observer.load();
+            expect(durable.authGeneration, greaterThan(baseAuth));
+            release.complete();
+            final result = await pending as Map;
+            expect(result['accepted'], isTrue);
+            final restored = await observer.load();
+            expect(restored.authGeneration, durable.authGeneration);
+            expect(
+              restored.attempts.values.any((a) => a.id == result['attempt']),
+              isFalse,
+            );
+            expect(signups, peerAttempt == null ? 2 : 3);
+            if (peerAttempt != null) {
+              expect(restored.attempts['peer']?.id == peerAttempt, isTrue);
+            }
+          }
+        }
+      }
+    }
+  }, skip: unsupportedPosix);
+
   test('server success survives a runtime write failure in this run without resending', () async {
     final root = await scratch();
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
@@ -984,14 +3193,16 @@ void main() {
       }
       await request.response.close();
     });
+    final files = FailWrite(2)..blockReadsAfterFailure = true;
     final store = NativeDeviceStore(
       scope(origin),
       directory: root,
-      files: FailWrite(2),
+      files: files,
     );
     final client = DeviceTransport(store);
     addTearDown(client.close);
     await client.invoke('example.read', {});
+    files.readUnavailable = true;
     await client.invoke('example.read', {});
     expect(sends == 1 && await store.read() == rotated, isTrue);
     expect((await persistent.load()).refreshSent, isTrue);
@@ -1001,6 +3212,11 @@ void main() {
         isA<ClientException>().having((e) => e.code, 'code', 'session_changed'),
       ),
     );
+    files.readUnavailable = false;
+    expect(await store.read() == rotated, isTrue);
+    expect((await persistent.load()).refreshSent, isFalse);
+    expect(await persistent.read() == rotated, isTrue);
+    expect(sends, 1);
   }, skip: unsupportedPosix);
   test(
     'pre-existing broad intermediate directory is rejected without chmod',
@@ -1383,6 +3599,7 @@ void main() {
       before,
       DeviceState(
         generation: before.generation + 1,
+        authGeneration: before.authGeneration,
         session: before.session,
         attempts: {
           'signup': DeviceAttempt(
@@ -1405,7 +3622,7 @@ void main() {
   }, skip: unsupportedPosix);
 
   test(
-    'non-successor generation writes are rejected without touching the record',
+    'invalid successor or decreasing auth generations preserve the record',
     () async {
       final root = await scratch();
       const origin = 'https://generation.example.test';
@@ -1414,13 +3631,17 @@ void main() {
       final current = await store.load();
       final file = File('${store.directory}/auth.json');
       final bytes = await file.readAsBytes();
-      for (final generation in [current.generation, current.generation + 2]) {
+      for (final (generation, authGeneration) in [
+        (current.generation, current.authGeneration),
+        (current.generation + 2, current.authGeneration),
+        (current.generation + 1, current.authGeneration - 1),
+      ]) {
         await expectLater(
           store.commit(
             current,
             DeviceState(
               generation: generation,
-              authGeneration: current.authGeneration,
+              authGeneration: authGeneration,
               session: current.session,
             ),
           ),
@@ -1971,6 +4192,8 @@ class FailWrite extends PosixFiles {
   final int at;
   var writes = 0;
   bool readUnavailable = false;
+  bool writeUnavailable = false;
+  bool blockReadsAfterFailure = false;
   @override
   Uint8List? read(int dir, String name) {
     if (readUnavailable) {
@@ -1981,7 +4204,8 @@ class FailWrite extends PosixFiles {
 
   @override
   void syncFile(int fd) {
-    if (++writes == at) {
+    if (++writes == at || writeUnavailable) {
+      if (blockReadsAfterFailure) readUnavailable = true;
       throw const ClientException('device_storage_unavailable');
     }
     super.syncFile(fd);
@@ -1989,10 +4213,22 @@ class FailWrite extends PosixFiles {
 }
 
 class FailDirectorySyncOnce extends PosixFiles {
+  FailDirectorySyncOnce({this.at = 1});
+  final int at;
+  var syncs = 0;
   var failed = false;
+  bool readUnavailable = false;
+  @override
+  Uint8List? read(int dir, String name) {
+    if (readUnavailable) {
+      throw const ClientException('device_storage_unavailable');
+    }
+    return super.read(dir, name);
+  }
+
   @override
   void syncDirectory(int fd) {
-    if (!failed) {
+    if (!failed && ++syncs == at) {
       failed = true;
       throw const ClientException('device_storage_unavailable');
     }
@@ -2034,5 +4270,29 @@ class ChurningStore extends DeviceStore {
       }),
     );
     return delegate.commit(expected, next);
+  }
+}
+
+class UncertainAuthenticationStart extends FailWrite {
+  UncertainAuthenticationStart() : super(2);
+  bool failRecoveryThenCleanup = false;
+  bool failCleanupSync = false;
+  @override
+  void syncFile(int fd) {
+    if (failRecoveryThenCleanup) {
+      failRecoveryThenCleanup = false;
+      failCleanupSync = true;
+      throw const ClientException('device_storage_unavailable');
+    }
+    super.syncFile(fd);
+  }
+
+  @override
+  void syncDirectory(int fd) {
+    if (failCleanupSync) {
+      failCleanupSync = false;
+      throw const ClientException('device_storage_unavailable');
+    }
+    super.syncDirectory(fd);
   }
 }
