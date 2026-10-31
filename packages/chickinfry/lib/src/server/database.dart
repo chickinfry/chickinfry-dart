@@ -189,13 +189,12 @@ final class Field<T> {
   const Field(this.table, this.column);
   final String table;
   final ColumnDefinition column;
-  Filter equals(T value) => value == null ? isNull() : _compare('=', value);
-  Filter notEquals(T value) =>
-      value == null ? isNotNull() : _compare('<>', value);
-  Filter greaterThan(T value) => _compare('>', value);
-  Filter greaterThanOrEquals(T value) => _compare('>=', value);
-  Filter lessThan(T value) => _compare('<', value);
-  Filter lessThanOrEquals(T value) => _compare('<=', value);
+  Filter eq(T value) => value == null ? isNull() : _compare('=', value);
+  Filter ne(T value) => value == null ? isNotNull() : _compare('<>', value);
+  Filter gt(T value) => _compare('>', value);
+  Filter gte(T value) => _compare('>=', value);
+  Filter lt(T value) => _compare('<', value);
+  Filter lte(T value) => _compare('<=', value);
   Filter _compare(String op, T value) => Filter._((name, params) {
     _belongs(name);
     params.add(column.validate(value));
@@ -307,7 +306,16 @@ final class Repository {
         .join(' AND ');
   }
 
-  Future<Map<String, Object?>> insert(Map<String, Object?> input) async {
+  Future<Map<String, Object?>> insert(Map<String, Object?> input) =>
+      _insert(input);
+
+  Future<Map<String, Object?>> upsert(Map<String, Object?> input) =>
+      _insert(input, upsert: true);
+
+  Future<Map<String, Object?>> _insert(
+    Map<String, Object?> input, {
+    bool upsert = false,
+  }) async {
     final values = _values(input);
     for (final column in _table.columns) {
       if (!column.optional && !values.containsKey(column.name)) {
@@ -318,8 +326,23 @@ final class Repository {
     final clause = values.isEmpty
         ? 'DEFAULT VALUES'
         : '(${values.keys.map(_quote).join(', ')}) VALUES (${List.generate(params.length, (index) => '\$${index + 1}').join(', ')})';
+    var conflict = '';
+    if (upsert) {
+      _key({
+        for (final name in _table.primaryKey)
+          if (values.containsKey(name)) name: values[name],
+      }, []);
+      final mutable = values.keys.where(
+        (name) => !_table.primaryKey.contains(name),
+      );
+      if (mutable.isEmpty) {
+        throw ArgumentError('Upsert requires mutable values.');
+      }
+      conflict =
+          ' ON CONFLICT (${_table.primaryKey.map(_quote).join(', ')}) DO UPDATE SET ${mutable.map((name) => '${_quote(name)} = EXCLUDED.${_quote(name)}').join(', ')}';
+    }
     return (await _run(
-      'INSERT INTO $_name $clause RETURNING $_columns',
+      'INSERT INTO $_name $clause$conflict RETURNING $_columns',
       params,
     )).single;
   }
@@ -363,39 +386,102 @@ final class Repository {
     return _run(sql, params);
   }
 
-  Future<Map<String, Object?>> update(
-    Map<String, Object?> key,
-    Map<String, Object?> patch,
-  ) async {
+  Map<String, Object?> _patch(Map<String, Object?> patch) {
     final values = _values(patch);
     if (values.keys.any(_table.primaryKey.contains)) {
       throw ArgumentError('Primary key cannot be updated.');
     }
-    if (values.isEmpty) {
-      final row = await findById(key);
-      if (row == null) throw StateError('Row was not found.');
-      return row;
-    }
-    final params = <Object?>[];
-    final assignments = values.entries
-        .map((entry) {
-          params.add(entry.value);
-          return '${_quote(entry.key)} = \$${params.length}';
-        })
-        .join(', ');
-    final where = _key(key, params);
-    return (await _run(
-      'UPDATE $_name SET $assignments WHERE $where RETURNING $_columns',
-      params,
-    )).single;
+    return values;
   }
 
-  Future<bool> delete(Map<String, Object?> key) async {
+  Future<Map<String, Object?>> update(
+    Map<String, Object?> key,
+    Map<String, Object?> patch,
+  ) async {
+    final values = _patch(patch);
+    final row = values.isEmpty
+        ? await findById(key)
+        : await _update(key, values);
+    if (row == null) throw const DatabaseError('not_found');
+    return row;
+  }
+
+  Future<Map<String, Object?>?> updateIf(
+    Map<String, Object?> key,
+    Filter condition,
+    Map<String, Object?> patch,
+  ) {
+    final values = _patch(patch);
+    if (values.isEmpty) throw ArgumentError('No columns to update.');
+    return _update(key, values, condition: condition);
+  }
+
+  Future<Map<String, Object?>> increment(
+    Map<String, Object?> key,
+    Map<String, int> columns,
+  ) async {
+    final row = await _update(key, const {}, increments: columns);
+    if (row == null) throw const DatabaseError('not_found');
+    return row;
+  }
+
+  Future<Map<String, Object?>?> incrementIf(
+    Map<String, Object?> key,
+    Filter condition,
+    Map<String, int> columns,
+    Map<String, Object?> patch,
+  ) {
+    final values = _patch(patch);
+    if (values.isEmpty) throw ArgumentError('No columns to update.');
+    return _update(key, values, condition: condition, increments: columns);
+  }
+
+  Future<Map<String, Object?>?> _update(
+    Map<String, Object?> key,
+    Map<String, Object?> values, {
+    Filter? condition,
+    Map<String, int>? increments,
+  }) async {
+    final params = <Object?>[];
+    final assignments = <String>[];
+    if (increments != null) {
+      if (increments.isEmpty) throw ArgumentError('No columns to increment.');
+      for (final entry in increments.entries) {
+        if (_table.column(entry.key).kind != 'integer' ||
+            _table.primaryKey.contains(entry.key) ||
+            values.containsKey(entry.key) ||
+            entry.value == 0 ||
+            entry.value < -9007199254740991 ||
+            entry.value > 9007199254740991) {
+          throw ArgumentError('Invalid increment.');
+        }
+        params.add(entry.value);
+        final name = _quote(entry.key);
+        assignments.add('$name = $name + \$${params.length}');
+      }
+    }
+    for (final entry in values.entries) {
+      params.add(entry.value);
+      assignments.add('${_quote(entry.key)} = \$${params.length}');
+    }
+    var where = _key(key, params);
+    if (condition != null) {
+      where += ' AND (${condition._sql(_table.name, params)})';
+    }
+    final rows = await _run(
+      'UPDATE $_name SET ${assignments.join(', ')} WHERE $where RETURNING $_columns',
+      params,
+    );
+    return rows.isEmpty ? null : rows.single;
+  }
+
+  Future<Map<String, Object?>?> delete(Map<String, Object?> key) async {
     final params = <Object?>[];
     final where = _key(key, params);
-    return (await _run(
+    final rows = await _run(
       'DELETE FROM $_name WHERE $where RETURNING $_columns',
       params,
-    )).isNotEmpty;
+    );
+    return rows.isEmpty ? null : rows.single;
   }
 }

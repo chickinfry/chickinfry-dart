@@ -35,7 +35,7 @@ void main() {
     );
     await repository.findMany(
       where: Filter.and([
-        name.equals("quote'--"),
+        name.eq("quote'--"),
         Filter.not(part.isIn([1, 2])),
       ]),
       orderBy: [part.desc()],
@@ -79,7 +79,7 @@ void main() {
         where: const Field<String>(
           'other',
           ColumnDefinition('name', 'string'),
-        ).equals('x'),
+        ).eq('x'),
       ),
       throwsArgumentError,
     );
@@ -104,6 +104,134 @@ void main() {
     expect(frames.last['params'], [id, 1, 'x', null]);
     await repository.update({'id': id, 'part': 1}, {});
     expect((frames.last['sql'] as String).startsWith('SELECT'), isTrue);
+  });
+  test('delete returns the removed row or null', () async {
+    final row = {'id': id, 'part': 1, 'name': 'x', 'note': null};
+    var rows = <Map<String, Object?>>[row];
+    final repository = Repository(
+      DatabaseConnection((_) async => {'rows': rows}),
+      table,
+    );
+    final key = {'id': id, 'part': 1};
+    expect(await repository.delete(key), row);
+    rows = [];
+    expect(await repository.delete(key), isNull);
+  });
+  test('missing update target returns not_found', () async {
+    final repository = Repository(
+      DatabaseConnection((_) async => {'rows': <Object?>[]}),
+      table,
+    );
+    final key = {'id': id, 'part': 1};
+    for (final patch in <Map<String, Object?>>[
+      {},
+      {'name': 'changed'},
+    ]) {
+      await expectLater(
+        repository.update(key, patch),
+        throwsA(
+          isA<DatabaseError>().having((e) => e.code, 'code', 'not_found'),
+        ),
+      );
+    }
+  });
+  test('conditional writes and upsert use one parameterized statement and preserve results', () async {
+    const writes = TableDefinition(
+      'records',
+      ['id', 'part'],
+      [
+        ColumnDefinition('id', 'id'),
+        ColumnDefinition('part', 'integer'),
+        ColumnDefinition('name', 'string'),
+        ColumnDefinition('count', 'integer'),
+        ColumnDefinition('note', 'string', nullable: true, optional: true),
+      ],
+    );
+    final row = {'id': id, 'part': 1, 'name': 'new', 'count': 8, 'note': null};
+    final frames = <Map<String, Object?>>[];
+    var rows = <Map<String, Object?>>[row];
+    String? error;
+    final repository = Repository(
+      DatabaseConnection((frame) async {
+        frames.add(frame);
+        return error == null ? {'rows': rows} : {'error': error};
+      }),
+      writes,
+    );
+    final key = {'id': id, 'part': 1};
+    final condition = part.isIn([1]);
+    final calls = <Future<Object?> Function()>[
+      () => repository.updateIf(key, condition, {'name': 'new'}),
+      () => repository.upsert({'id': id, 'part': 1, 'name': 'new', 'count': 8}),
+      () => repository.increment(key, {'count': 1}),
+      () =>
+          repository.incrementIf(key, condition, {'count': 1}, {'name': 'new'}),
+    ];
+    final sql = [
+      'UPDATE "records" SET "name" = \$1 WHERE "id" = \$2 AND "part" = \$3 AND ("part" IN (\$4)) RETURNING "id", "part", "name", "count", "note"',
+      'INSERT INTO "records" ("id", "part", "name", "count") VALUES (\$1, \$2, \$3, \$4) ON CONFLICT ("id", "part") DO UPDATE SET "name" = EXCLUDED."name", "count" = EXCLUDED."count" RETURNING "id", "part", "name", "count", "note"',
+      'UPDATE "records" SET "count" = "count" + \$1 WHERE "id" = \$2 AND "part" = \$3 RETURNING "id", "part", "name", "count", "note"',
+      'UPDATE "records" SET "count" = "count" + \$1, "name" = \$2 WHERE "id" = \$3 AND "part" = \$4 AND ("part" IN (\$5)) RETURNING "id", "part", "name", "count", "note"',
+    ];
+    final params = [
+      ['new', id, 1, 1],
+      [id, 1, 'new', 8],
+      [1, id, 1],
+      [1, 'new', id, 1, 1],
+    ];
+    for (var index = 0; index < calls.length; index++) {
+      rows = [row];
+      expect(await calls[index](), row);
+      expect(frames.last['sql'], sql[index]);
+      expect(frames.last['params'], params[index]);
+      rows = [];
+      if (index == 0 || index == 3) {
+        expect(await calls[index](), isNull);
+      } else if (index == 2) {
+        await expectLater(
+          calls[index](),
+          throwsA(
+            isA<DatabaseError>().having((e) => e.code, 'code', 'not_found'),
+          ),
+        );
+      } else {
+        // An absent upsert target is inserted by the same statement.
+        rows = [row];
+        expect(await calls[index](), row);
+      }
+      error = '23505';
+      await expectLater(
+        calls[index](),
+        throwsA(isA<DatabaseError>().having((e) => e.code, 'code', '23505')),
+      );
+      error = null;
+    }
+    frames.clear();
+    final invalid = <Future<Object?> Function()>[
+      () => repository.upsert({'id': id, 'name': 'new', 'count': 8}),
+      () => repository.updateIf(key, condition, {'part': 2}),
+      () => repository.increment(key, {'name': 1}),
+      () => repository.increment(key, {'part': 1}),
+      () => repository.increment(key, {'count': 0}),
+      () => repository.increment(key, {'count': 9007199254740992}),
+      () => repository.increment(key, <String, int>{}),
+      () => repository.incrementIf(key, condition, {'count': 1}, {'count': 2}),
+      () => repository.incrementIf(key, condition, {
+        'count': 1,
+      }, <String, Object?>{}),
+      () => repository.updateIf(
+        key,
+        const Field<int>(
+          'other',
+          ColumnDefinition('count', 'integer'),
+        ).isIn([1]),
+        {'name': 'x'},
+      ),
+    ];
+    for (final call in invalid) {
+      await expectLater(Future.sync(call), throwsArgumentError);
+    }
+    expect(frames, isEmpty);
   });
   test('timestamp preserves microseconds and normalizes offset; invalid dates fail', () {
     const timestamp = ColumnDefinition('at', 'timestamp');
