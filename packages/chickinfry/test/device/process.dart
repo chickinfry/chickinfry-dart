@@ -39,8 +39,8 @@ Future<void> main(List<String> arguments) async {
               try {
                 await native.load();
                 exit(86);
-              } on ClientException catch (error) {
-                if (error.code != 'device_storage_unavailable') exit(87);
+              } on ClientError catch (error) {
+                if (error.code != 'failed_precondition') exit(87);
               }
             } else {
               if (!native.directory.startsWith('$root/')) exit(88);
@@ -129,8 +129,8 @@ Future<void> main(List<String> arguments) async {
             try {
               Persist.dir('');
               exit(83);
-            } on ClientException catch (error) {
-              if (error.code != 'device_storage_unavailable') exit(84);
+            } on ClientError catch (error) {
+              if (error.code != 'failed_precondition') exit(84);
             }
           } finally {
             scoped.close();
@@ -146,8 +146,8 @@ Future<void> main(List<String> arguments) async {
           try {
             await store.load();
             exit(76);
-          } on ClientException catch (error) {
-            exit(error.code == 'device_storage_unavailable' ? 0 : 77);
+          } on ClientError catch (error) {
+            exit(error.code == 'failed_precondition' ? 0 : 77);
           }
         case 'increment':
           for (var i = 0; i < 10; i++) {
@@ -173,7 +173,7 @@ Future<void> main(List<String> arguments) async {
     }
   } catch (error, stack) {
     final label = stack.toString().split('\n').first;
-    if (error is ClientException &&
+    if (error is ClientError &&
         RegExp(r'^device storage check=[a-z_]+$').hasMatch(label)) {
       stderr.writeln(label);
     }

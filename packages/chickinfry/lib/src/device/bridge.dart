@@ -81,8 +81,10 @@ final class DeviceTransport implements ClientTransport {
     var baseKnown = true;
     try {
       before = await store.load();
-    } on ClientException catch (error) {
-      if (!_browser || error.code != 'device_storage_unavailable') rethrow;
+    } on ClientError catch (error) {
+      if (!_browser || store.blocked || error.code != 'failed_precondition') {
+        rethrow;
+      }
       // Browser credentials remain in cookies when local storage is blocked.
       before =
           store.transientState ?? store.lastPersistentState ?? DeviceState();
@@ -183,11 +185,11 @@ final class DeviceTransport implements ClientTransport {
             before = marked;
             break;
           }
-        } on ClientException {
-          throw const ClientException('device_storage_unavailable');
+        } on ClientError {
+          throw const ClientError('failed_precondition');
         }
         if (conflicts == deviceLocalRetryLimit) {
-          throw const ClientException('device_storage_unavailable');
+          throw const ClientError('failed_precondition');
         }
         before = await store.load();
         if (before.session == null && !before.authTransitionUnknown) break;
@@ -201,12 +203,12 @@ final class DeviceTransport implements ClientTransport {
       try {
         result = await _connection.invoke(operation, request);
       } on OperationError catch (error) {
-        if (transition == null || error.code == 'redirect_not_allowed') rethrow;
+        if (transition == null) rethrow;
         rejection = error;
         uncertain = false;
       }
       if (rejection == null && result is! Map<String, Object?>) {
-        throw const ClientException('invalid_response');
+        throw const ClientError('internal');
       }
       final email = request['email'] is String
           ? (request['email']! as String).trim().toLowerCase()
@@ -225,7 +227,7 @@ final class DeviceTransport implements ClientTransport {
         final confirmed = await BrowserAuth(_connection).session();
         if (browserIssued.id != confirmed.id ||
             browserIssued.sessionId != confirmed.sessionId) {
-          throw const ClientException('session_changed');
+          throw const ClientError('failed_precondition');
         }
       } else if (!_browser &&
           result is Map<String, Object?> &&
@@ -233,8 +235,8 @@ final class DeviceTransport implements ClientTransport {
         try {
           issued = SessionCredentials.fromJson(result);
           DeviceState.fromJson(DeviceState(session: issued).toJson());
-        } on ClientException {
-          throw const ClientException('invalid_response');
+        } on ClientError {
+          throw const ClientError('internal');
         }
       } else if (result is Map<String, Object?> &&
           operation == 'auth.signup' &&
@@ -247,8 +249,8 @@ final class DeviceTransport implements ClientTransport {
             'email': email,
             'started_at': started,
           });
-        } on ClientException {
-          throw const ClientException('invalid_response');
+        } on ClientError {
+          throw const ClientError('internal');
         }
       }
       if (rejection == null &&
@@ -256,7 +258,7 @@ final class DeviceTransport implements ClientTransport {
           issued == null &&
           browserIssued == null &&
           pending == null) {
-        throw const ClientException('invalid_response');
+        throw const ClientError('internal');
       }
       final issuedSession = issued != null || browserIssued != null;
       if (!issuedSession) uncertain = false;
@@ -349,10 +351,7 @@ final class DeviceTransport implements ClientTransport {
         if (next == null) break;
         if (conflicts == deviceLocalRetryLimit + 1) {
           if (rejection != null) {
-            throw ClientException(
-              'device_storage_unavailable',
-              operationError: rejection,
-            );
+            throw ClientError('failed_precondition', operationError: rejection);
           }
           if (baseKnown && store.transientState == null) {
             store.lastPersistentState = current;

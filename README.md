@@ -91,9 +91,9 @@ Store read failures preserve the record and fail the call.
 
 Native Dart supports bearer credentials and session stores. Browser Fetch
 uses cookies only, as described below. Requests have a 30-second default deadline, a 4 MiB UTF-8 request limit and a 1 MiB response limit. Redirects are
-rejected. Server errors preserve their code and HTTP status through
-`OperationError`; local failures use
-`ClientException`.
+rejected. Server errors preserve their code, HTTP status, and nullable
+`responseMessage` through `OperationError`; its `toString()` omits the description.
+Local failures use `ClientError`.
 
 Proxy connections preserve SDK routing and caller deadlines; connection/TLS socket cancellation remains SDK-managed.
 

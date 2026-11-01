@@ -8,19 +8,19 @@ final class BrowserSession {
 
   factory BrowserSession.fromJson(Object? value) {
     if (value is! Map<String, Object?>) {
-      throw const ClientException('invalid_response');
+      throw const ClientError('internal');
     }
     String field(String name) {
       final result = value[name];
       if (result is! String || result.isEmpty) {
-        throw const ClientException('invalid_response');
+        throw const ClientError('internal');
       }
       return result;
     }
 
     final expiresAt = field('expiresAt');
     if (!validTimestamp(expiresAt)) {
-      throw const ClientException('invalid_response');
+      throw const ClientError('internal');
     }
     return BrowserSession._(
       field('id'),
@@ -53,14 +53,14 @@ final class BrowserAuth {
       'auth.signin',
       'auth.identity',
     }.contains(operation)) {
-      throw const ClientException('invalid_input');
+      throw const ClientError('invalid_argument');
     }
     final issued = BrowserSession.fromJson(
       await _transport.invoke(operation, input),
     );
     final confirmed = await session();
     if (issued.id != confirmed.id || issued.sessionId != confirmed.sessionId) {
-      throw const ClientException('session_changed');
+      throw const ClientError('failed_precondition');
     }
     return confirmed;
   }

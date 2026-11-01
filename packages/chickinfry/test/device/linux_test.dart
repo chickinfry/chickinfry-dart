@@ -15,10 +15,10 @@ void main() {
       ? false
       : 'Requires the Linux file device.';
   final unavailable = throwsA(
-    isA<ClientException>().having(
+    isA<ClientError>().having(
       (error) => error.code,
       'code',
-      'device_storage_unavailable',
+      'failed_precondition',
     ),
   );
 
@@ -180,8 +180,8 @@ void main() {
           'https://permissions.example.test',
         ).load();
         fail('A writable ancestor was accepted.');
-      } on ClientException catch (error, stack) {
-        expect(error.code, 'device_storage_unavailable');
+      } on ClientError catch (error, stack) {
+        expect(error.code, 'failed_precondition');
         expect(
           stack.toString(),
           contains('device storage check=ancestor_mode'),

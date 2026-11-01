@@ -10,18 +10,18 @@ import 'store.dart';
 
 String resolveDirectory(String directory) {
   if (directory.isEmpty || directory.contains('\x00')) {
-    throw const ClientException('device_storage_unavailable');
+    throw const ClientError('failed_precondition');
   }
   try {
     return Directory(directory).absolute.uri.normalizePath().toFilePath();
   } catch (_) {
-    throw const ClientException('device_storage_unavailable');
+    throw const ClientError('failed_precondition');
   }
 }
 
 DeviceStore openDevice(DeviceScope scope, Persist? persist) {
   if (!Platform.isMacOS && !Platform.isLinux) {
-    throw const ClientException('device_storage_unavailable');
+    throw const ClientError('failed_precondition');
   }
   return NativeDeviceStore(scope, directory: persist?.directory);
 }
@@ -51,7 +51,7 @@ final class NativeDeviceStore extends DeviceStore {
     final base = _base;
     if (base != null) {
       if (!base.startsWith('/') || base.isEmpty) {
-        throw const ClientException('device_storage_unavailable');
+        throw const ClientError('failed_precondition');
       }
       return base;
     }
@@ -59,7 +59,7 @@ final class NativeDeviceStore extends DeviceStore {
         scope.app == '..' ||
         scope.app.contains('/') ||
         scope.app.contains('\x00')) {
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     if (Platform.isLinux) {
       final xdg = Platform.environment['XDG_STATE_HOME'];
@@ -69,7 +69,7 @@ final class NativeDeviceStore extends DeviceStore {
     }
     final home = Platform.environment['HOME'];
     if (home == null || !home.startsWith('/')) {
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     return Platform.isLinux
         ? '$home/.local/state/chickinfry/${scope.app}'
@@ -85,24 +85,24 @@ final class NativeDeviceStore extends DeviceStore {
     try {
       final envelope = jsonDecode(utf8.decode(bytes));
       if (envelope is! Map<String, Object?> || envelope['version'] is! int) {
-        throw const ClientException('device_storage_corrupt');
+        throw const ClientError('data_loss');
       }
       if ((envelope['version']! as int) > 1) {
-        throw const ClientException('device_storage_version_unsupported');
+        throw const ClientError('unimplemented');
       }
       if (envelope['version'] != 1 ||
           jsonEncode(envelope['owner']) != jsonEncode(scope.owner)) {
-        throw const ClientException('device_storage_corrupt');
+        throw const ClientError('data_loss');
       }
       final state = DeviceState.fromJson(envelope['auth']);
       if (state.attempts.length > deviceAttemptLimit) {
-        throw const ClientException('device_storage_corrupt');
+        throw const ClientError('data_loss');
       }
       return state;
-    } on ClientException {
+    } on ClientError {
       rethrow;
     } catch (_) {
-      throw const ClientException('device_storage_corrupt');
+      throw const ClientError('data_loss');
     }
   }
 
@@ -110,7 +110,7 @@ final class NativeDeviceStore extends DeviceStore {
   Future<DeviceState> load() async {
     requireAvailable();
     if (!Platform.isMacOS && !Platform.isLinux) {
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     try {
       return await _files.locked(directory, (dir) async {
@@ -125,11 +125,11 @@ final class NativeDeviceStore extends DeviceStore {
         _write(dir, current, recovered);
         return recovered;
       }, root: _root);
-    } on ClientException catch (error) {
+    } on ClientError catch (error) {
       final memory = transientState;
       if (memory == null ||
-          (error.code != 'device_storage_unavailable' &&
-              error.code != 'device_storage_full')) {
+          (error.code != 'failed_precondition' &&
+              error.code != 'resource_exhausted')) {
         rethrow;
       }
       return memory;
@@ -147,7 +147,7 @@ final class NativeDeviceStore extends DeviceStore {
           root: _root,
         );
         if (recoveryReadInvalidated(current)) return null;
-      } on ClientException {
+      } on ClientError {
         return super.read();
       }
     }
@@ -166,7 +166,7 @@ final class NativeDeviceStore extends DeviceStore {
     }
     if (next.generation != expected.generation + 1 ||
         next.authGeneration < expected.authGeneration) {
-      throw const ClientException('session_changed');
+      throw const ClientError('internal');
     }
     return _files.locked(directory, (dir) async {
       if (!identical(memory, transientState)) return false;
@@ -189,7 +189,7 @@ final class NativeDeviceStore extends DeviceStore {
   Future<DeviceState?> claimRefresh(SessionCredentials expected) async {
     await load();
     if (transientState != null) {
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     return super.claimRefresh(expected);
   }
@@ -197,7 +197,7 @@ final class NativeDeviceStore extends DeviceStore {
   Future<bool> _commitPersistent(DeviceState expected, DeviceState next) {
     requireAvailable();
     if (!Platform.isMacOS && !Platform.isLinux) {
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     return _files.locked(directory, (dir) async {
       final current = _load(dir);
@@ -208,7 +208,7 @@ final class NativeDeviceStore extends DeviceStore {
       }
       if (next.generation != current.generation + 1 ||
           next.authGeneration < current.authGeneration) {
-        throw const ClientException('session_changed');
+        throw const ClientError('internal');
       }
       next = prepareWrite(next);
       _write(dir, current, next);
@@ -225,14 +225,14 @@ final class NativeDeviceStore extends DeviceStore {
       );
       finishRecovery(current);
       lastPersistentState = next;
-    } on ClientException {
+    } on ClientError {
       uncertainWrite = next;
       if (consumedAttemptEmails.isNotEmpty) {
         try {
           recoveryWasApplied(_load(dir));
-        } on ClientException catch (error) {
-          if (error.code != 'device_storage_unavailable' &&
-              error.code != 'device_storage_full') {
+        } on ClientError catch (error) {
+          if (error.code != 'failed_precondition' &&
+              error.code != 'resource_exhausted') {
             rethrow;
           }
         }

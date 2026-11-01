@@ -18,7 +18,7 @@ bool _safeIntegers(DeviceState state) => [
 
 DeviceStore openDevice(DeviceScope scope, Persist? persist) {
   if (persist?.directory != null) {
-    throw const ClientException('device_storage_unavailable');
+    throw const ClientError('failed_precondition');
   }
   return WebDeviceStore(scope);
 }
@@ -35,7 +35,7 @@ final class WebDeviceStore extends DeviceStore {
     try {
       value = web.window.localStorage.getItem(coordinationKey);
     } catch (_) {
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     if (value == null) {
       final state = DeviceState();
@@ -46,14 +46,14 @@ final class WebDeviceStore extends DeviceStore {
     }
     try {
       if (utf8.encode(value).length > devicePayloadLimit) {
-        throw const ClientException('device_storage_corrupt');
+        throw const ClientError('data_loss');
       }
       final envelope = jsonDecode(value);
       if (envelope is! Map<String, Object?> || envelope['version'] is! int) {
-        throw const ClientException('device_storage_corrupt');
+        throw const ClientError('data_loss');
       }
       if ((envelope['version']! as int) > 1) {
-        throw const ClientException('device_storage_version_unsupported');
+        throw const ClientError('unimplemented');
       }
       final auth = envelope['auth'];
       if (envelope['version'] != 1 ||
@@ -64,19 +64,19 @@ final class WebDeviceStore extends DeviceStore {
           auth['refresh_id'] != null ||
           auth['auth_transition_id'] != null ||
           auth['auth_transition_unknown'] != false) {
-        throw const ClientException('device_storage_corrupt');
+        throw const ClientError('data_loss');
       }
       final state = DeviceState.fromJson(auth);
       if (state.attempts.length > deviceAttemptLimit || !_safeIntegers(state)) {
-        throw const ClientException('device_storage_corrupt');
+        throw const ClientError('data_loss');
       }
       _rawValues[state] = value;
       if (transientState == null) lastPersistentState = state;
       return state;
-    } on ClientException {
+    } on ClientError {
       rethrow;
     } catch (_) {
-      throw const ClientException('device_storage_corrupt');
+      throw const ClientError('data_loss');
     }
   }
 
@@ -94,9 +94,10 @@ final class WebDeviceStore extends DeviceStore {
         }
         if (transientState == null) return lastPersistentState!;
       }
-    } on ClientException catch (error) {
-      if (error.code != 'device_storage_unavailable' &&
-          error.code != 'device_storage_full') {
+    } on ClientError catch (error) {
+      if (blocked ||
+          (error.code != 'failed_precondition' &&
+              error.code != 'resource_exhausted')) {
         rethrow;
       }
     }
@@ -110,8 +111,8 @@ final class WebDeviceStore extends DeviceStore {
       try {
         final current = _loadPersistent();
         if (recoveryReadInvalidated(current)) return null;
-      } on ClientException catch (error) {
-        if (error.code != 'device_storage_unavailable') rethrow;
+      } on ClientError catch (error) {
+        if (error.code != 'failed_precondition') rethrow;
       }
     }
     return super.read();
@@ -125,7 +126,7 @@ final class WebDeviceStore extends DeviceStore {
         next.authTransitionId != null ||
         next.refreshSent ||
         next.authTransitionUnknown) {
-      throw const ClientException('unsupported_auth_transport');
+      throw const ClientError('unimplemented');
     }
     final memory = transientState;
     if (memory == null) return _commitPersistent(expected, next);
@@ -136,7 +137,7 @@ final class WebDeviceStore extends DeviceStore {
     }
     if (next.generation != expected.generation + 1 ||
         next.authGeneration < expected.authGeneration) {
-      throw const ClientException('session_changed');
+      throw const ClientError('internal');
     }
     final current = _loadPersistent();
     final recovered = reconcileRecovery(current, next);
@@ -156,11 +157,11 @@ final class WebDeviceStore extends DeviceStore {
     }
     if (next.generation != current.generation + 1 ||
         next.authGeneration < current.authGeneration) {
-      throw const ClientException('session_changed');
+      throw const ClientError('internal');
     }
     next = prepareWrite(next);
     if (!_safeIntegers(next)) {
-      throw const ClientException('device_storage_full');
+      throw const ClientError('resource_exhausted');
     }
     final encoded = jsonEncode(bundle(next));
     try {
@@ -172,9 +173,9 @@ final class WebDeviceStore extends DeviceStore {
         final base = lastPersistentState;
         try {
           recoveryWasApplied(_loadPersistent());
-        } on ClientException catch (error) {
-          if (error.code != 'device_storage_unavailable' &&
-              error.code != 'device_storage_full') {
+        } on ClientError catch (error) {
+          if (error.code != 'failed_precondition' &&
+              error.code != 'resource_exhausted') {
             rethrow;
           }
         } finally {
@@ -183,9 +184,9 @@ final class WebDeviceStore extends DeviceStore {
       }
       if (error.isA<web.DOMException>() &&
           (error as web.DOMException).name == 'QuotaExceededError') {
-        throw const ClientException('device_storage_full');
+        throw const ClientError('resource_exhausted');
       }
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     finishRecovery(current);
     lastPersistentState = next;

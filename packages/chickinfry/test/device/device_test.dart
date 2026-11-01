@@ -75,11 +75,7 @@ void main() {
         ),
       ),
       throwsA(
-        isA<ClientException>().having(
-          (e) => e.code,
-          'code',
-          'device_storage_full',
-        ),
+        isA<ClientError>().having((e) => e.code, 'code', 'resource_exhausted'),
       ),
     );
     expect((await store.load()).generation, 1);

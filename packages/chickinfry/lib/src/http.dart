@@ -44,7 +44,7 @@ final class HttpTransport implements ClientTransport {
     }
     final normalized = normalizeOrigin(origin);
     if (timeout <= Duration.zero) {
-      throw ArgumentError('Timeout must be positive.');
+      throw const ClientError('invalid_argument');
     }
     return HttpTransport._(
       normalized,
@@ -75,10 +75,10 @@ final class HttpTransport implements ClientTransport {
   /// withBearer returns an independent authentication context sharing this connection.
   HttpTransport withBearer(String token) {
     if (!platform.isNative) {
-      throw const ClientException('unsupported_auth_transport');
+      throw const ClientError('unimplemented');
     }
     if (!tokenPattern.hasMatch(token)) {
-      throw const ClientException('invalid_token');
+      throw const ClientError('invalid_argument');
     }
     return HttpTransport._(origin, timeout, _client, false, token, null);
   }
@@ -86,11 +86,13 @@ final class HttpTransport implements ClientTransport {
   /// withSession reads fresh credentials for every call to this origin.
   HttpTransport withSession(SessionStore store) {
     if (!platform.isNative) {
-      throw const ClientException('unsupported_auth_transport');
+      throw const ClientError('unimplemented');
     }
-    if (normalizeOrigin(store.origin) != origin ||
-        store.coordinationKey.isEmpty) {
-      throw const ClientException('invalid_origin');
+    if (normalizeOrigin(store.origin) != origin) {
+      throw const ClientError('failed_precondition');
+    }
+    if (store.coordinationKey.isEmpty) {
+      throw const ClientError('invalid_argument');
     }
     return HttpTransport._(origin, timeout, _client, false, null, store);
   }
@@ -111,19 +113,19 @@ final class HttpTransport implements ClientTransport {
       if (barrier != null) await barrier;
     }
     if (!platform.isSupported) {
-      throw const ClientException('unsupported_platform');
+      throw const ClientError('unimplemented');
     }
     if (!_operationPattern.hasMatch(operation)) {
-      throw const ClientException('invalid_input');
+      throw const ClientError('invalid_argument');
     }
     final Uint8List body;
     try {
       body = Uint8List.fromList(utf8.encode(jsonEncode(input)));
     } catch (_) {
-      throw const ClientException('invalid_input');
+      throw const ClientError('invalid_argument');
     }
     if (body.length > 4 * 1024 * 1024) {
-      throw const ClientException('request_too_large');
+      throw const ClientError('resource_exhausted');
     }
     final store = _store;
     final credentials = store == null ? null : await _read(store);
@@ -136,7 +138,7 @@ final class HttpTransport implements ClientTransport {
     if (operation == 'auth.refresh' && store is DeviceStore) {
       if (credentials == null ||
           input['refresh_token'] != credentials.refreshToken) {
-        throw const ClientException('session_changed');
+        throw const ClientError('unauthenticated');
       }
       return (await _refresh(store, credentials)).toJson();
     }
@@ -164,14 +166,16 @@ final class HttpTransport implements ClientTransport {
           store == null ||
           credentials == null ||
           error.status != 401 ||
-          error.code != 'invalid_token' ||
-          (_uncertain[(origin, store.coordinationKey)]?.contains(credentials) ??
-              false)) {
+          error.code != 'invalid_token') {
         rethrow;
+      }
+      if (_uncertain[(origin, store.coordinationKey)]?.contains(credentials) ??
+          false) {
+        throw const ClientError('unauthenticated');
       }
       final refreshed = await _refresh(store, credentials);
       final latest = await _read(store);
-      if (latest != refreshed) throw const ClientException('session_changed');
+      if (latest != refreshed) throw const ClientError('failed_precondition');
       return _send(operation, body, refreshed.accessToken);
     }
   }
@@ -181,16 +185,15 @@ final class HttpTransport implements ClientTransport {
       return store is DeviceStore
           ? await store.waitForSession(timeout)
           : await store.read();
-    } on ClientException catch (error) {
-      if (error.code == 'invalid_session_record' ||
-          (store is DeviceStore &&
-              (error.code.startsWith('device_storage_') ||
-                  error.code == 'session_changed'))) {
+    } on ClientError catch (error) {
+      if (error.code == 'invalid_argument' ||
+          error.code == 'data_loss' ||
+          store is DeviceStore) {
         rethrow;
       }
-      throw const ClientException('session_storage_error');
+      throw const ClientError('failed_precondition');
     } catch (_) {
-      throw const ClientException('session_storage_error');
+      throw const ClientError('failed_precondition');
     }
   }
 
@@ -202,13 +205,13 @@ final class HttpTransport implements ClientTransport {
   }) async {
     try {
       return await store.compareAndSet(expected, next);
-    } on ClientException catch (error) {
-      if (store is DeviceStore && error.code.startsWith('device_storage_')) {
-        throw ClientException(error.code, operationError: failure);
+    } on ClientError catch (error) {
+      if (store is DeviceStore) {
+        throw ClientError(error.code, operationError: failure);
       }
-      throw ClientException('session_storage_error', operationError: failure);
+      throw ClientError('failed_precondition', operationError: failure);
     } catch (_) {
-      throw ClientException('session_storage_error', operationError: failure);
+      throw ClientError('failed_precondition', operationError: failure);
     }
   }
 
@@ -260,8 +263,9 @@ final class HttpTransport implements ClientTransport {
     SessionCredentials expected,
   ) async {
     final latest = await _read(store);
-    if (latest == null || !_sameSession(latest, expected)) {
-      throw const ClientException('session_changed');
+    if (latest == null) throw const ClientError('unauthenticated');
+    if (!_sameSession(latest, expected)) {
+      throw const ClientError('failed_precondition');
     }
     if (latest != expected) return latest;
     DeviceState? claimed;
@@ -272,7 +276,7 @@ final class HttpTransport implements ClientTransport {
         if (winner == null ||
             !_sameSession(winner, expected) ||
             winner == expected) {
-          throw const ClientException('session_changed');
+          throw const ClientError('failed_precondition');
         }
         return winner;
       }
@@ -288,11 +292,11 @@ final class HttpTransport implements ClientTransport {
       final SessionCredentials refreshed;
       try {
         refreshed = SessionCredentials.fromJson(value);
-      } on ClientException {
-        throw const ClientException('invalid_response');
+      } on ClientError {
+        throw const ClientError('internal');
       }
       if (!_sameSession(refreshed, expected)) {
-        throw const ClientException('invalid_response');
+        throw const ClientError('internal');
       }
       if (conformanceEnabled) {
         currentConformanceCall?.refreshObservation?.credentialsValidated = true;
@@ -301,7 +305,7 @@ final class HttpTransport implements ClientTransport {
           ? await store.finishRefresh(claimed!, refreshed)
           : await _replace(store, expected, refreshed);
       if (!saved) {
-        throw const ClientException('session_changed');
+        throw const ClientError('failed_precondition');
       }
       confirmed = true;
       if (conformanceEnabled) {
@@ -317,8 +321,8 @@ final class HttpTransport implements ClientTransport {
         if (store is DeviceStore) {
           try {
             await store.finishRefresh(claimed!, null);
-          } on ClientException catch (failure) {
-            throw ClientException(failure.code, operationError: error);
+          } on ClientError catch (failure) {
+            throw ClientError(failure.code, operationError: error);
           }
         } else {
           await _replace(store, expected, null, failure: error);
@@ -377,7 +381,7 @@ final class HttpTransport implements ClientTransport {
                 currentConformanceCall?.httpObservation?.requestCancel();
               }
               if (!abort.isCompleted) abort.complete();
-              throw const ClientException('request_timeout');
+              throw const ClientError('deadline_exceeded');
             },
           );
       status = response.statusCode;
@@ -399,7 +403,7 @@ final class HttpTransport implements ClientTransport {
         if (conformanceEnabled) {
           currentConformanceCall?.httpObservation?.closeReader();
         }
-        throw OperationError('redirect_not_allowed', status);
+        throw ClientError('internal', status: status);
       }
       // Dart pins da6595cd6bb5d4c0a185d759a025e879ff06e631 (3.13.0) and
       // 04bcd1036cdc799ac6564988f159ee454d42c822 (3.13.5):
@@ -421,7 +425,7 @@ final class HttpTransport implements ClientTransport {
             currentConformanceCall?.httpObservation?.requestCancel();
           }
           if (!abort.isCompleted) abort.complete();
-          throw ClientException('response_too_large', status: status);
+          throw ClientError('resource_exhausted', status: status);
         }
         bytes.add(Uint8List.fromList(chunk));
         if (conformanceEnabled) {
@@ -441,15 +445,22 @@ final class HttpTransport implements ClientTransport {
       if (status < 200 || status >= 300) {
         final code = value is Map<String, Object?> ? value['error'] : null;
         if (code is! String || !_errorPattern.hasMatch(code)) {
-          throw ClientException('invalid_response', status: status);
+          throw ClientError('internal', status: status);
         }
         if (conformanceEnabled) {
           currentConformanceCall?.httpObservation?.responseConfirmed = true;
         }
-        throw OperationError(code, status);
+        throw OperationError(
+          code,
+          status,
+          responseMessage:
+              value is Map<String, Object?> && value['message'] is String
+              ? value['message']! as String
+              : null,
+        );
       }
       if (value is! Map<String, Object?>) {
-        throw ClientException('invalid_response', status: status);
+        throw ClientError('internal', status: status);
       }
       if (conformanceEnabled) {
         currentConformanceCall?.httpObservation?.completed = true;
@@ -457,13 +468,13 @@ final class HttpTransport implements ClientTransport {
       return value;
     } on OperationError {
       rethrow;
-    } on ClientException {
+    } on ClientError {
       rethrow;
     } on FormatException {
-      throw ClientException('invalid_response', status: status);
+      throw ClientError('internal', status: status);
     } catch (_) {
-      throw ClientException(
-        timedOut ? 'request_timeout' : 'network_error',
+      throw ClientError(
+        timedOut ? 'deadline_exceeded' : 'unavailable',
         status: status,
       );
     } finally {

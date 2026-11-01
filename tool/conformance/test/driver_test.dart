@@ -978,7 +978,7 @@ void main() {
       );
       call.httpAttempts = 1;
       final error = observation.sdkError(
-        const ClientException('network_error'),
+        const ClientError('unavailable'),
         call,
         driver.credentials,
       );
@@ -993,7 +993,7 @@ void main() {
       expect(
         observation
             .sdkError(
-              const ClientException('network_error'),
+              const ClientError('unavailable'),
               call,
               driver.credentials,
               construction: true,
@@ -1006,14 +1006,33 @@ void main() {
       expect(error['outcomeUnknown'], null);
       expect(error['rawTransportDetails'], false);
       for (final failure in [
-        const ClientException('network_error', status: 200),
-        const ClientException('unrecognized_code'),
+        const ClientError('unavailable', status: 200),
+        const ClientError('unrecognized_code'),
         const OperationError('denied', 403),
       ]) {
         final payload = observation.sdkError(failure, call, driver.credentials);
         expect(payload.keys.toSet(), sdkFields);
         expect(payload['rawTransportDetails'], false);
       }
+      call.httpObservation = ConformanceHttpAttempt(call, 'probe.echo')
+        ..status = 401;
+      expect(
+        observation.sdkError(
+          const ClientError('unauthenticated'),
+          call,
+          driver.credentials,
+        )['httpStatus'],
+        isNull,
+      );
+      expect(
+        observation.sdkError(
+          const ClientError('deadline_exceeded', status: 200),
+          call,
+          driver.credentials,
+        )['httpStatus'],
+        200,
+      );
+      call.httpObservation = null;
       driver.credentials.register('protected', 's' * 43);
       final protectedFailure = OperationError(
         driver.credentials.value('protected'),
@@ -1021,7 +1040,7 @@ void main() {
       );
       expect(driver.credentials.exposes(protectedFailure.toString()), true);
       for (final failure in [
-        const ClientException('network_error SocketException: peer marker'),
+        const ClientError('network_error SocketException: peer marker'),
         const OperationError('Denied', 403),
         const OperationError('denied detail', 403),
         const OperationError('denied1', 403),

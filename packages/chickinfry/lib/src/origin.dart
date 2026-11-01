@@ -10,7 +10,7 @@ String normalizeOrigin(String value) {
     // Uri parsing removes dot paths and decodes hosts before validation.
     final match = _originPattern.firstMatch(value);
     if (match == null || match.end != value.length) {
-      throw const ClientException('invalid_origin');
+      throw const ClientError('invalid_argument');
     }
     final uri = Uri.parse(value);
     final host = uri.host;
@@ -36,12 +36,12 @@ String normalizeOrigin(String value) {
         (uri.path.isNotEmpty && uri.path != '/') ||
         uri.port <= 0 ||
         uri.port > 65535) {
-      throw const ClientException('invalid_origin');
+      throw const ClientError('invalid_argument');
     }
     return uri.origin;
-  } on ClientException {
+  } on ClientError {
     rethrow;
   } catch (_) {
-    throw const ClientException('invalid_origin');
+    throw const ClientError('invalid_argument');
   }
 }

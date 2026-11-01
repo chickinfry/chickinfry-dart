@@ -133,12 +133,12 @@ void main() {
     ]) {
       await expectLater(
         transport.invoke(name, {}),
-        throwsA(clientFailure('invalid_input')),
+        throwsA(clientFailure('invalid_argument')),
       );
     }
     await expectLater(
       transport.invoke('thing.get', {'value': Object()}),
-      throwsA(clientFailure('invalid_input')),
+      throwsA(clientFailure('invalid_argument')),
     );
     expect(peer.requests, 1);
   });
@@ -198,7 +198,7 @@ void main() {
     ]) {
       expect(
         () => withConformanceCall(call, () => HttpTransport(origin)),
-        throwsA(clientFailure('invalid_origin')),
+        throwsA(clientFailure('invalid_argument')),
         reason: 'Must reject the invalid origin $origin.',
       );
     }
@@ -210,11 +210,11 @@ void main() {
           Record(credentials()),
         ),
       ),
-      throwsA(clientFailure('invalid_origin')),
+      throwsA(clientFailure('failed_precondition')),
     );
     expect(
       () => HttpTransport('https://example.com', timeout: Duration.zero),
-      throwsArgumentError,
+      throwsA(clientFailure('invalid_argument')),
     );
     if (conformanceEnabled) {
       expect(constructions.where((event) => event.succeeded), isNotEmpty);
@@ -250,7 +250,7 @@ void main() {
             beforeSend,
             () => refused.invoke('thing.write', {}),
           ),
-          throwsA(clientFailure('network_error')),
+          throwsA(clientFailure('unavailable')),
         );
         expect(beforeSend.httpObservation!.socketBytesWritten, 0);
         expect(beforeSend.httpObservation!.outcomeUnknown, isFalse);
@@ -281,7 +281,7 @@ void main() {
               'data': 'x' * (4 * 1024 * 1024 - 512),
             }),
           ),
-          throwsA(clientFailure('network_error')),
+          throwsA(clientFailure('unavailable')),
         );
         expect(received, greaterThan(0));
         expect(sent.httpObservation!.socketBytesWritten, greaterThan(0));
@@ -303,11 +303,11 @@ void main() {
           withConformanceCall(invalid, () async {
             final value = await transport.invoke('thing.write', {});
             if (value is! Map<String, Object?> || value['id'] is! String) {
-              throw const ClientException('invalid_response');
+              throw const ClientError('internal');
             }
             return value['id'];
           }),
-          throwsA(clientFailure('invalid_response')),
+          throwsA(clientFailure('internal')),
         );
         expect(peer.requests, 1);
         expect(invalid.httpObservation!.status, 200);
@@ -571,13 +571,13 @@ void main() {
       for (final token in ['', 'bad', '$accessToken\n']) {
         expect(
           () => root.withBearer(token),
-          throwsA(clientFailure('invalid_token')),
+          throwsA(clientFailure('invalid_argument')),
         );
       }
       root.close();
       await expectLater(
         signed.invoke('thing.get', {}),
-        throwsA(clientFailure('network_error')),
+        throwsA(clientFailure('failed_precondition')),
       );
       expect(peer.requests, 2);
     },
@@ -601,7 +601,7 @@ void main() {
       for (var i = 0; i < 4; i++) {
         await expectLater(
           transport.invoke('thing.get', {}),
-          throwsA(clientFailure('invalid_response', status: 200)),
+          throwsA(clientFailure('internal', status: 200)),
         );
       }
     },
@@ -633,64 +633,102 @@ void main() {
   );
 
   test(
-    'C-06 malformed error envelopes become invalid_response with status',
+    'C-06 received descriptions preserve absent null and empty string',
     () async {
-      final bodies = [
-        '<html>private-detail</html>',
-        '',
-        '{}',
-        '{"error":null}',
-        '{"error":42}',
-        '{"error":"Not.Valid"}',
+      final descriptions = <Map<String, Object?>>[
+        {},
+        {'message': null},
+        {'message': ''},
+        {'message': 'received description'},
+        {'message': 42},
       ];
       final peer = await Peer.start((request) async {
         await request.drain<void>();
-        request.response.statusCode = 503;
-        request.response.write(bodies.removeAt(0));
-        await request.response.close();
+        await reply(request, {
+          'error': 'future_server_error',
+          ...descriptions.removeAt(0),
+        }, status: 503);
       });
       final transport = peer.transport();
-      for (var i = 0; i < 6; i++) {
+      for (final expected in [null, null, '', 'received description', null]) {
         await expectLater(
           transport.invoke('thing.get', {}),
-          throwsA(clientFailure('invalid_response', status: 503)),
+          throwsA(
+            isA<OperationError>()
+                .having((error) => error.code, 'code', 'future_server_error')
+                .having((error) => error.status, 'status', 503)
+                .having(
+                  (error) => error.responseMessage,
+                  'responseMessage',
+                  expected,
+                )
+                .having(
+                  (error) => error.toString().contains('received description'),
+                  'description exposed',
+                  false,
+                ),
+          ),
         );
       }
     },
   );
 
+  test('C-06 malformed error envelopes become internal with status', () async {
+    final bodies = [
+      '<html>private-detail</html>',
+      '',
+      '{}',
+      '{"error":null}',
+      '{"error":42}',
+      '{"error":"Not.Valid"}',
+    ];
+    final peer = await Peer.start((request) async {
+      await request.drain<void>();
+      request.response.statusCode = 503;
+      request.response.write(bodies.removeAt(0));
+      await request.response.close();
+    });
+    final transport = peer.transport();
+    for (var i = 0; i < 6; i++) {
+      await expectLater(
+        transport.invoke('thing.get', {}),
+        throwsA(clientFailure('internal', status: 503)),
+      );
+    }
+  });
+
   test('error messages render code-specific guidance and generic fallback', () {
     expect(
-      const ClientException('unsupported_platform').toString(),
-      contains('OS secure session storage'),
+      const ClientError('unimplemented').toString(),
+      contains('Use a supported platform'),
     );
     expect(
-      const ClientException('invalid_token').toString(),
-      contains('pass the access token string'),
+      const ClientError('invalid_argument').toString(),
+      contains('Check the origin'),
     );
     expect(
-      const ClientException('invalid_response', status: 503).toString(),
-      contains("check that the origin points to your project's server"),
+      const ClientError('internal', status: 503).toString(),
+      contains('check the server origin'),
     );
     expect(
-      const ClientException('response_too_large', status: 200).toString(),
-      contains('(response_too_large, HTTP 200)'),
+      const ClientError('resource_exhausted', status: 200).toString(),
+      contains('(resource_exhausted, HTTP 200)'),
     );
     expect(
-      const ClientException('network_error').toString(),
+      const ClientError('unavailable').toString(),
       'The request failed before a response arrived; check network '
-      'connectivity and the origin. (network_error)',
+      'connectivity and the origin. (unavailable)',
     );
     expect(
       const OperationError('operation_failed', 500).toString(),
       contains('Handle it by branching on code'),
     );
     expect(
-      const ClientException('future_local_error').toString(),
+      const ClientError('future_local_error').toString(),
       'Client failed (future_local_error).',
     );
     expect(
-      const ClientException('future_local_error', status: 599).toString(),
+      const ClientError('future_local_error', status: 599).toString(),
       'Client failed (future_local_error, HTTP 599).',
     );
   });
@@ -716,11 +754,11 @@ void main() {
         transport.invoke('thing.get', {
           'value': 'a' * (4 * 1024 * 1024 - overhead + 1),
         }),
-        throwsA(clientFailure('request_too_large')),
+        throwsA(clientFailure('resource_exhausted')),
       );
       await expectLater(
         transport.invoke('thing.get', {'value': '\uD55C😀\\\n' * (512 * 1024)}),
-        throwsA(clientFailure('request_too_large')),
+        throwsA(clientFailure('resource_exhausted')),
       );
       expect(lengths, [4 * 1024 * 1024]);
     },
@@ -744,11 +782,11 @@ void main() {
       expect((result['value'] as String).length, 1024 * 1024 - 12);
       await expectLater(
         transport.invoke('thing.get', {}),
-        throwsA(clientFailure('response_too_large', status: 200)),
+        throwsA(clientFailure('resource_exhausted', status: 200)),
       );
       await expectLater(
         transport.invoke('thing.get', {}),
-        throwsA(clientFailure('response_too_large', status: 500)),
+        throwsA(clientFailure('resource_exhausted', status: 500)),
       );
     },
   );
@@ -770,7 +808,7 @@ void main() {
       });
       await expectLater(
         source.transport().withBearer(accessToken).invoke('thing.get', {}),
-        throwsA(operationFailure('redirect_not_allowed', status)),
+        throwsA(clientFailure('internal', status: status)),
       );
       expect(destination.requests, 0);
       expect(source.requests, 1);
@@ -897,7 +935,7 @@ void main() {
       final transport = root.withBearer(accessToken);
       await expectLater(
         transport.invoke('thing.get', {}),
-        throwsA(clientFailure('network_error')),
+        throwsA(clientFailure('unavailable')),
       );
       expect(requests, 0);
       expect(tunnels, 1);
@@ -909,7 +947,7 @@ void main() {
       final watch = Stopwatch()..start();
       await expectLater(
         transport.invoke('thing.get', {}),
-        throwsA(clientFailure('request_timeout')),
+        throwsA(clientFailure('deadline_exceeded')),
       );
       print(
         'Proxy CONNECT: requests=$requests; tunnels=$tunnels; '
@@ -991,7 +1029,7 @@ void main() {
       watch.start();
       await expectLater(
         transport.invoke('thing.get', {}),
-        throwsA(clientFailure('request_timeout')),
+        throwsA(clientFailure('deadline_exceeded')),
       );
       final returnedAt = watch.elapsedMilliseconds;
       final closedAt = await disconnected.future.timeout(
@@ -1011,7 +1049,7 @@ void main() {
       resumeTls = true;
       await expectLater(
         transport.invoke('thing.get', {}),
-        throwsA(clientFailure('network_error')),
+        throwsA(clientFailure('unavailable')),
       );
       SecurityContext.defaultContext.setTrustedCertificates(
         'test/fixtures/ca.pem',
@@ -1076,7 +1114,10 @@ void main() {
               .invoke('thing.write', {})
               .timeout(const Duration(seconds: 1)),
           throwsA(
-            clientFailure('request_timeout', status: headersSent ? 200 : null),
+            clientFailure(
+              'deadline_exceeded',
+              status: headersSent ? 200 : null,
+            ),
           ),
         );
         await disconnected.future.timeout(const Duration(seconds: 2));
@@ -1142,8 +1183,8 @@ void main() {
           ),
           throwsA(
             status == 302
-                ? operationFailure('redirect_not_allowed', status)
-                : clientFailure('response_too_large', status: status),
+                ? clientFailure('internal', status: status)
+                : clientFailure('resource_exhausted', status: status),
           ),
         );
         await disconnected.future.timeout(const Duration(seconds: 2));
@@ -1205,7 +1246,7 @@ void main() {
     });
     await expectLater(
       peer.transport().invoke('thing.write', {}),
-      throwsA(clientFailure('network_error')),
+      throwsA(clientFailure('unavailable')),
     );
     expect(writes, 1);
     expect(peer.requests, 1);
@@ -1224,15 +1265,15 @@ void main() {
     await expectLater(
       peer.transport().invoke('thing.get', {}),
       throwsA(
-        isA<ClientException>()
-            .having((error) => error.code, 'code', 'network_error')
+        isA<ClientError>()
+            .having((error) => error.code, 'code', 'unavailable')
             .having((error) => error.status, 'status', 200)
             .having(
               (error) => error.toString(),
               'message',
               'The connection failed while the response was being read; '
                   'check network connectivity and the origin. '
-                  '(network_error, HTTP 200)',
+                  '(unavailable, HTTP 200)',
             ),
       ),
     );

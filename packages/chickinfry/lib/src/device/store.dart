@@ -43,7 +43,7 @@ final class DeviceScope {
           environment,
         ].any((value) => value.isEmpty || value.length > 320) ||
         !_validScreen(screen)) {
-      throw const ClientException('invalid_input');
+      throw const ClientError('invalid_argument');
     }
   }
   final String app;
@@ -71,7 +71,7 @@ final class DeviceAttempt {
         value['id'] is! String ||
         value['email'] is! String ||
         value['started_at'] is! int) {
-      throw const ClientException('device_storage_corrupt');
+      throw const ClientError('data_loss');
     }
     final result = DeviceAttempt(
       value['id']! as String,
@@ -82,7 +82,7 @@ final class DeviceAttempt {
         result.email.isEmpty ||
         result.email.length > deviceEmailLimit ||
         result.startedAt < 0) {
-      throw const ClientException('device_storage_corrupt');
+      throw const ClientError('data_loss');
     }
     return result;
   }
@@ -144,7 +144,7 @@ final class DeviceState {
                 !_requestId.hasMatch(value['refresh_id']! as String) ||
                 value['refresh_sent'] != true)) ||
         value['attempts'] is! Map<String, Object?>) {
-      throw const ClientException('device_storage_corrupt');
+      throw const ClientError('data_loss');
     }
     try {
       final attempts = (value['attempts']! as Map<String, Object?>).map((
@@ -152,7 +152,7 @@ final class DeviceState {
         entry,
       ) {
         if (!_validScreen(key)) {
-          throw const ClientException('device_storage_corrupt');
+          throw const ClientError('data_loss');
         }
         return MapEntry(key, DeviceAttempt.fromJson(entry));
       });
@@ -163,7 +163,7 @@ final class DeviceState {
               (!_uuid.hasMatch(session.userId) ||
                   !_uuid.hasMatch(session.sessionId))) ||
           (value['refresh_sent'] == true && session == null)) {
-        throw const ClientException('device_storage_corrupt');
+        throw const ClientError('data_loss');
       }
       return DeviceState(
         generation: value['generation']! as int,
@@ -175,8 +175,8 @@ final class DeviceState {
         authTransitionId: value['auth_transition_id'] as String?,
         attempts: attempts,
       );
-    } on ClientException {
-      throw const ClientException('device_storage_corrupt');
+    } on ClientError {
+      throw const ClientError('data_loss');
     }
   }
 }
@@ -257,9 +257,10 @@ abstract class DeviceStore implements SessionStore {
       if (!baseKnown && !identical(await load(), transientState)) return false;
       accepted = await commit(expected, next);
       return accepted;
-    } on ClientException catch (error) {
-      if (error.code != 'device_storage_unavailable' &&
-          error.code != 'device_storage_full') {
+    } on ClientError catch (error) {
+      if (blocked ||
+          (error.code != 'failed_precondition' &&
+              error.code != 'resource_exhausted')) {
         rethrow;
       }
       if (transientState == null && baseKnown) {
@@ -400,7 +401,7 @@ abstract class DeviceStore implements SessionStore {
       lastPersistentState = current;
       if (accountChanged) {
         blocked = true;
-        throw const ClientException('session_changed');
+        throw const ClientError('failed_precondition');
       }
       return current;
     }
@@ -500,7 +501,7 @@ abstract class DeviceStore implements SessionStore {
       attempts: attempts,
     );
     if (recovered.authGeneration < current.authGeneration) {
-      throw const ClientException('session_changed');
+      throw const ClientError('internal');
     }
     if (retain) {
       // An unsaved start mark is not a successful authentication result.
@@ -515,7 +516,7 @@ abstract class DeviceStore implements SessionStore {
   }
 
   void requireAvailable() {
-    if (blocked) throw const ClientException('device_storage_unavailable');
+    if (blocked) throw const ClientError('failed_precondition');
   }
 
   @override
@@ -530,7 +531,7 @@ abstract class DeviceStore implements SessionStore {
         )) {
       return null;
     }
-    if (state.refreshSent) throw const ClientException('session_changed');
+    if (state.refreshSent) throw const ClientError('unauthenticated');
     return state.session;
   }
 
@@ -539,8 +540,8 @@ abstract class DeviceStore implements SessionStore {
     while (true) {
       try {
         return await read();
-      } on ClientException catch (error) {
-        if (error.code != 'session_changed' || elapsed.elapsed >= timeout) {
+      } on ClientError catch (error) {
+        if (error.code != 'unauthenticated' || elapsed.elapsed >= timeout) {
           rethrow;
         }
       }
@@ -565,7 +566,7 @@ abstract class DeviceStore implements SessionStore {
         attempts: current.attempts,
       ),
     )) {
-      throw const ClientException('session_changed');
+      throw const ClientError('failed_precondition');
     }
   }
 
@@ -650,20 +651,20 @@ abstract class DeviceStore implements SessionStore {
   }
 
   Future<void> clear(DeviceState expected) async {
+    final bool saved;
     try {
-      if (!await commit(
+      saved = await commit(
         expected,
         DeviceState(
           generation: expected.generation + 1,
           authGeneration: expected.authGeneration + 1,
         ),
-      )) {
-        throw const ClientException('session_changed');
-      }
-    } on ClientException catch (error) {
-      if (error.code != 'session_changed') blocked = true;
+      );
+    } on ClientError {
+      blocked = true;
       rethrow;
     }
+    if (!saved) throw const ClientError('failed_precondition');
   }
 
   Map<String, Object?> bundle(DeviceState state) => {
@@ -692,7 +693,7 @@ abstract class DeviceStore implements SessionStore {
         next.generation >= _generationLimit ||
         next.attempts.length > deviceAttemptLimit ||
         utf8.encode(jsonEncode(bundle(next))).length > devicePayloadLimit) {
-      throw const ClientException('device_storage_full');
+      throw const ClientError('resource_exhausted');
     }
     return DeviceState.fromJson(next.toJson());
   }

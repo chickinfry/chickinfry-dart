@@ -51,8 +51,8 @@ SessionCredentials credentials({
   sessionId: session,
 );
 
-TypeMatcher<ClientException> clientFailure(String code, {int? status}) =>
-    isA<ClientException>()
+TypeMatcher<ClientError> clientFailure(String code, {int? status}) =>
+    isA<ClientError>()
         .having((error) => error.code, 'code', code)
         .having((error) => error.status, 'status', status);
 

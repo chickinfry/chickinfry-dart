@@ -58,7 +58,7 @@ final class SecureSessionStore implements SessionStore {
       try {
         await _storage.delete(key: coordinationKey);
       } catch (_) {
-        throw const ClientException('session_storage_error');
+        throw const ClientError('failed_precondition');
       }
     } else {
       await _write(next);
@@ -74,10 +74,10 @@ final class SecureSessionStore implements SessionStore {
       // A native backend can return null for an existing non-UTF-8 value.
       present = raw != null || await _storage.containsKey(key: coordinationKey);
     } catch (_) {
-      throw const ClientException('session_storage_error');
+      throw const ClientError('failed_precondition');
     }
     if (raw == null) {
-      if (present) throw const ClientException('invalid_session_record');
+      if (present) throw const ClientError('data_loss');
       return null;
     }
     try {
@@ -86,11 +86,11 @@ final class SecureSessionStore implements SessionStore {
           record['version'] is! int ||
           record['version'] != 1 ||
           record['origin'] != origin) {
-        throw const ClientException('invalid_session_record');
+        throw const ClientError('data_loss');
       }
       return SessionCredentials.fromJson(record);
     } catch (_) {
-      throw const ClientException('invalid_session_record');
+      throw const ClientError('data_loss');
     }
   }
 
@@ -99,7 +99,7 @@ final class SecureSessionStore implements SessionStore {
     try {
       await _storage.write(key: coordinationKey, value: raw);
     } catch (_) {
-      throw const ClientException('session_storage_error');
+      throw const ClientError('failed_precondition');
     }
   }
 
@@ -127,6 +127,6 @@ void _requireNative() {
         TargetPlatform.iOS,
         TargetPlatform.macOS,
       }.contains(defaultTargetPlatform)) {
-    throw const ClientException('unsupported_platform');
+    throw const ClientError('unimplemented');
   }
 }

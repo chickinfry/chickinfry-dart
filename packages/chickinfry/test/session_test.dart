@@ -149,7 +149,7 @@ void main() {
             initiator: false,
           ),
         ).then<Object>((value) => value, onError: (Object error) => error);
-        const error = ClientException('request_timeout');
+        const error = ClientError('deadline_exceeded');
         shared.completeError(error);
         expect(await transport.invoke('thing.get', {}), {'ok': true});
         expect(failureEvents, isEmpty);
@@ -159,7 +159,7 @@ void main() {
             .whereType<ConformanceRefreshEvent>()
             .single;
         expect(observed.flight, same(flight));
-        expect(observed.code, 'request_timeout');
+        expect(observed.code, 'deadline_exceeded');
         expect(observed.status, isNull);
         expect(failureCall.instrumentationFailed, isFalse);
 
@@ -204,7 +204,7 @@ void main() {
         );
         await expectLater(
           withConformanceCall(invalid, () => transport.invoke('invalid', {})),
-          throwsA(clientFailure('invalid_input')),
+          throwsA(clientFailure('invalid_argument')),
         );
         expect(invalidArrivals, hasLength(1));
         expect(invalidArrivals.single.operation, 'invalid');
@@ -271,12 +271,12 @@ void main() {
               ...original.toJson(),
               field: value,
             }),
-            throwsA(clientFailure('invalid_session_record')),
+            throwsA(clientFailure('invalid_argument')),
           );
         }
         expect(
           () => SessionCredentials.fromJson(original.toJson()..remove(field)),
-          throwsA(clientFailure('invalid_session_record')),
+          throwsA(clientFailure('invalid_argument')),
         );
       }
       for (final value in [
@@ -291,7 +291,7 @@ void main() {
             ...original.toJson(),
             'expires_at': value,
           }),
-          throwsA(clientFailure('invalid_session_record')),
+          throwsA(clientFailure('invalid_argument')),
         );
       }
       expect(
@@ -299,7 +299,7 @@ void main() {
           ...original.toJson(),
           'access_token': 'bad',
         }),
-        throwsA(clientFailure('invalid_session_record')),
+        throwsA(clientFailure('invalid_argument')),
       );
     },
   );
@@ -450,11 +450,7 @@ void main() {
         );
         await expectLater(
           withConformanceCall(call, () => transport.invoke('thing.get', {})),
-          throwsA(
-            clientFailure(
-              corrupt ? 'invalid_session_record' : 'session_storage_error',
-            ),
-          ),
+          throwsA(clientFailure(corrupt ? 'data_loss' : 'failed_precondition')),
         );
         expect(peer.requests, 0);
         expect(record.value == credentials(), isTrue);
@@ -963,7 +959,7 @@ void main() {
           ),
           throwsA(
             succeeds
-                ? clientFailure('session_changed')
+                ? clientFailure('failed_precondition')
                 : operationFailure('session_revoked', 401),
           ),
         );
@@ -1004,7 +1000,7 @@ void main() {
               MemorySessionStore(peer.origin, 'already-changed', record),
             )
             .invoke('thing.get', {}),
-        throwsA(clientFailure('session_changed')),
+        throwsA(clientFailure('failed_precondition')),
       );
       expect(refreshes, 0);
       expect(peer.requests, 1);
@@ -1031,7 +1027,7 @@ void main() {
             )
             .invoke('thing.get', {}),
         throwsA(
-          clientFailure('session_storage_error')
+          clientFailure('failed_precondition')
               .having(
                 (error) => error.operationError?.code,
                 'server code',
@@ -1122,11 +1118,11 @@ void main() {
             .transport(timeout: const Duration(milliseconds: 300))
             .withSession(secondStore);
         final failure = switch (kind) {
-          'timeout' => clientFailure('request_timeout'),
-          'connection' => clientFailure('network_error'),
-          'storage' => clientFailure('session_storage_error'),
-          'oversized' => clientFailure('response_too_large', status: 200),
-          'malformed' => clientFailure('invalid_response', status: 200),
+          'timeout' => clientFailure('deadline_exceeded'),
+          'connection' => clientFailure('unavailable'),
+          'storage' => clientFailure('failed_precondition'),
+          'oversized' => clientFailure('resource_exhausted', status: 200),
+          'malformed' => clientFailure('internal', status: 200),
           'rate-limited' => operationFailure('rate_limited', 429),
           _ => operationFailure('operation_failed', 500),
         };
@@ -1229,7 +1225,7 @@ void main() {
             suppressed,
             () => second.invoke('thing.write', {}),
           ),
-          throwsA(operationFailure('invalid_token', 401)),
+          throwsA(clientFailure('unauthenticated')),
         );
         expect(refreshes, 1);
         if (conformanceEnabled) {
@@ -1246,7 +1242,7 @@ void main() {
         );
         await expectLater(
           first.invoke('thing.write', {}),
-          throwsA(clientFailure('invalid_response')),
+          throwsA(clientFailure('internal')),
         );
         expect(refreshes, 2);
       },
@@ -1293,7 +1289,7 @@ void main() {
       );
       final old = expectLater(
         peer.transport().withSession(firstStore).invoke('thing.write', {}),
-        throwsA(clientFailure('network_error')),
+        throwsA(clientFailure('unavailable')),
       );
       await oldStarted.future;
       await secondStore.write(
@@ -1302,13 +1298,13 @@ void main() {
       final newer = peer.transport().withSession(secondStore);
       await expectLater(
         newer.invoke('thing.write', {}),
-        throwsA(clientFailure('session_storage_error')),
+        throwsA(clientFailure('failed_precondition')),
       );
       releaseOld.complete();
       await old;
       await expectLater(
         newer.invoke('thing.write', {}),
-        throwsA(operationFailure('invalid_token', 401)),
+        throwsA(clientFailure('unauthenticated')),
       );
       expect(refreshes, 2);
       expect(
@@ -1349,7 +1345,7 @@ void main() {
                 MemorySessionStore(peer.origin, 'identity-$change', record),
               )
               .invoke('thing.write', {}),
-          throwsA(clientFailure('invalid_response')),
+          throwsA(clientFailure('internal')),
         );
         expect(business, 1);
         expect(record.value == credentials(), isTrue);

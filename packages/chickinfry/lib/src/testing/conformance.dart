@@ -474,12 +474,12 @@ Future<SessionCredentials> observeRefresh(
         flight,
         error is OperationError
             ? error.code
-            : error is ClientException
+            : error is ClientError
             ? error.code
             : null,
         error is OperationError
             ? error.status
-            : error is ClientException
+            : error is ClientError
             ? error.status
             : null,
         _refreshObservations[flight],

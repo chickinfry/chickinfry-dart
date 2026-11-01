@@ -11,39 +11,17 @@ import 'protocol.dart';
 
 // This allowlist is independent of the SDK formatter under test.
 const _clientGuidance = {
-  'unsupported_platform':
-      'Flutter Web and browser targets are not supported yet; browser support '
-      'is planned. Use a native (non-web) platform for now.',
-  'invalid_token':
-      'Invalid bearer token: pass the access token string from your login result '
-      'unchanged.',
-  'invalid_origin':
-      'Invalid origin: pass an https:// origin, or http:// only on a loopback '
-      'address, with no path, query, fragment, or user info.',
-  'invalid_input':
-      'Invalid input: pass an operation name like service.operation and a '
-      'JSON-encodable map.',
-  'request_too_large':
-      'The request body exceeds the 4 MiB limit after JSON encoding; reduce the '
-      'payload or split the call.',
-  'request_timeout':
-      'The request exceeded its deadline; the default is 30 seconds, so pass a '
-      'larger timeout to HttpTransport if the operation needs more time.',
-  'response_too_large':
-      'The response exceeded the 1 MiB limit; change the operation to return '
-      'less data.',
-  'invalid_response':
-      'The server response was not a valid Chickinfry response; check that the '
-      "origin points to your project's server.",
-  'session_storage_error':
-      'The session store failed while reading or writing credentials; check your '
-      'SessionStore implementation and its backing storage.',
-  'session_changed':
-      'The stored session changed during the call; re-read the session and call '
-      'again with the current credentials.',
-  'invalid_session_record':
-      'The stored session record is invalid; clear the stored session and sign '
-      'in again.',
+  'invalid_argument':
+      'Check the origin, operation name, JSON input, timeout, and credentials.',
+  'failed_precondition': 'Check the current session, transport, and session storage before calling again.',
+  'resource_exhausted':
+      'Reduce the request or response size, or free space in session storage.',
+  'deadline_exceeded': 'The request exceeded its deadline; check connectivity or increase the timeout.',
+  'canceled': 'The request was canceled.',
+  'data_loss': 'Stored session data could not be read. Sign out to clear it, then sign in again.',
+  'unimplemented': 'Use a supported platform, authentication transport, and storage version.',
+  'internal': 'The response or client state was invalid; check the server origin and update the SDK.',
+  'unauthenticated': 'Sign in again before making this call.',
 };
 final _errorCode = RegExp(r'^[a-z_]+$');
 
@@ -206,9 +184,6 @@ final class Observation implements ConformanceObserver {
   }) {
     final refresh = events.whereType<ConformanceRefreshEvent>().toList();
     final failedRefresh = refresh.isNotEmpty && refresh.last.code != null;
-    final observedStatus = failedRefresh
-        ? refresh.last.observation?.attempt?.status
-        : call.httpObservation?.status;
     final String? code;
     final int? status;
     final bool? rawDetails;
@@ -224,11 +199,11 @@ final class Observation implements ConformanceObserver {
           _errorCode.stringMatch(code) != code ||
           message != allowed ||
           credentials.exposes(message);
-    } else if (error is ClientException) {
+    } else if (error is ClientError) {
       code = error.code;
-      status = error.status ?? observedStatus;
+      status = error.status;
       final message = error.toString();
-      final guidance = code == 'network_error'
+      final guidance = code == 'unavailable'
           ? error.status == null
                 ? 'The request failed before a response arrived; check network '
                       'connectivity and the origin.'

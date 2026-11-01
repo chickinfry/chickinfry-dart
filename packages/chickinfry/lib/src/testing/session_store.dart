@@ -25,7 +25,7 @@ class MemorySessionStore implements SessionStore {
 
   @override
   Future<SessionCredentials?> read() async {
-    if (record.corrupt) throw const ClientException('invalid_session_record');
+    if (record.corrupt) throw const ClientError('data_loss');
     if (record.failRead) throw StateError('Private storage failure.');
     return record.value;
   }

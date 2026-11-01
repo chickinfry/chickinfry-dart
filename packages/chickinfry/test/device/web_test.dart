@@ -19,7 +19,7 @@ const _prefix = 'chickinfry:device:';
 
 void js(String body) => _function(body.toJS).callAsFunction();
 Matcher local(String code) =>
-    isA<ClientException>().having((e) => e.code, 'code', code);
+    isA<ClientError>().having((e) => e.code, 'code', code);
 Matcher remote(String code) =>
     isA<OperationError>().having((e) => e.code, 'code', code);
 
@@ -124,7 +124,7 @@ void main() {
       await actor.invoke('auth.send_verification_email', {
         'attempt': afterPeer.attempts['peer6']!.id,
       });
-    } on ClientException catch (error) {
+    } on ClientError catch (error) {
       code = error.code;
     }
     final retained =
@@ -138,7 +138,7 @@ void main() {
     String? laterCode;
     try {
       await actor.invoke('auth.session', {});
-    } on ClientException catch (error) {
+    } on ClientError catch (error) {
       laterCode = error.code;
     }
 
@@ -249,7 +249,7 @@ void main() {
     addTearDown(() => js('globalThis.restoreStorage();'));
     await expectLater(
       client.store.load(),
-      throwsA(local('device_storage_unavailable')),
+      throwsA(local('failed_precondition')),
     );
     final pending = await client.invoke('auth.signup', {
       'pending': true,
@@ -282,7 +282,7 @@ void main() {
     addTearDown(() => web.window.localStorage.removeItem('device-quota-fill'));
     await expectLater(
       client.store.commit(before, DeviceState(generation: 1)),
-      throwsA(local('device_storage_full')),
+      throwsA(local('resource_exhausted')),
     );
     final result = await client.invoke('auth.signup', {
       'pending': true,
@@ -318,7 +318,7 @@ void main() {
     addTearDown(() => js('globalThis.restoreStorage();'));
     await expectLater(
       client.invoke('auth.logout', {}),
-      throwsA(local('device_storage_unavailable')),
+      throwsA(local('failed_precondition')),
     );
     expect(client.store.blocked, isTrue);
     js('globalThis.restoreStorage();');
@@ -329,16 +329,13 @@ void main() {
     );
     await expectLater(
       client.invoke('auth.signin', {}),
-      throwsA(local('device_storage_unavailable')),
+      throwsA(local('failed_precondition')),
     );
     expect((await control())['calls'], {'auth.signup': 1, 'auth.logout': 1});
   });
 
   test('disabled persistence never accesses localStorage and directory remains rejected', () async {
-    expect(
-      () => Persist.dir('unused'),
-      throwsA(local('device_storage_unavailable')),
-    );
+    expect(() => Persist.dir('unused'), throwsA(local('failed_precondition')));
     js("""
       const descriptor = Object.getOwnPropertyDescriptor(window, 'localStorage');
       Object.defineProperty(window, 'localStorage', { configurable: true,
@@ -399,24 +396,21 @@ void main() {
           },
         ),
       ),
-      throwsA(local('device_storage_full')),
+      throwsA(local('resource_exhausted')),
     );
     expect(web.window.localStorage.getItem(key) == original, isTrue);
     final envelope = jsonDecode(original) as Map<String, Object?>;
     for (final entry in <(String, String)>[
-      ('{', 'device_storage_corrupt'),
-      (
-        jsonEncode({...envelope, 'version': 2}),
-        'device_storage_version_unsupported',
-      ),
+      ('{', 'data_loss'),
+      (jsonEncode({...envelope, 'version': 2}), 'unimplemented'),
       (
         jsonEncode({
           ...envelope,
           'owner': ['other'],
         }),
-        'device_storage_corrupt',
+        'data_loss',
       ),
-      (' ' * (devicePayloadLimit + 1), 'device_storage_corrupt'),
+      (' ' * (devicePayloadLimit + 1), 'data_loss'),
     ]) {
       web.window.localStorage.setItem(key, entry.$1);
       await expectLater(client.store.load(), throwsA(local(entry.$2)));
@@ -450,10 +444,7 @@ void main() {
         }
         final raw = jsonEncode(envelope);
         web.window.localStorage.setItem(key, raw);
-        await expectLater(
-          client.store.load(),
-          throwsA(local('device_storage_corrupt')),
-        );
+        await expectLater(client.store.load(), throwsA(local('data_loss')));
         expect(web.window.localStorage.getItem(key) == raw, isTrue);
       }
     },
@@ -482,7 +473,7 @@ void main() {
             authGeneration: before.authGeneration + (authLimit ? 1 : 0),
           ),
         ),
-        throwsA(local('device_storage_full')),
+        throwsA(local('resource_exhausted')),
       );
       expect(web.window.localStorage.getItem(key) == raw, isTrue);
     }
@@ -503,7 +494,7 @@ void main() {
           },
         ),
       ),
-      throwsA(local('device_storage_full')),
+      throwsA(local('resource_exhausted')),
     );
     expect(web.window.localStorage.getItem(key) == raw, isTrue);
   });
@@ -1424,8 +1415,8 @@ void main() {
                 } else if (boundary.startsWith('account')) {
                   await actor.invoke('auth.signin', {'account': 'b'});
                 }
-              } on ClientException catch (error) {
-                expect(error.code, 'session_changed');
+              } on ClientError catch (error) {
+                expect(error.code, 'failed_precondition');
                 fenced = true;
               }
               final durable = await device(app: app).store.load();
@@ -1439,11 +1430,8 @@ void main() {
               DeviceState? current;
               try {
                 current = await client.store.load();
-              } on ClientException catch (error) {
-                expect([
-                  'session_changed',
-                  'device_storage_unavailable',
-                ], contains(error.code));
+              } on ClientError catch (error) {
+                expect(error.code, 'failed_precondition');
                 fenced = true;
               }
               final persisted = await device(app: app).store.load();
@@ -1460,11 +1448,8 @@ void main() {
               if (shouldFence) {
                 expect(client.store.blocked, isTrue, reason: reason);
                 expect(persisted.toJson(), durable.toJson(), reason: reason);
-                if (result is ClientException) {
-                  expect([
-                    'session_changed',
-                    'device_storage_unavailable',
-                  ], contains(result.code));
+                if (result is ClientError) {
+                  expect(result.code, 'failed_precondition');
                 } else {
                   expect((result as Map)['accepted'], isTrue);
                   expect(
@@ -1527,7 +1512,7 @@ void main() {
       );
       await expectLater(
         store.commit(current, DeviceState(generation: 2)),
-        throwsA(local('session_changed')),
+        throwsA(local('internal')),
       );
       expect((await store.load()).toJson(), current.toJson());
     },

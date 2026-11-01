@@ -11,11 +11,11 @@ import 'store.dart' show devicePayloadLimit;
 String posixStatSymbol(Abi abi) => switch (abi) {
   Abi.macosX64 => r'fstat$INODE64',
   Abi.macosArm64 || Abi.linuxX64 || Abi.linuxArm64 => 'fstat',
-  _ => throw const ClientException('device_storage_unavailable'),
+  _ => throw const ClientError('failed_precondition'),
 };
 
 Never _rejectStorage(String check) => Error.throwWithStackTrace(
-  const ClientException('device_storage_unavailable'),
+  const ClientError('failed_precondition'),
   StackTrace.fromString('device storage check=$check\n${StackTrace.current}'),
 );
 
@@ -157,10 +157,10 @@ class PosixFiles {
   static final _nonblock = _linux ? 0x800 : 4;
   static const _readwrite = 2;
 
-  Never _failure() => throw ClientException(
+  Never _failure() => throw ClientError(
     _errno().value == 28 || _errno().value == (_linux ? 122 : 69)
-        ? 'device_storage_full'
-        : 'device_storage_unavailable',
+        ? 'resource_exhausted'
+        : 'failed_precondition',
   );
 
   int _open(int parent, String name, int flags, [int mode = 0]) {
@@ -259,7 +259,7 @@ class PosixFiles {
           if (_uidUuid(_uid(), owner) != 0) _failure();
           for (var i = 0; i < 16; i++) {
             if (principal[i] != owner[i]) {
-              throw const ClientException('device_storage_unavailable');
+              throw const ClientError('failed_precondition');
             }
           }
         } finally {
@@ -295,7 +295,7 @@ class PosixFiles {
     if (!path.startsWith('/') ||
         path.contains('\x00') ||
         path.split('/').contains('..')) {
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     var fd = _open(_linux ? -100 : -2, '/', _directory);
     try {
@@ -371,10 +371,10 @@ class PosixFiles {
       acquired = true;
       return await body(dir);
     } on FileSystemException catch (error) {
-      throw ClientException(
+      throw ClientError(
         error.osError?.errorCode == 28
-            ? 'device_storage_full'
-            : 'device_storage_unavailable',
+            ? 'resource_exhausted'
+            : 'failed_precondition',
       );
     } finally {
       try {
@@ -424,7 +424,7 @@ class PosixFiles {
           if (count < 0) _failure();
           if (count == 0) break;
           if (result.length + count > devicePayloadLimit) {
-            throw const ClientException('device_storage_corrupt');
+            throw const ClientError('data_loss');
           }
           result.add(Uint8List.fromList(memory.asTypedList(count)));
         }

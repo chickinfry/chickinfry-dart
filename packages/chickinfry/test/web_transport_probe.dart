@@ -5,8 +5,8 @@ void main() {
   try {
     transport.withBearer('');
     throw StateError('Native authentication was accepted in a browser.');
-  } on ClientException catch (error) {
-    if (error.code != 'unsupported_auth_transport') rethrow;
+  } on ClientError catch (error) {
+    if (error.code != 'unimplemented') rethrow;
   } finally {
     transport.close();
   }

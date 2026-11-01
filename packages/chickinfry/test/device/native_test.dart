@@ -324,7 +324,7 @@ void main() {
         await actor.invoke('auth.send_verification_email', {
           'email': 'a@example.test',
         });
-      } on ClientException catch (error) {
+      } on ClientError catch (error) {
         code = error.code;
       }
       final after = await peerStore.load();
@@ -342,7 +342,7 @@ void main() {
         await actor.invoke('auth.send_verification_email', {
           'email': 'a@example.test',
         });
-      } on ClientException catch (error) {
+      } on ClientError catch (error) {
         laterCode = error.code;
       }
 
@@ -487,16 +487,16 @@ void main() {
             outcome == 'definite failure' ||
             outcome == 'unknown response') {
           final code = switch (outcome) {
-            'mark write fails' => 'device_storage_unavailable',
+            'mark write fails' => 'failed_precondition',
             'definite failure' => 'invalid_credentials',
-            _ => 'network_error',
+            _ => 'unavailable',
           };
           await expectLater(
             response,
             throwsA(
               predicate<Object>(
                 (error) =>
-                    (error is ClientException && error.code == code) ||
+                    (error is ClientError && error.code == code) ||
                     (error is OperationError && error.code == code),
               ),
             ),
@@ -526,10 +526,10 @@ void main() {
             await expectLater(
               client.invoke(operation, {}),
               throwsA(
-                isA<ClientException>().having(
+                isA<ClientError>().having(
                   (error) => error.code,
                   'code',
-                  'device_storage_unavailable',
+                  'failed_precondition',
                 ),
               ),
             );
@@ -654,10 +654,10 @@ void main() {
           await expectLater(
             client.invoke(operation, {}),
             throwsA(
-              isA<ClientException>().having(
+              isA<ClientError>().having(
                 (error) => error.code,
                 'code',
-                'invalid_response',
+                'internal',
               ),
             ),
           );
@@ -872,12 +872,10 @@ void main() {
             ? expectLater(
                 successful,
                 throwsA(
-                  isA<ClientException>().having(
+                  isA<ClientError>().having(
                     (error) => error.code,
                     'code',
-                    earlier == 'corrupt success'
-                        ? 'invalid_response'
-                        : 'network_error',
+                    earlier == 'corrupt success' ? 'internal' : 'unavailable',
                   ),
                 ),
               )
@@ -1066,11 +1064,7 @@ void main() {
       await expectLater(
         blocked.invoke('example.read', {}),
         throwsA(
-          isA<ClientException>().having(
-            (e) => e.code,
-            'code',
-            'session_changed',
-          ),
+          isA<ClientError>().having((e) => e.code, 'code', 'unauthenticated'),
         ),
       );
       expect(sends, 1);
@@ -1111,7 +1105,7 @@ void main() {
       final before = await File('${reader.directory}/auth.json').readAsBytes();
       await expectLater(
         reader.load(),
-        throwsA(isA<ClientException>().having((e) => e.code, 'code', code)),
+        throwsA(isA<ClientError>().having((e) => e.code, 'code', code)),
       );
       final after = await File('${reader.directory}/auth.json').readAsBytes();
       expect(base64Encode(before) == base64Encode(after), isTrue);
@@ -1119,9 +1113,9 @@ void main() {
 
     final envelope = jsonDecode(utf8.decode(original)) as Map<String, Object?>;
     await file.writeAsString(jsonEncode({...envelope, 'version': 2}));
-    await rejects('device_storage_version_unsupported', store);
+    await rejects('unimplemented', store);
     await file.writeAsString('{');
-    await rejects('device_storage_corrupt', store);
+    await rejects('data_loss', store);
     await file.writeAsBytes(original);
     final other = device(root, origin, app: 'other.app');
     await other.load();
@@ -1130,14 +1124,14 @@ void main() {
       '600',
       '${other.directory}/auth.json',
     ], includeParentEnvironment: false);
-    await rejects('device_storage_corrupt', other);
+    await rejects('data_loss', other);
 
     final changed = {
       ...envelope,
       'auth': {'generation': -1},
     };
     await file.writeAsString(jsonEncode(changed));
-    await rejects('device_storage_corrupt', store);
+    await rejects('data_loss', store);
     for (final field in ['auth_transition_id', 'refresh_id']) {
       for (final orphan in [false, true]) {
         await file.writeAsString(
@@ -1152,7 +1146,7 @@ void main() {
             },
           }),
         );
-        await rejects('device_storage_corrupt', store);
+        await rejects('data_loss', store);
       }
     }
     await file.writeAsBytes(original);
@@ -1210,10 +1204,10 @@ void main() {
       await expectLater(
         transport.invoke('example.read', {}),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'device_storage_unavailable',
+            'failed_precondition',
           ),
         ),
       );
@@ -1242,10 +1236,10 @@ void main() {
       await expectLater(
         client.invoke('example.read', {}),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'device_storage_full',
+            'resource_exhausted',
           ),
         ),
       );
@@ -1260,10 +1254,10 @@ void main() {
       await expectLater(
         linked.load(),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'device_storage_unavailable',
+            'failed_precondition',
           ),
         ),
       );
@@ -1276,10 +1270,10 @@ void main() {
       await expectLater(
         store.load(),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'device_storage_unavailable',
+            'failed_precondition',
           ),
         ),
       );
@@ -1291,10 +1285,10 @@ void main() {
       await expectLater(
         store.load(),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'device_storage_unavailable',
+            'failed_precondition',
           ),
         ),
       );
@@ -1577,10 +1571,10 @@ void main() {
         await expectLater(
           actor.invoke('auth.signin', {'email': 'own@example.test'}),
           throwsA(
-            isA<ClientException>().having(
+            isA<ClientError>().having(
               (e) => e.code,
               'code',
-              'device_storage_unavailable',
+              'failed_precondition',
             ),
           ),
         );
@@ -1753,10 +1747,10 @@ void main() {
       await expectLater(
         client.invoke('auth.signup', {'email': 'recovery@example.test'}),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (error) => error.code,
             'code',
-            'device_storage_unavailable',
+            'failed_precondition',
           ),
         ),
       );
@@ -2035,11 +2029,7 @@ void main() {
             await expectLater(
               peerClient.invoke('auth.signin', {'email': 'new@example.test'}),
               throwsA(
-                isA<ClientException>().having(
-                  (e) => e.code,
-                  'code',
-                  'network_error',
-                ),
+                isA<ClientError>().having((e) => e.code, 'code', 'unavailable'),
               ),
             );
             expect((await peer.load()).authTransitionUnknown, isTrue);
@@ -2582,10 +2572,10 @@ void main() {
           await expectLater(
             actor.read(),
             throwsA(
-              isA<ClientException>().having(
+              isA<ClientError>().having(
                 (e) => e.code,
                 'code',
-                'session_changed',
+                'unauthenticated',
               ),
             ),
           );
@@ -2608,7 +2598,7 @@ void main() {
       );
       await expectLater(
         actor.clear(await actor.load()),
-        throwsA(isA<ClientException>()),
+        throwsA(isA<ClientError>()),
       );
       final before = await peer.load();
       await peer.commit(
@@ -2628,10 +2618,10 @@ void main() {
       await expectLater(
         actor.read(),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'device_storage_unavailable',
+            'failed_precondition',
           ),
         ),
       );
@@ -2672,7 +2662,7 @@ void main() {
               'auth_transition_id': randomId().replaceAll('-', ''),
             }),
           ),
-          throwsA(isA<ClientException>()),
+          throwsA(isA<ClientError>()),
         );
         expect(await actor.read() == original, isTrue);
         expect(actor.transientState!.authTransitionUnknown, isFalse);
@@ -2781,10 +2771,10 @@ void main() {
             await expectLater(
               actor.invoke('auth.signin', {'email': 'own@example.test'}),
               throwsA(
-                isA<ClientException>().having(
+                isA<ClientError>().having(
                   (e) => e.code,
                   'code',
-                  'device_storage_unavailable',
+                  'failed_precondition',
                 ),
               ),
             );
@@ -2972,10 +2962,10 @@ void main() {
         expect(
           () => actor.prepareWrite(actor.reconcileRecovery(current, memory)),
           throwsA(
-            isA<ClientException>().having(
+            isA<ClientError>().having(
               (e) => e.code,
               'code',
-              'device_storage_full',
+              'resource_exhausted',
             ),
           ),
         );
@@ -3209,7 +3199,7 @@ void main() {
     await expectLater(
       persistent.read(),
       throwsA(
-        isA<ClientException>().having((e) => e.code, 'code', 'session_changed'),
+        isA<ClientError>().having((e) => e.code, 'code', 'unauthenticated'),
       ),
     );
     files.readUnavailable = false;
@@ -3237,10 +3227,10 @@ void main() {
       await expectLater(
         store.load(),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'device_storage_unavailable',
+            'failed_precondition',
           ),
         ),
       );
@@ -3350,10 +3340,10 @@ void main() {
       await expectLater(
         secondClient.invoke('auth.logout', {}),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'session_changed',
+            'failed_precondition',
           ),
         ),
       );
@@ -3361,10 +3351,10 @@ void main() {
       await expectLater(
         second.read(),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'device_storage_unavailable',
+            'failed_precondition',
           ),
         ),
       );
@@ -3494,10 +3484,10 @@ void main() {
       await expectLater(
         store.load(),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'device_storage_unavailable',
+            'failed_precondition',
           ),
         ),
       );
@@ -3537,10 +3527,10 @@ void main() {
       await expectLater(
         device(inherited, origin).load(),
         throwsA(
-          isA<ClientException>().having(
+          isA<ClientError>().having(
             (e) => e.code,
             'code',
-            'device_storage_unavailable',
+            'failed_precondition',
           ),
         ),
       );
@@ -3566,13 +3556,7 @@ void main() {
       );
       await expectLater(
         reader.load(),
-        throwsA(
-          isA<ClientException>().having(
-            (e) => e.code,
-            'code',
-            'device_storage_corrupt',
-          ),
-        ),
+        throwsA(isA<ClientError>().having((e) => e.code, 'code', 'data_loss')),
       );
       expect(await file.length(), length);
       expect(counter.bytesRead < length, isTrue);
@@ -3645,13 +3629,7 @@ void main() {
               session: current.session,
             ),
           ),
-          throwsA(
-            isA<ClientException>().having(
-              (e) => e.code,
-              'code',
-              'session_changed',
-            ),
-          ),
+          throwsA(isA<ClientError>().having((e) => e.code, 'code', 'internal')),
         );
       }
       expect(
@@ -4178,13 +4156,12 @@ void main() {
 
 class FullFiles extends PosixFiles {
   @override
-  void syncFile(int fd) => throw const ClientException('device_storage_full');
+  void syncFile(int fd) => throw const ClientError('resource_exhausted');
 }
 
 class UnavailableFiles extends PosixFiles {
   @override
-  void syncFile(int fd) =>
-      throw const ClientException('device_storage_unavailable');
+  void syncFile(int fd) => throw const ClientError('failed_precondition');
 }
 
 class FailWrite extends PosixFiles {
@@ -4197,7 +4174,7 @@ class FailWrite extends PosixFiles {
   @override
   Uint8List? read(int dir, String name) {
     if (readUnavailable) {
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     return super.read(dir, name);
   }
@@ -4206,7 +4183,7 @@ class FailWrite extends PosixFiles {
   void syncFile(int fd) {
     if (++writes == at || writeUnavailable) {
       if (blockReadsAfterFailure) readUnavailable = true;
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     super.syncFile(fd);
   }
@@ -4221,7 +4198,7 @@ class FailDirectorySyncOnce extends PosixFiles {
   @override
   Uint8List? read(int dir, String name) {
     if (readUnavailable) {
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     return super.read(dir, name);
   }
@@ -4230,7 +4207,7 @@ class FailDirectorySyncOnce extends PosixFiles {
   void syncDirectory(int fd) {
     if (!failed && ++syncs == at) {
       failed = true;
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     super.syncDirectory(fd);
   }
@@ -4282,7 +4259,7 @@ class UncertainAuthenticationStart extends FailWrite {
     if (failRecoveryThenCleanup) {
       failRecoveryThenCleanup = false;
       failCleanupSync = true;
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     super.syncFile(fd);
   }
@@ -4291,7 +4268,7 @@ class UncertainAuthenticationStart extends FailWrite {
   void syncDirectory(int fd) {
     if (failCleanupSync) {
       failCleanupSync = false;
-      throw const ClientException('device_storage_unavailable');
+      throw const ClientError('failed_precondition');
     }
     super.syncDirectory(fd);
   }

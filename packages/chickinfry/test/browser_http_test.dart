@@ -15,7 +15,7 @@ external int get readerCancels;
 
 const fixtureOrigin = 'http://127.0.0.1:18739';
 
-Matcher local(String code, [int? status]) => isA<ClientException>()
+Matcher local(String code, [int? status]) => isA<ClientError>()
     .having((e) => e.code, 'code', code)
     .having((e) => e.status, 'status', status);
 Matcher remote(String code, int status) => isA<OperationError>()
@@ -66,17 +66,14 @@ void main() {
   test('browser HttpTransport sends JSON through Fetch', () async {
     expect(
       () => HttpTransport('http://localhost:18739'),
-      throwsA(local('invalid_origin')),
+      throwsA(local('invalid_argument')),
     );
     expect(await transport.invoke('thing.echo', {'value': 7}), {'value': 7});
     expect((await control())['boundary'], isTrue);
-    expect(
-      () => transport.withBearer(''),
-      throwsA(local('unsupported_auth_transport')),
-    );
+    expect(() => transport.withBearer(''), throwsA(local('unimplemented')));
     expect(
       () => transport.withSession(_UnreachableStore()),
-      throwsA(local('unsupported_auth_transport')),
+      throwsA(local('unimplemented')),
     );
   });
 
@@ -123,7 +120,7 @@ void main() {
       );
       await expectLater(
         auth.authenticate('auth.refresh', {}),
-        throwsA(local('invalid_input')),
+        throwsA(local('invalid_argument')),
       );
       expect((await control())['calls'], {'auth.signup': 1, 'auth.session': 1});
     },
@@ -134,7 +131,7 @@ void main() {
       await control({'mismatch': field});
       await expectLater(
         auth.authenticate('auth.identity', {'account': 'a'}),
-        throwsA(local('session_changed')),
+        throwsA(local('failed_precondition')),
       );
       expect((await auth.session()).id, 'a');
     }
@@ -171,7 +168,7 @@ void main() {
     expect((await auth.session()).id, 'a');
   });
 
-  test('all manual redirects preserve opaque status and never reach either destination', () async {
+  test('all manual redirects keep opaque status absent and never reach either destination', () async {
     await auth.authenticate('auth.signin', {'account': 'a'});
     for (final status in [301, 302, 303, 307, 308]) {
       for (final external in [false, true]) {
@@ -180,7 +177,7 @@ void main() {
             'status': status,
             'external': external,
           }),
-          throwsA(remote('redirect_not_allowed', 0)),
+          throwsA(local('internal')),
         );
       }
     }
@@ -195,20 +192,20 @@ void main() {
       final input = {'data': 'x' * (4 * 1024 * 1024 - 11)};
       await expectLater(
         transport.invoke('thing.echo', input),
-        throwsA(local('response_too_large', 200)),
+        throwsA(local('resource_exhausted', 200)),
       );
       input['data'] = '${input['data']}x';
       await expectLater(
         transport.invoke('thing.echo', input),
-        throwsA(local('request_too_large')),
+        throwsA(local('resource_exhausted')),
       );
       await expectLater(
         transport.invoke('invalid/name', {}),
-        throwsA(local('invalid_input')),
+        throwsA(local('invalid_argument')),
       );
       await expectLater(
         transport.invoke('thing.echo', {'bad': Object()}),
-        throwsA(local('invalid_input')),
+        throwsA(local('invalid_argument')),
       );
       expect((await control())['calls'], {'thing.echo': 1});
     },
@@ -221,7 +218,7 @@ void main() {
     final cancellations = readerCancels;
     await expectLater(
       transport.invoke('thing.bytes', {'size': 1024 * 1024 + 1}),
-      throwsA(local('response_too_large', 200)),
+      throwsA(local('resource_exhausted', 200)),
     );
     expect(readerCancels, cancellations + 1);
   });
@@ -236,7 +233,7 @@ void main() {
     final watch = Stopwatch()..start();
     await expectLater(
       short.invoke('thing.slow', {}),
-      throwsA(local('request_timeout', 200)),
+      throwsA(local('deadline_exceeded', 200)),
     );
     expect(watch.elapsed, lessThan(const Duration(seconds: 2)));
     expect(readerCancels, cancellations + 1);
@@ -247,21 +244,21 @@ void main() {
       final status = body == '{}' || body.contains('error') ? 503 : 200;
       await expectLater(
         transport.invoke('thing.invalid', {'body': body, 'status': status}),
-        throwsA(local('invalid_response', status)),
+        throwsA(local('internal', status)),
       );
     }
     await expectLater(
       transport.invoke('thing.invalid', {'utf8': false}),
-      throwsA(local('invalid_response', 200)),
+      throwsA(local('internal', 200)),
     );
     await expectLater(
       transport.invoke('thing.cors', {}),
-      throwsA(local('network_error')),
+      throwsA(local('unavailable')),
     );
     final closed = HttpTransport(fixtureOrigin)..close();
     await expectLater(
       closed.invoke('thing.echo', {}),
-      throwsA(local('network_error')),
+      throwsA(local('failed_precondition')),
     );
   });
 

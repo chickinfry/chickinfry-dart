@@ -20,7 +20,7 @@ SessionCredentials credentials({String token = 'a', String user = 'user'}) =>
     );
 
 Matcher failure(String code) =>
-    isA<ClientException>().having((error) => error.code, 'code', code);
+    isA<ClientError>().having((error) => error.code, 'code', code);
 
 class StoragePeer {
   final records = <String, String>{};
@@ -80,7 +80,7 @@ void main() {
         for (final origin in ['https://api.example.com', 'invalid']) {
           expect(
             () => SecureSessionStore(origin),
-            throwsA(failure('unsupported_platform')),
+            throwsA(failure('unimplemented')),
           );
         }
         expect(peer.calls, isEmpty);
@@ -117,7 +117,7 @@ void main() {
     ]) {
       expect(
         () => SecureSessionStore(origin),
-        throwsA(failure('invalid_origin')),
+        throwsA(failure('invalid_argument')),
       );
     }
     expect(peer.calls, isEmpty);
@@ -129,21 +129,15 @@ void main() {
       final store = SecureSessionStore('https://api.example.com');
       await store.write(credentials());
       peer.returnNull = true;
-      await expectLater(
-        store.read(),
-        throwsA(failure('invalid_session_record')),
-      );
+      await expectLater(store.read(), throwsA(failure('data_loss')));
       await expectLater(
         store.compareAndSet(credentials(), null),
-        throwsA(failure('invalid_session_record')),
+        throwsA(failure('data_loss')),
       );
       expect(peer.records, hasLength(1));
       expect(peer.count('delete'), 0);
       peer.failMethod = 'containsKey';
-      await expectLater(
-        store.read(),
-        throwsA(failure('session_storage_error')),
-      );
+      await expectLater(store.read(), throwsA(failure('failed_precondition')));
       expect(peer.count('delete'), 0);
     },
   );
@@ -190,13 +184,10 @@ void main() {
     ];
     for (final raw in corrupt) {
       peer.records[store.coordinationKey] = raw;
-      await expectLater(
-        store.read(),
-        throwsA(failure('invalid_session_record')),
-      );
+      await expectLater(store.read(), throwsA(failure('data_loss')));
       await expectLater(
         store.compareAndSet(credentials(), null),
-        throwsA(failure('invalid_session_record')),
+        throwsA(failure('data_loss')),
       );
       expect(peer.records[store.coordinationKey], raw);
     }
@@ -217,13 +208,10 @@ void main() {
       await store.write(credentials());
       final before = peer.records[store.coordinationKey];
       peer.failMethod = 'read';
-      await expectLater(
-        store.read(),
-        throwsA(failure('session_storage_error')),
-      );
+      await expectLater(store.read(), throwsA(failure('failed_precondition')));
       await expectLater(
         store.compareAndSet(credentials(), null),
-        throwsA(failure('session_storage_error')),
+        throwsA(failure('failed_precondition')),
       );
       expect(peer.records[store.coordinationKey], before);
       expect(peer.count('delete'), 0);
@@ -254,8 +242,8 @@ void main() {
           await store.compareAndSet(credentials(), null);
         }
         fail('Expected storage failure');
-      } on ClientException catch (error) {
-        expect(error.code, 'session_storage_error');
+      } on ClientError catch (error) {
+        expect(error.code, 'failed_precondition');
         expect(error.toString(), isNot(contains('private OS detail')));
       }
       peer.failMethod = null;
@@ -333,7 +321,7 @@ void main() {
       debugDefaultTargetPlatformOverride = platform;
       expect(
         () => SecureSessionStore('https://api.example.com'),
-        throwsA(failure('unsupported_platform')),
+        throwsA(failure('unimplemented')),
       );
       expect(peer.calls, isEmpty);
     });

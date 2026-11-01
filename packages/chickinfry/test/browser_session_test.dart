@@ -22,20 +22,14 @@ void main() {
       ]) {
         expect(
           () => BrowserSession.fromJson({...valid, field: bad}),
-          throwsA(
-            isA<ClientException>().having(
-              (e) => e.code,
-              'code',
-              'invalid_response',
-            ),
-          ),
+          throwsA(isA<ClientError>().having((e) => e.code, 'code', 'internal')),
         );
       }
     }
     for (final invalid in <Object?>[null, [], 'text']) {
       expect(
         () => BrowserSession.fromJson(invalid),
-        throwsA(isA<ClientException>()),
+        throwsA(isA<ClientError>()),
       );
     }
   });

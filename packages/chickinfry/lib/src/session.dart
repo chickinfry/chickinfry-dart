@@ -36,18 +36,18 @@ final class SessionCredentials {
         sessionId.isEmpty ||
         !validTimestamp(expiresAt) ||
         !validTimestamp(refreshExpiresAt)) {
-      throw const ClientException('invalid_session_record');
+      throw const ClientError('invalid_argument');
     }
   }
 
   factory SessionCredentials.fromJson(Object? value) {
     if (value is! Map<String, Object?>) {
-      throw const ClientException('invalid_session_record');
+      throw const ClientError('invalid_argument');
     }
     String field(String name) {
       final result = value[name];
       if (result is! String) {
-        throw const ClientException('invalid_session_record');
+        throw const ClientError('invalid_argument');
       }
       return result;
     }

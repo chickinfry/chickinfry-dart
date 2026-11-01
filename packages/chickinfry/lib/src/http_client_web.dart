@@ -17,7 +17,7 @@ final class _CookieClient extends http.BaseClient {
 
   @override
   Future<http.StreamedResponse> send(http.BaseRequest request) async {
-    if (_closed) throw const ClientException('network_error');
+    if (_closed) throw const ClientError('failed_precondition');
     final controller = web.AbortController();
     _active.add(controller);
     var handedOff = false;
@@ -51,11 +51,14 @@ final class _CookieClient extends http.BaseClient {
           .toDart;
       if (response.type == 'opaqueredirect' ||
           (response.status >= 300 && response.status < 400)) {
-        throw OperationError('redirect_not_allowed', response.status);
+        throw ClientError(
+          'internal',
+          status: response.status == 0 ? null : response.status,
+        );
       }
       final stream = response.body;
       if (stream == null) {
-        throw ClientException('invalid_response', status: response.status);
+        throw ClientError('internal', status: response.status);
       }
       final reader = web.ReadableStreamDefaultReader(stream);
       handedOff = true;
