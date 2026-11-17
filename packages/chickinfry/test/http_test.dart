@@ -904,6 +904,7 @@ void main() {
               isTrue,
             );
             if (!stalled) {
+              await Future<void>.delayed(const Duration(milliseconds: 250));
               final target = await Socket.connect('127.0.0.1', origin.port);
               upstream = target;
               addTearDown(target.destroy);
@@ -924,14 +925,19 @@ void main() {
       final native = HttpClient(context: clientContext)
         ..findProxy = (_) => 'PROXY 127.0.0.1:${proxy.port}';
       final root = HttpOverrides.runZoned(
+        () => HttpTransport('https://127.0.0.1:${origin.port}'),
+        createHttpClient: (_) => native,
+      );
+      final bounded = HttpOverrides.runZoned(
         () => HttpTransport(
-          'https://127.0.0.1:${origin.port}',
+          root.origin,
           timeout: const Duration(milliseconds: 200),
         ),
         createHttpClient: (_) => native,
       );
       native.connectionTimeout = const Duration(seconds: 2);
       addTearDown(root.close);
+      addTearDown(bounded.close);
       final transport = root.withBearer(accessToken);
       await expectLater(
         transport.invoke('thing.get', {}),
@@ -946,7 +952,7 @@ void main() {
       stalled = true;
       final watch = Stopwatch()..start();
       await expectLater(
-        transport.invoke('thing.get', {}),
+        bounded.withBearer(accessToken).invoke('thing.get', {}),
         throwsA(clientFailure('deadline_exceeded')),
       );
       print(
@@ -975,13 +981,16 @@ void main() {
       addTearDown(() => next.close(force: true));
       var requests = 0;
       var receivedBytes = 0;
+      var responseDelay = const Duration(milliseconds: 250);
+      var response = <String, Object?>{'value': 'a' * (256 * 1024)};
       next.listen((request) async {
         requests++;
         receivedBytes = await request.fold<int>(
           0,
           (length, chunk) => length + chunk.length,
         );
-        await reply(request, {'value': 'a' * (256 * 1024)});
+        await Future<void>.delayed(responseDelay);
+        await reply(request, response);
       });
       var resumeTls = false;
       final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
@@ -1018,17 +1027,24 @@ void main() {
       });
       final native = HttpClient()..findProxy = (_) => 'DIRECT';
       final transport = HttpOverrides.runZoned(
+        () => HttpTransport('https://127.0.0.1:$port'),
+        createHttpClient: (_) => native,
+      );
+      // Recovery shares the same connection pool without racing its TLS work
+      // against the short deadline used only for the stalled connection.
+      final bounded = HttpOverrides.runZoned(
         () => HttpTransport(
-          'https://127.0.0.1:$port',
+          transport.origin,
           timeout: const Duration(milliseconds: 200),
         ),
         createHttpClient: (_) => native,
       );
       native.connectionTimeout = const Duration(seconds: 2);
       addTearDown(transport.close);
+      addTearDown(bounded.close);
       watch.start();
       await expectLater(
-        transport.invoke('thing.get', {}),
+        bounded.invoke('thing.get', {}),
         throwsA(clientFailure('deadline_exceeded')),
       );
       final returnedAt = watch.elapsedMilliseconds;
@@ -1073,6 +1089,10 @@ void main() {
         }
         expect(call.transportEvents.last.retainedBytes, 393216);
       }
+      responseDelay = Duration.zero;
+      response = {};
+      expect(await bounded.invoke('thing.get', {}), <String, Object?>{});
+      expect(requests, 2);
     },
   );
 

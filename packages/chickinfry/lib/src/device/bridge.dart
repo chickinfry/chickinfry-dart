@@ -17,9 +17,14 @@ final class _AuthTransitions {
   _AuthTransitions(this.authGeneration);
   final int authGeneration;
   final live = <DeviceState>{};
+  final emailGenerations = <String, int>{};
   String? markId;
   // A sibling rejection cannot undo an earlier uncertain account change.
   bool unresolved = false;
+
+  void recordEmailClear(String email) {
+    emailGenerations[email] = (emailGenerations[email] ?? 0) + 1;
+  }
 }
 
 // Generated clients supply identities; the runtime never infers them from URLs.
@@ -103,14 +108,19 @@ final class DeviceTransport implements ClientTransport {
     final saved = attempts[screen];
     var request = input;
     if (const {
-          'auth.verify_email',
-          'auth.send_verification_email',
-        }.contains(operation) &&
-        input['email'] == null &&
-        input['attempt'] == null &&
-        saved != null &&
-        saved.validAt(started)) {
-      request = {...input, 'attempt': saved.id};
+      'auth.verify_email',
+      'auth.send_verification_email',
+    }.contains(operation)) {
+      if (!input.containsKey('email') &&
+          !input.containsKey('attempt') &&
+          saved != null &&
+          saved.validAt(started)) {
+        request = {...input, 'attempt': saved.id};
+      }
+      if (request.containsKey('email') == request.containsKey('attempt') ||
+          (request['email'] ?? request['attempt']) is! String) {
+        throw const ClientError('invalid_argument');
+      }
     }
     if (operation == 'auth.logout') {
       Object? result;
@@ -125,7 +135,7 @@ final class DeviceTransport implements ClientTransport {
       } finally {
         await store.clear(before);
       }
-      return result ?? <String, Object?>{};
+      return result ?? <String, Object?>{'status': 'ok'};
     }
     DeviceAttempt? consumed;
     if (operation == 'auth.verify_email' && request['attempt'] is String) {
@@ -133,6 +143,12 @@ final class DeviceTransport implements ClientTransport {
         if (attempt.id == request['attempt']) consumed = attempt;
       }
     }
+    final email = request['email'] is String
+        ? (request['email']! as String).trim().toLowerCase()
+        : (consumed?.email ??
+              (saved != null && request['attempt'] == saved.id
+                  ? saved.email
+                  : null));
     DeviceState? transition;
     _AuthTransitions? owned;
     final coordinationKey = store.coordinationKey;
@@ -196,6 +212,7 @@ final class DeviceTransport implements ClientTransport {
       }
     }
     final invalidations = store.authInvalidations;
+    final emailGeneration = owned?.emailGenerations[email] ?? 0;
     var uncertain = true;
     try {
       Object? result;
@@ -210,12 +227,6 @@ final class DeviceTransport implements ClientTransport {
       if (rejection == null && result is! Map<String, Object?>) {
         throw const ClientError('internal');
       }
-      final email = request['email'] is String
-          ? (request['email']! as String).trim().toLowerCase()
-          : (consumed?.email ??
-                (saved != null && request['attempt'] == saved.id
-                    ? saved.email
-                    : null));
       SessionCredentials? issued;
       BrowserSession? browserIssued;
       DeviceAttempt? pending;
@@ -277,10 +288,12 @@ final class DeviceTransport implements ClientTransport {
         final stillPresent =
             referenced == null ||
             current.attempts.values.any((value) => value.id == referenced.id);
+        final sameEmailReplacement =
+            referenced != null && current.attempts[screen]?.email == email;
         final late =
             store.authInvalidations != invalidations ||
             current.authGeneration != before.authGeneration ||
-            !stillPresent;
+            (!stillPresent && !sameEmailReplacement);
         final peerMark =
             transition != null &&
             current.authTransitionUnknown &&
@@ -323,7 +336,8 @@ final class DeviceTransport implements ClientTransport {
             authTransitionId: peerMark ? current.authTransitionId : null,
             attempts: attempts,
           );
-        } else if (pending != null) {
+        } else if (pending != null &&
+            (owned?.emailGenerations[email] ?? 0) == emailGeneration) {
           attempts[screen] = pending;
           next = DeviceState(
             generation: current.generation + 1,
@@ -360,6 +374,7 @@ final class DeviceTransport implements ClientTransport {
           store.transientState = next;
           if (issuedSession && !late && email != null) {
             store.recordAttemptConsumption(email, next);
+            owned?.recordEmailClear(email);
           }
           break;
         }
@@ -372,6 +387,9 @@ final class DeviceTransport implements ClientTransport {
               )
             : await store.commit(current, next);
         if (saved) {
+          if (issuedSession && !late && email != null) {
+            owned?.recordEmailClear(email);
+          }
           if (issuedSession && store.transientState == null) uncertain = false;
           break;
         }

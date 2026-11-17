@@ -1,0 +1,11 @@
+import 'package:chickinfry_client_required_auth/chickinfry_client.dart';
+
+void main() {
+  AuthVerifyEmailInput(
+    code: '123456',
+    target: AuthVerifyEmailInputTargetChoice.attempt(
+      '00000000-0000-4000-8000-000000000001',
+      email: 'user@example.test',
+    ),
+  );
+}

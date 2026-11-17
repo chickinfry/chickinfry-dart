@@ -12,6 +12,7 @@ the executable hash, and every launch. Its native declaration uses:
   "protocolVersion": 1,
   "driverVersion": "1.0.0",
   "driverCommit": "<full clean source commit>",
+  "requiredAuthSDK": true,
   "build": {"tool": "dart", "entry": "bin/driver.dart", "features": []},
   "executable": "driver",
   "run": null,
@@ -24,13 +25,20 @@ the actual source commit. Never label a dirty source tree with a clean commit.
 Prepare the package's existing `.dart_tool/package_config.json` with offline
 dependencies before invoking the coordinator. The runtime path in that config
 must resolve to the pinned runtime source. The coordinator injects
-`chickinfry_client_plain` and `chickinfry_client_auth` and adds
+`chickinfry_client_plain`, `chickinfry_client_auth` and
+`chickinfry_client_required_auth` and adds
 `-Dchickinfry.conformance=true`; they are generated inputs, not registry packages.
 No dependency download or custom build/run arguments belong in the declaration.
 
 The coordinator supplies `fixture: "plain"` or `fixture: "auth"` on every
 `client.create`. `createBridge` is the only selection boundary; it rejects unknown
 fixtures before SDK construction. Copies retain the source client's fixture.
+For C-11, the requiredAuth fixture selects the required-verification SDK. It uses the
+same client.create/client.call protocol and leaves session and bearer paths intact.
+The opted-in declaration also accepts --required-auth-sdk from the coordinator.
+SDK selection depends only on the explicit fixture, never the case identifier.
+Its tests check signup attempt reuse, SDK results and errors, and compile the
+invalid sealed-choice consumer to prove that email and attempt cannot coexist.
 The driver accepts only the native Dart SDK role and process protocol version 1;
 the shared suite, execution and result schema version is 3.
 

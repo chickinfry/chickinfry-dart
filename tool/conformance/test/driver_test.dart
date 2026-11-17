@@ -13,6 +13,8 @@ import 'package:chickinfry_conformance/protocol.dart';
 import 'package:chickinfry_conformance/server.dart';
 import 'package:test/test.dart';
 
+import '../bin/driver.dart' show validateLaunch;
+
 Map<String, Object?> get handshake => {
   'protocolVersions': [1],
   'runId': 'run',
@@ -26,6 +28,22 @@ Map<String, Object?> args(Map<String, Object?> values) => {
 };
 
 void main() {
+  test('launch accepts the optional required-auth SDK without other flags', () {
+    const base = ['--plain-sdk', 'plain', '--auth-sdk', 'auth'];
+    expect(() => validateLaunch(base), returnsNormally);
+    expect(
+      () => validateLaunch([...base, '--required-auth-sdk', 'required']),
+      returnsNormally,
+    );
+    for (final args in <List<String>>[
+      [],
+      [...base, '--required-auth-sdk'],
+      [...base, '--unknown', 'required'],
+      [...base, '--required-auth-sdk', 'required', 'extra'],
+    ]) {
+      expect(() => validateLaunch(args), throwsStateError);
+    }
+  });
   test('strict JSON rejects escaped/nested duplicates and malformed UTF-8', () {
     for (final value in [
       '{"x":1,"x":2}',

@@ -9,6 +9,41 @@ import 'package:chickinfry/src/device/store.dart';
 import 'support.dart';
 
 void main() {
+  test('verification without a saved target fails before a request', () async {
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    var requests = 0;
+    server.listen((request) async {
+      requests++;
+      await request.response.close();
+    });
+    final transport = DeviceTransport(
+      MemoryDeviceStore(scope('http://127.0.0.1:${server.port}')),
+    );
+    addTearDown(transport.close);
+    for (final operation in [
+      'auth.verify_email',
+      'auth.send_verification_email',
+    ]) {
+      for (final input in <Map<String, Object?>>[
+        {},
+        {'email': 'user@example.test', 'attempt': randomId()},
+        {'email': null, 'attempt': randomId()},
+      ]) {
+        await expectLater(
+          transport.invoke(operation, input),
+          throwsA(
+            isA<ClientError>().having(
+              (e) => e.code,
+              'code',
+              'invalid_argument',
+            ),
+          ),
+        );
+      }
+    }
+    expect(requests, 0);
+  });
   test(
     'disabled persistence authenticates without creating a directory',
     () async {

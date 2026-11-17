@@ -10,6 +10,7 @@ import 'package:chickinfry/src/device/bridge.dart';
 import 'package:chickinfry/src/device/native.dart';
 import 'package:chickinfry/src/device/store.dart';
 import 'package:chickinfry/src/device/files.dart';
+import 'package:chickinfry/src/signup.dart';
 import 'package:test/test.dart';
 
 import 'support.dart';
@@ -18,6 +19,113 @@ void main() {
   final unsupportedPosix = Platform.isMacOS || Platform.isLinux
       ? false
       : 'Requires the macOS or Linux POSIX file device.';
+  for (final scenario in [
+    'same-email replacement',
+    'different-email replacement',
+    'same-session signin',
+    'other-email same-session signin',
+  ]) {
+    test('device email ordering: $scenario', () async {
+      final root = await scratch();
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      final origin = 'http://127.0.0.1:${server.port}';
+      final issued = credentials();
+      final sameSession = scenario.endsWith('same-session signin');
+      final first = randomId();
+      final second = randomId();
+      final arrived = Completer<void>();
+      final release = Completer<void>();
+      addTearDown(() {
+        if (!release.isCompleted) release.complete();
+      });
+      var requests = 0;
+      var signups = 0;
+      Map<String, Object?>? verification;
+      server.listen((request) async {
+        final input = jsonDecode(
+          await utf8.decoder.bind(request).join(),
+        ) as Map<String, Object?>;
+        requests++;
+        Object output;
+        if (request.uri.path == '/auth.signup') {
+          signups++;
+          if (sameSession) {
+            arrived.complete();
+            await release.future;
+          }
+          output = {'accepted': true, 'attempt': signups == 1 ? first : second};
+        } else {
+          if (request.uri.path == '/auth.verify_email') {
+            verification = input;
+            arrived.complete();
+            await release.future;
+          }
+          output = {...issued.toJson(), 'email_verified': true};
+        }
+        request.response.headers.contentType = ContentType.json;
+        request.response.write(jsonEncode(output));
+        await request.response.close();
+      });
+      final transport = DeviceTransport(device(root, origin));
+      addTearDown(transport.close);
+      final client = SignupBinding(transport);
+      int? authGeneration;
+      if (sameSession) {
+        await client.invoke('auth.signin', {'email': 'person@example.test'});
+        authGeneration = (await device(root, origin).load()).authGeneration;
+        final pending = client.invoke('auth.signup', {
+          'email': scenario == 'other-email same-session signin'
+              ? 'other@example.test'
+              : 'person@example.test',
+        });
+        await arrived.future;
+        await client.invoke('auth.signin', {'email': ' PERSON@example.test '});
+        release.complete();
+        await pending;
+      } else {
+        await client.invoke('auth.signup', {'email': 'person@example.test'});
+        final pending = client.invoke('auth.verify_email', {'code': '123456'});
+        await arrived.future;
+        expect(verification?['attempt'], first);
+        await client.invoke('auth.signup', {
+          'email': scenario == 'same-email replacement'
+              ? ' PERSON@example.test '
+              : 'other@example.test',
+        });
+        release.complete();
+        await pending;
+      }
+      final stored = await device(root, origin).load();
+      if (scenario == 'different-email replacement') {
+        expect(stored.session, isNull);
+        expect(stored.attempts['signup']?.id, second);
+      } else {
+        expect(stored.session, issued);
+        expect(await device(root, origin).read(), issued);
+        if (authGeneration != null) {
+          expect(stored.authGeneration, authGeneration);
+        }
+        if (scenario == 'other-email same-session signin') {
+          expect(stored.attempts['signup']?.id, first);
+          return;
+        }
+        expect(stored.attempts, isEmpty);
+        final before = requests;
+        await expectLater(
+          client.invoke('auth.verify_email', {'code': '123456'}),
+          throwsA(
+            isA<ClientError>().having(
+              (e) => e.code,
+              'code',
+              'invalid_argument',
+            ),
+          ),
+        );
+        expect(requests, before);
+      }
+    }, skip: unsupportedPosix);
+  }
   for (final outcome in ['rejected', 'same-session']) {
     test(
       'business read recovery observes peer before explicit signin $outcome',
@@ -524,7 +632,7 @@ void main() {
             failureFiles!.readUnavailable = true;
             expect(await store.read() == issued, isTrue);
             await expectLater(
-              client.invoke(operation, {}),
+              client.invoke(operation, {'email': 'user@example.test'}),
               throwsA(
                 isA<ClientError>().having(
                   (error) => error.code,
@@ -576,7 +684,9 @@ void main() {
             addTearDown(retryClient.close);
             expect(
               SessionCredentials.fromJson(
-                    await retryClient.invoke(operation, {}),
+                    await retryClient.invoke(operation, {
+                      'email': 'user@example.test',
+                    }),
                   ) ==
                   issued,
               isTrue,
@@ -652,7 +762,7 @@ void main() {
           final client = DeviceTransport(device(root, origin));
           addTearDown(client.close);
           await expectLater(
-            client.invoke(operation, {}),
+            client.invoke(operation, {'email': 'user@example.test'}),
             throwsA(
               isA<ClientError>().having(
                 (error) => error.code,
@@ -3431,7 +3541,12 @@ void main() {
       );
       addTearDown(firstClient.close);
       addTearDown(secondClient.close);
-      await firstClient.invoke('auth.send_verification_email', {});
+      await expectLater(
+        firstClient.invoke('auth.send_verification_email', {}),
+        throwsA(
+          isA<ClientError>().having((e) => e.code, 'code', 'invalid_argument'),
+        ),
+      );
       await secondClient.invoke('auth.signup', {
         'email': 'second@example.test',
       });

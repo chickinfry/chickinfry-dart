@@ -2,6 +2,8 @@ import 'package:chickinfry/chickinfry.dart';
 // The coordinator injects these aliases in its owned package configuration.
 import 'package:chickinfry_client_plain/chickinfry_client.dart' as plain;
 import 'package:chickinfry_client_auth/chickinfry_client.dart' as auth;
+import 'package:chickinfry_client_required_auth/chickinfry_client.dart'
+    as required_auth;
 
 import 'protocol.dart';
 
@@ -20,6 +22,9 @@ typedef Bridge = Future<Map<String, Object?>> Function(
       plain.Client(transport),
     ),
     'auth' => (HttpTransport transport) => authBridge(auth.Client(transport)),
+    'requiredAuth' => (HttpTransport transport) => requiredAuthBridge(
+      required_auth.Client(transport),
+    ),
     _ => invalidArgs(),
   };
   final transport = createTransport();
@@ -45,6 +50,87 @@ Bridge plainBridge(plain.Client client) => (operation, input) async {
             },
         ],
       };
+    default:
+      unimplemented();
+  }
+};
+
+Bridge requiredAuthBridge(
+  required_auth.Client client,
+) => (operation, input) async {
+  if (input.containsKey('email') && input.containsKey('attempt')) {
+    throw const ClientError('invalid_argument');
+  }
+  switch (operation) {
+    case 'auth.signup':
+      final output = await client.auth.signup(
+        required_auth.AuthSignupInput(
+          email: string(input, 'email'),
+          password: string(input, 'password'),
+        ),
+      );
+      return {'accepted': output.accepted, 'attempt': output.attempt};
+    case 'auth.send_verification_email':
+      final output = await client.auth.sendVerificationEmail(
+        required_auth.AuthSendVerificationEmailInput(
+          target: input.containsKey('attempt')
+              ? required_auth
+                    .AuthSendVerificationEmailInputTargetChoice.attempt(
+                  string(input, 'attempt'),
+                )
+              : input.containsKey('email')
+              ? required_auth.AuthSendVerificationEmailInputTargetChoice.email(
+                  string(input, 'email'),
+                )
+              : null,
+        ),
+      );
+      return {'accepted': output.accepted};
+    case 'auth.verify_email':
+      final output = await client.auth.verifyEmail(
+        required_auth.AuthVerifyEmailInput(
+          code: string(input, 'code'),
+          target: input.containsKey('attempt')
+              ? required_auth.AuthVerifyEmailInputTargetChoice.attempt(
+                  string(input, 'attempt'),
+                )
+              : input.containsKey('email')
+              ? required_auth.AuthVerifyEmailInputTargetChoice.email(
+                  string(input, 'email'),
+                )
+              : null,
+        ),
+      );
+      return {
+        'email_verified': output.emailVerified,
+        'access_token': output.accessToken,
+        'refresh_token': output.refreshToken,
+        'expires_at': output.expiresAt,
+        'refresh_expires_at': output.refreshExpiresAt,
+        'user_id': output.userId,
+        'session_id': output.sessionId,
+      };
+    case 'auth.signin':
+      final output = await client.auth.signin(
+        required_auth.AuthSigninInput(
+          email: string(input, 'email'),
+          password: string(input, 'password'),
+        ),
+      );
+      return {
+        'email_verified': output.emailVerified,
+        'access_token': output.accessToken,
+        'refresh_token': output.refreshToken,
+        'expires_at': output.expiresAt,
+        'refresh_expires_at': output.refreshExpiresAt,
+        'user_id': output.userId,
+        'session_id': output.sessionId,
+      };
+    case 'auth.logout':
+      final output = await client.auth.logout(
+        const required_auth.AuthLogoutInput(),
+      );
+      return {'status': output.status};
     default:
       unimplemented();
   }
