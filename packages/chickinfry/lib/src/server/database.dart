@@ -120,6 +120,7 @@ final class ColumnDefinition {
   });
   final String name, kind;
   final bool nullable, optional;
+  static final _extraTimestampZeros = RegExp(r'(\.\d{3,5}?)0+Z$');
 
   Object? validate(Object? value) {
     if (value == null) {
@@ -166,7 +167,10 @@ final class ColumnDefinition {
       if (utc == null || utc.year < 1 || utc.year > 9999) {
         throw ArgumentError('Invalid timestamp.');
       }
-      return utc.toIso8601String();
+      return utc.toIso8601String().replaceFirstMapped(
+        _extraTimestampZeros,
+        (match) => '${match[1]}Z',
+      );
     }
     return value;
   }
