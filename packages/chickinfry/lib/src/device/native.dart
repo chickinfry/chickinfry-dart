@@ -137,21 +137,25 @@ final class NativeDeviceStore extends DeviceStore {
   }
 
   @override
-  Future<SessionCredentials?> read() async {
+  Future<SessionCredentials?> read({bool requireKnown = false}) async {
     requireAvailable();
     if (transientState?.session != null) {
+      final DeviceState current;
       try {
-        final current = await _files.locked(
+        current = await _files.locked(
           directory,
           (dir) async => _load(dir),
           root: _root,
         );
-        if (recoveryReadInvalidated(current)) return null;
       } on ClientError {
-        return super.read();
+        return super.read(requireKnown: requireKnown);
+      }
+      if (recoveryReadInvalidated(current)) {
+        if (requireKnown) throw const ClientError('failed_precondition');
+        return null;
       }
     }
-    return super.read();
+    return super.read(requireKnown: requireKnown);
   }
 
   @override

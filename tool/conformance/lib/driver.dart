@@ -5,6 +5,9 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:chickinfry/chickinfry.dart';
+import 'package:chickinfry/src/device/bridge.dart';
+import 'package:chickinfry/src/device/store.dart';
+import 'package:chickinfry/src/origin.dart';
 import 'package:chickinfry/src/testing/conformance.dart';
 import 'package:chickinfry/src/testing/session_store.dart';
 
@@ -22,8 +25,8 @@ final class Store {
 }
 
 final class Client {
-  Client(this.transport, this.bridge, this.fixture, this.hasSession);
-  final HttpTransport transport;
+  Client(this.withBearer, this.bridge, this.fixture, this.hasSession);
+  final HttpTransport Function(String) withBearer;
   final Bridge bridge;
   final String fixture;
   final bool hasSession;
@@ -43,8 +46,9 @@ final class Driver {
   )
   request;
   final stores = <String, Store>{};
+  final deviceStores = <String, MemoryDeviceStore>{};
   final clients = <String, Client>{};
-  final ownedTransports = <HttpTransport>[];
+  final ownedTransports = <void Function()>[];
   final barriers = <Barrier>[];
   final flights = Map<Object, String>.identity();
   final calls = <String, (ConformanceCall, Observation)>{};
@@ -142,7 +146,8 @@ final class Driver {
     switch (command) {
       case 'session.store.create':
         final ref = identifier(args, 'storeRef');
-        if (stores.containsKey(ref)) violation();
+        if (stores.containsKey(ref) || deviceStores.containsKey(ref))
+          violation();
         final origin = string(args, 'origin');
         final present = [
           'recordRef',
@@ -150,6 +155,19 @@ final class Driver {
           'refreshRef',
         ].where(args.containsKey).length;
         if (present != 0 && present != 3) invalidArgs();
+        if (currentCase == 'C-12') {
+          if (present != 0) invalidArgs();
+          deviceStores[ref] = MemoryDeviceStore(
+            DeviceScope(
+              app: 'conformance',
+              origin: origin,
+              project: runId!,
+              environment: 'test',
+              screen: ref,
+            ),
+          );
+          return {'storeRef': ref, 'revision': 0};
+        }
         final initial = present == 0
             ? null
             : credentials.record(
@@ -189,7 +207,24 @@ final class Driver {
         if (args['includeTrace'] == true && !conformanceEnabled) {
           unimplemented();
         }
-        final store = lookup(stores, identifier(args, 'storeRef'));
+        final ref = identifier(args, 'storeRef');
+        final device = deviceStores[ref];
+        if (device != null) {
+          if (args['includeTrace'] == true) unimplemented();
+          final state = await device.load();
+          final value = state.session;
+          return {
+            'present': value != null,
+            'revision': state.generation,
+            'accessRef': value == null
+                ? null
+                : credentials.reference(value.accessToken),
+            'refreshRef': value == null
+                ? null
+                : credentials.reference(value.refreshToken),
+          };
+        }
+        final store = lookup(stores, ref);
         final snapshot = store.record.snapshot;
         final value = snapshot.value;
         final trace = <Map<String, Object?>>[];
@@ -233,8 +268,14 @@ final class Driver {
         final fixture = string(args, 'fixture');
         final origin = string(args, 'origin');
         final timeout = positive(args, 'requestTimeoutMs');
-        final store = args.containsKey('storeRef')
-            ? lookup(stores, identifier(args, 'storeRef')).store
+        final storeRef = args.containsKey('storeRef')
+            ? identifier(args, 'storeRef')
+            : null;
+        final device = fixture == 'emptySession'
+            ? lookup(deviceStores, storeRef ?? invalidArgs())
+            : null;
+        final store = storeRef != null && device == null
+            ? lookup(stores, storeRef).store
             : null;
         final bearer = args.containsKey('bearerRef')
             ? credentials.value(identifier(args, 'bearerRef'))
@@ -242,19 +283,33 @@ final class Driver {
         final (call, observation) = observationFor(id, 'constructor');
         try {
           final client = withConformanceCall(call, () {
+            if (device != null) {
+              if (normalizeOrigin(origin) != device.origin) {
+                throw const ClientError('failed_precondition');
+              }
+              final (transport, bridge) = createBridge(
+                () => DeviceTransport(
+                  device,
+                  timeout: Duration(milliseconds: timeout),
+                ),
+                fixture: fixture,
+              );
+              ownedTransports.add(transport.close);
+              return Client(transport.withBearer, bridge, fixture, true);
+            }
             final (transport, bridge) = createBridge(() {
               final base = HttpTransport(
                 origin,
                 timeout: Duration(milliseconds: timeout),
               );
-              ownedTransports.add(base);
+              ownedTransports.add(base.close);
               return store != null
                   ? base.withSession(store)
                   : bearer != null
                   ? base.withBearer(bearer)
                   : base;
             }, fixture: fixture);
-            return Client(transport, bridge, fixture, store != null);
+            return Client(transport.withBearer, bridge, fixture, store != null);
           });
           if (call.instrumentationFailed) {
             throw const DriverError('driver_failed');
@@ -282,10 +337,15 @@ final class Driver {
         final (call, observation) = observationFor(id, 'copy');
         try {
           final (transport, bridge) = createBridge(
-            () => source.transport.withBearer(token),
+            () => source.withBearer(token),
             fixture: source.fixture,
           );
-          clients[ref] = Client(transport, bridge, source.fixture, false);
+          clients[ref] = Client(
+            transport.withBearer,
+            bridge,
+            source.fixture,
+            false,
+          );
           return {'clientRef': ref};
         } catch (error) {
           throw SdkFailure(observation.sdkError(error, call, credentials));
@@ -484,7 +544,7 @@ final class Driver {
 
   void close() {
     for (final transport in ownedTransports) {
-      transport.close();
+      transport();
     }
     ownedTransports.clear();
   }
@@ -493,6 +553,7 @@ final class Driver {
     close();
     clients.clear();
     stores.clear();
+    deviceStores.clear();
     barriers.clear();
     flights.clear();
     calls.clear();

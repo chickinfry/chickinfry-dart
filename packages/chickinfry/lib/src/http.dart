@@ -19,6 +19,21 @@ abstract interface class ClientTransport {
   Future<Object?> invoke(String operation, Map<String, Object?> input);
 }
 
+/// Optional support for operations that can run without a session.
+abstract interface class PublicTransport implements ClientTransport {
+  Future<Object?> invokePublic(String operation, Map<String, Object?> input);
+}
+
+/// Dispatches public calls while supporting transports that only implement invoke.
+extension PublicInvocation on ClientTransport {
+  Future<Object?> invokePublic(String operation, Map<String, Object?> input) {
+    final transport = this;
+    return transport is PublicTransport
+        ? transport.invokePublic(operation, input)
+        : transport.invoke(operation, input);
+  }
+}
+
 final _operationPattern = RegExp(r'^[a-z][a-z0-9_]*\.[a-z][a-z0-9_]*$');
 final _errorPattern = RegExp(r'^[a-z_]+$');
 final _refreshes = <(String, String), _RefreshFlight>{};
@@ -32,7 +47,7 @@ class _RefreshFlight {
 
 /// HttpTransport uses a fixed origin and a finite per-request deadline.
 /// Browsers use cookies only; native targets can attach bearer credentials.
-final class HttpTransport implements ClientTransport {
+final class HttpTransport implements PublicTransport {
   factory HttpTransport(
     String origin, {
     Duration timeout = const Duration(seconds: 30),
@@ -103,7 +118,18 @@ final class HttpTransport implements ClientTransport {
   }
 
   @override
-  Future<Object?> invoke(String operation, Map<String, Object?> input) async {
+  Future<Object?> invoke(String operation, Map<String, Object?> input) =>
+      _invoke(operation, input, publicOperation: false);
+
+  @override
+  Future<Object?> invokePublic(String operation, Map<String, Object?> input) =>
+      _invoke(operation, input, publicOperation: true);
+
+  Future<Object?> _invoke(
+    String operation,
+    Map<String, Object?> input, {
+    required bool publicOperation,
+  }) async {
     if (conformanceEnabled) {
       currentConformanceCall?.elapsed.start();
       final barrier = currentConformanceCall?.arrive(
@@ -134,6 +160,13 @@ final class HttpTransport implements ClientTransport {
       final uncertain = _uncertain[key];
       uncertain?.removeWhere((value) => value != credentials);
       if (uncertain?.isEmpty ?? false) _uncertain.remove(key);
+      if (uncertain?.contains(credentials) ?? false) {
+        throw const ClientError('unauthenticated');
+      }
+      if (credentials == null &&
+          (!publicOperation || operation == 'auth.refresh')) {
+        throw const ClientError('unauthenticated');
+      }
     }
     if (operation == 'auth.refresh' && store is DeviceStore) {
       if (credentials == null ||
@@ -183,7 +216,7 @@ final class HttpTransport implements ClientTransport {
   Future<SessionCredentials?> _read(SessionStore store) async {
     try {
       return store is DeviceStore
-          ? await store.waitForSession(timeout)
+          ? await store.waitForSession(timeout, requireKnown: true)
           : await store.read();
     } on ClientError catch (error) {
       if (error.code == 'invalid_argument' ||

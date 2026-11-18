@@ -6,6 +6,7 @@ import 'package:chickinfry/src/device/bridge.dart';
 import 'package:test/test.dart';
 import 'package:chickinfry/src/device/store.dart';
 
+import '../support.dart' show Peer, clientFailure, operationFailure, reply;
 import 'support.dart';
 
 void main() {
@@ -77,6 +78,164 @@ void main() {
       expect(authenticated && await transport.store.read() == value, isTrue);
     },
   );
+  test('C-12 one device transport signs in again after logout', () async {
+    final first = credentials();
+    final second = credentials(user: first.userId);
+    var logins = 0;
+    final seen = <(String, String?)>[];
+    final peer = await Peer.start((request) async {
+      await request.drain<void>();
+      final operation = request.uri.path;
+      final header = request.headers.value('authorization');
+      final bearer = header == null
+          ? null
+          : header == 'Bearer ${first.accessToken}'
+          ? 'first'
+          : header == 'Bearer ${second.accessToken}'
+          ? 'second'
+          : 'unexpected';
+      seen.add((operation, bearer));
+      final response = switch (operation) {
+        '/auth.signin' => (++logins == 1 ? first : second).toJson(),
+        '/auth.signup' => {'accepted': true, 'attempt': randomId()},
+        '/auth.logout' => {'status': 'ok'},
+        _ => <String, Object?>{},
+      };
+      await reply(request, response);
+    });
+    final transport = DeviceTransport(MemoryDeviceStore(scope(peer.origin)));
+    addTearDown(transport.close);
+
+    await transport.invokePublic('auth.signin', {});
+    await transport.invoke('example.read', {});
+    await transport.invoke('auth.logout', {});
+    expect(await transport.store.read(), isNull);
+    await transport.invokePublic('auth.signup', {'email': 'user@example.test'});
+    await transport.invokePublic('auth.signin', {});
+    await transport.invoke('example.read', {});
+    await transport.invokePublic('example.list', {});
+    await transport.invoke('auth.logout', {});
+    await transport.invokePublic('example.list', {});
+    await expectLater(
+      transport.invoke('auth.logout', {}),
+      throwsA(clientFailure('unauthenticated')),
+    );
+    await expectLater(
+      transport.invoke('example.read', {}),
+      throwsA(clientFailure('unauthenticated')),
+    );
+    expect(seen, [
+      ('/auth.signin', null),
+      ('/example.read', 'first'),
+      ('/auth.logout', 'first'),
+      ('/auth.signup', null),
+      ('/auth.signin', null),
+      ('/example.read', 'second'),
+      ('/example.list', 'second'),
+      ('/auth.logout', 'second'),
+      ('/example.list', null),
+    ]);
+  });
+
+  for (final failedRefresh in [false, true]) {
+    final reason = failedRefresh
+        ? 'an uncertain refresh'
+        : 'an expired session';
+    test('device can sign in after $reason', () async {
+      final current = credentials();
+      final first = SessionCredentials.fromJson({
+        ...current.toJson(),
+        'expires_at': '2000-01-01T00:00:00Z',
+        'refresh_expires_at': '2000-01-02T00:00:00Z',
+      });
+      final next = credentials(user: first.userId);
+      final signinHeaders = <bool>[];
+      var refreshes = 0;
+      final peer = await Peer.start((request) async {
+        await request.drain<void>();
+        final header = request.headers.value('authorization');
+        switch (request.uri.path) {
+          case '/auth.signin':
+            signinHeaders.add(header != null);
+            if (header == null) {
+              await reply(
+                request,
+                (signinHeaders.length == 1 ? first : next).toJson(),
+              );
+            } else {
+              await reply(request, {'error': 'invalid_token'}, status: 401);
+            }
+          case '/auth.refresh':
+            refreshes++;
+            await reply(request, {
+              'error': failedRefresh ? 'unavailable' : 'invalid_token',
+            }, status: failedRefresh ? 500 : 401);
+          default:
+            if (header == 'Bearer ${next.accessToken}') {
+              await reply(request, {'accepted': true});
+            } else {
+              await reply(request, {'error': 'invalid_token'}, status: 401);
+            }
+        }
+      });
+      final store = MemoryDeviceStore(scope(peer.origin));
+      final transport = DeviceTransport(
+        store,
+        timeout: const Duration(seconds: 1),
+      );
+      addTearDown(transport.close);
+
+      await transport.invokePublic('auth.signin', {});
+      if (failedRefresh) {
+        await expectLater(
+          transport.invoke('example.read', {}),
+          throwsA(operationFailure('unavailable', 500)),
+        );
+        expect((await store.load()).refreshSent, isTrue);
+      }
+
+      await transport.invokePublic('auth.signin', {});
+      expect(await store.read(), next);
+      expect(await transport.invoke('example.read', {}), {'accepted': true});
+      expect(signinHeaders, [false, false]);
+      expect(refreshes, failedRefresh ? 1 : 0);
+    });
+  }
+
+  test('device can send verification email during a peer transition', () async {
+    final seen = <String>[];
+    final peer = await Peer.start((request) async {
+      await request.drain<void>();
+      seen.add(request.uri.path);
+      expect(request.headers.value('authorization'), isNull);
+      await reply(request, {'accepted': true});
+    });
+    final store = MemoryDeviceStore(scope(peer.origin));
+    final transitionId = newDeviceRequestId();
+    await store.commit(
+      await store.load(),
+      DeviceState(
+        generation: 1,
+        authTransitionUnknown: true,
+        authTransitionId: transitionId,
+      ),
+    );
+    final transport = DeviceTransport(store);
+    addTearDown(transport.close);
+    expect(
+      await transport.invokePublic('auth.send_verification_email', {
+        'email': 'user@example.test',
+      }),
+      {'accepted': true},
+    );
+    expect((await store.load()).authTransitionId, transitionId);
+    await expectLater(
+      transport.invokePublic('example.list', {}),
+      throwsA(clientFailure('failed_precondition')),
+    );
+    expect(seen, ['/auth.send_verification_email']);
+  });
+
   test('memory sessions are instance scoped', () async {
     final root = MemoryDeviceStore(scope('https://memory.example.test'));
     final other = MemoryDeviceStore(scope('https://memory.example.test'));

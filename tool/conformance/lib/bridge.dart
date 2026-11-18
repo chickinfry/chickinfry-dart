@@ -5,6 +5,9 @@ import 'package:chickinfry_client_auth/chickinfry_client.dart' as auth;
 import 'package:chickinfry_client_required_auth/chickinfry_client.dart'
     as required_auth;
 
+import 'package:chickinfry_client_empty_session/chickinfry_client.dart'
+    as empty_session;
+
 import 'protocol.dart';
 
 typedef Bridge = Future<Map<String, Object?>> Function(
@@ -13,17 +16,20 @@ typedef Bridge = Future<Map<String, Object?>> Function(
 );
 
 /// Selects the generated SDK only from the explicit fixture identifier.
-(HttpTransport, Bridge) createBridge(
-  HttpTransport Function() createTransport, {
+(T, Bridge) createBridge<T extends ClientTransport>(
+  T Function() createTransport, {
   required String fixture,
 }) {
   final factory = switch (fixture) {
-    'plain' => (HttpTransport transport) => plainBridge(
+    'plain' => (ClientTransport transport) => plainBridge(
       plain.Client(transport),
     ),
-    'auth' => (HttpTransport transport) => authBridge(auth.Client(transport)),
-    'requiredAuth' => (HttpTransport transport) => requiredAuthBridge(
+    'auth' => (ClientTransport transport) => authBridge(auth.Client(transport)),
+    'requiredAuth' => (ClientTransport transport) => requiredAuthBridge(
       required_auth.Client(transport),
+    ),
+    'emptySession' => (ClientTransport transport) => emptySessionBridge(
+      empty_session.Client(transport),
     ),
     _ => invalidArgs(),
   };
@@ -166,6 +172,55 @@ Bridge authBridge(auth.Client client) => (operation, input) async {
         'refresh_expires_at': output.refreshExpiresAt,
         'user_id': output.userId,
         'session_id': output.sessionId,
+      };
+    default:
+      unimplemented();
+  }
+};
+
+Bridge emptySessionBridge(
+  empty_session.Client client,
+) => (operation, input) async {
+  switch (operation) {
+    case 'auth.signin':
+      final output = await client.auth.signin(
+        empty_session.AuthSigninInput(
+          email: string(input, 'email'),
+          password: string(input, 'password'),
+        ),
+      );
+      return {
+        'email_verified': output.emailVerified,
+        'access_token': output.accessToken,
+        'refresh_token': output.refreshToken,
+        'expires_at': output.expiresAt,
+        'refresh_expires_at': output.refreshExpiresAt,
+        'user_id': output.userId,
+        'session_id': output.sessionId,
+      };
+    case 'auth.logout':
+      final output = await client.auth.logout(
+        const empty_session.AuthLogoutInput(),
+      );
+      return {'status': output.status};
+    case 'probe.echo':
+      final output = await client.probe.echo(
+        empty_session.ProbeEchoInput(wireValue: string(input, 'wire_value')),
+      );
+      return {'wire_value': output.wireValue, 'observed_at': output.observedAt};
+    case 'probe.list':
+      final output = await client.probe.list(
+        const empty_session.ProbeListInput(),
+      );
+      return {
+        'rows': [
+          for (final row in output.rows)
+            {
+              'id': row.id,
+              'wire_value': row.wireValue,
+              'observed_at': row.observedAt,
+            },
+        ],
       };
     default:
       unimplemented();

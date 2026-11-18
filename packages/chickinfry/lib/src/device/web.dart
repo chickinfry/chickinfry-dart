@@ -105,17 +105,20 @@ final class WebDeviceStore extends DeviceStore {
   }
 
   @override
-  Future<SessionCredentials?> read() async {
+  Future<SessionCredentials?> read({bool requireKnown = false}) async {
     requireAvailable();
     if (transientState != null) {
       try {
         final current = _loadPersistent();
-        if (recoveryReadInvalidated(current)) return null;
+        if (recoveryReadInvalidated(current)) {
+          if (requireKnown) throw const ClientError('unauthenticated');
+          return null;
+        }
       } on ClientError catch (error) {
         if (error.code != 'failed_precondition') rethrow;
       }
     }
-    return super.read();
+    return super.read(requireKnown: requireKnown);
   }
 
   @override

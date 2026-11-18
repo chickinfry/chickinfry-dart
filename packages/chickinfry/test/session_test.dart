@@ -304,6 +304,24 @@ void main() {
     },
   );
 
+  test('C-12 a protected call with an empty store never sends', () async {
+    final peer = await Peer.start((request) async {
+      await reply(request, {'error': 'unauthenticated'}, status: 401);
+    });
+    final store = MemorySessionStore(
+      peer.origin,
+      'empty-protected',
+      Record(null),
+    );
+    final transport = peer.transport().withSession(store);
+
+    await expectLater(
+      transport.invoke('thing.get', {}),
+      throwsA(clientFailure('unauthenticated')),
+    );
+    expect(peer.requests, 0);
+  });
+
   test('C-07 session reads latest record while copies retain separate auth contexts', () async {
     final observations = <int>[];
     final peer = await Peer.start((request) async {
@@ -322,9 +340,9 @@ void main() {
     final store = MemorySessionStore(peer.origin, 'fresh', record);
     final root = peer.transport();
     final session = root.withSession(store);
-    await session.invoke('thing.get', {});
+    await session.invokePublic('thing.get', {});
     await store.write(credentials(rotated: true));
-    await session.invoke('thing.get', {});
+    await session.invokePublic('thing.get', {});
     await root.invoke('thing.get', {});
     expect(observations, [0, 1, 0]);
   });
@@ -364,7 +382,7 @@ void main() {
         MemorySessionStore(peer.origin, 'retry', record),
       );
       await expectLater(
-        transport.invoke('thing.write', input),
+        transport.invokePublic('thing.write', input),
         throwsA(operationFailure('invalid_token', 401)),
       );
       expect(business, 2);
@@ -449,7 +467,10 @@ void main() {
           Observer(onRecord: events.add),
         );
         await expectLater(
-          withConformanceCall(call, () => transport.invoke('thing.get', {})),
+          withConformanceCall(
+            call,
+            () => transport.invokePublic('thing.get', {}),
+          ),
           throwsA(clientFailure(corrupt ? 'data_loss' : 'failed_precondition')),
         );
         expect(peer.requests, 0);
@@ -1223,15 +1244,15 @@ void main() {
         await expectLater(
           withConformanceCall(
             suppressed,
-            () => second.invoke('thing.write', {}),
+            () => second.invokePublic('thing.write', {}),
           ),
           throwsA(clientFailure('unauthenticated')),
         );
         expect(refreshes, 1);
+        expect(business, 2);
         if (conformanceEnabled) {
           expect(suppressed.refreshObservation, isNull);
-          expect(suppressed.httpObservation!.operation, 'thing.write');
-          expect(suppressed.httpObservation!.outcomeUnknown, isFalse);
+          expect(suppressed.httpObservation, isNull);
         }
         expect(record.value == credentials(), isTrue);
         expect(record.replacements, 0);

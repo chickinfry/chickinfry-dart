@@ -13,6 +13,7 @@ the executable hash, and every launch. Its native declaration uses:
   "driverVersion": "1.0.0",
   "driverCommit": "<full clean source commit>",
   "requiredAuthSDK": true,
+  "emptySessionSDK": true,
   "build": {"tool": "dart", "entry": "bin/driver.dart", "features": []},
   "executable": "driver",
   "run": null,
@@ -26,7 +27,7 @@ Prepare the package's existing `.dart_tool/package_config.json` with offline
 dependencies before invoking the coordinator. The runtime path in that config
 must resolve to the pinned runtime source. The coordinator injects
 `chickinfry_client_plain`, `chickinfry_client_auth` and
-`chickinfry_client_required_auth` and adds
+`chickinfry_client_required_auth`, and `chickinfry_client_empty_session`. It adds
 `-Dchickinfry.conformance=true`; they are generated inputs, not registry packages.
 No dependency download or custom build/run arguments belong in the declaration.
 
@@ -36,7 +37,10 @@ fixtures before SDK construction. Copies retain the source client's fixture.
 For C-11, the requiredAuth fixture selects the required-verification SDK. It uses the
 same client.create/client.call protocol and leaves session and bearer paths intact.
 The opted-in declaration also accepts --required-auth-sdk from the coordinator.
-SDK selection depends only on the explicit fixture, never the case identifier.
+The emptySession fixture selects the C-12 SDK. Its client uses the runtime's
+in-memory device store for sign-in and logout. Store reads observe that same
+store, and the driver does not install or clear credentials on its behalf.
+SDK selection depends on the explicit fixture.
 Its tests check signup attempt reuse, SDK results and errors, and compile the
 invalid sealed-choice consumer to prove that email and attempt cannot coexist.
 The driver accepts only the native Dart SDK role and process protocol version 1;

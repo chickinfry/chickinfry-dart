@@ -520,7 +520,7 @@ abstract class DeviceStore implements SessionStore {
   }
 
   @override
-  Future<SessionCredentials?> read() async {
+  Future<SessionCredentials?> read({bool requireKnown = false}) async {
     requireAvailable();
     final state = await load();
     if (state.authTransitionUnknown &&
@@ -529,17 +529,21 @@ abstract class DeviceStore implements SessionStore {
               active.authGeneration == state.authGeneration &&
               active.authTransitionId == state.authTransitionId,
         )) {
+      if (requireKnown) throw const ClientError('failed_precondition');
       return null;
     }
     if (state.refreshSent) throw const ClientError('unauthenticated');
     return state.session;
   }
 
-  Future<SessionCredentials?> waitForSession(Duration timeout) async {
+  Future<SessionCredentials?> waitForSession(
+    Duration timeout, {
+    bool requireKnown = false,
+  }) async {
     final elapsed = Stopwatch()..start();
     while (true) {
       try {
-        return await read();
+        return await read(requireKnown: requireKnown);
       } on ClientError catch (error) {
         if (error.code != 'unauthenticated' || elapsed.elapsed >= timeout) {
           rethrow;

@@ -3,7 +3,7 @@ import 'errors.dart';
 import 'http.dart';
 
 /// Binds generated clients to their pending signup without duplicating device state.
-final class SignupBinding implements ClientTransport {
+final class SignupBinding implements PublicTransport {
   SignupBinding(this._transport);
 
   final ClientTransport _transport;
@@ -15,22 +15,32 @@ final class SignupBinding implements ClientTransport {
     ClientTransport transport,
     String operation,
     Map<String, Object?> input,
-    T Function(Object?) decode,
-  ) => transport is SignupBinding
-      ? transport._invoke(operation, input, decode)
-      : transport.invoke(operation, input).then(decode);
+    T Function(Object?) decode, {
+    bool publicOperation = false,
+  }) => transport is SignupBinding
+      ? transport._invoke(operation, input, decode, publicOperation)
+      : (publicOperation
+                ? transport.invokePublic(operation, input)
+                : transport.invoke(operation, input))
+            .then(decode);
 
   @override
   Future<Object?> invoke(String operation, Map<String, Object?> input) =>
-      _invoke(operation, input, (output) => output);
+      _invoke(operation, input, (output) => output, false);
+
+  @override
+  Future<Object?> invokePublic(String operation, Map<String, Object?> input) =>
+      _invoke(operation, input, (output) => output, true);
 
   Future<T> _invoke<T>(
     String operation,
     Map<String, Object?> input,
     T Function(Object?) decode,
+    bool publicOperation,
   ) async {
+    final send = publicOperation ? _transport.invokePublic : _transport.invoke;
     if (_transport is DeviceTransport) {
-      return decode(await _transport.invoke(operation, input));
+      return decode(await send(operation, input));
     }
     var request = input;
     final signup = _signup;
@@ -58,7 +68,7 @@ final class SignupBinding implements ClientTransport {
                 request['attempt'] == signup?.attempt
             ? signup?.email
             : null);
-    final output = await _transport.invoke(operation, request);
+    final output = await send(operation, request);
     final result = decode(output);
     if (operation == 'auth.signup' &&
         output is Map<String, Object?> &&

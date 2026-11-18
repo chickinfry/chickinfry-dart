@@ -50,7 +50,7 @@ DeviceTransport createDeviceTransport({
   return DeviceTransport(store, timeout: timeout);
 }
 
-final class DeviceTransport implements ClientTransport {
+final class DeviceTransport implements PublicTransport {
   DeviceTransport(this.store, {Duration timeout = const Duration(seconds: 30)})
     : _connection = HttpTransport(store.origin, timeout: timeout) {
     _transport = _browser ? _connection : _connection.withSession(store);
@@ -62,7 +62,18 @@ final class DeviceTransport implements ClientTransport {
   HttpTransport withBearer(String token) => _connection.withBearer(token);
 
   @override
-  Future<Object?> invoke(String operation, Map<String, Object?> input) async {
+  Future<Object?> invoke(String operation, Map<String, Object?> input) =>
+      _invoke(operation, input, publicOperation: false);
+
+  @override
+  Future<Object?> invokePublic(String operation, Map<String, Object?> input) =>
+      _invoke(operation, input, publicOperation: true);
+
+  Future<Object?> _invoke(
+    String operation,
+    Map<String, Object?> input, {
+    required bool publicOperation,
+  }) async {
     store.requireAvailable();
     final auth = const {
       'auth.signup',
@@ -74,7 +85,9 @@ final class DeviceTransport implements ClientTransport {
       'auth.logout',
     };
     if (!auth.contains(operation)) {
-      return _transport.invoke(operation, input);
+      return publicOperation
+          ? _transport.invokePublic(operation, input)
+          : _transport.invoke(operation, input);
     }
     final explicitAuthentication = const {
       'auth.signup',
@@ -135,7 +148,10 @@ final class DeviceTransport implements ClientTransport {
       } finally {
         await store.clear(before);
       }
-      return result ?? <String, Object?>{'status': 'ok'};
+      if (!_browser && before.session == null) {
+        throw const ClientError('unauthenticated');
+      }
+      return result;
     }
     DeviceAttempt? consumed;
     if (operation == 'auth.verify_email' && request['attempt'] is String) {
@@ -218,6 +234,7 @@ final class DeviceTransport implements ClientTransport {
       Object? result;
       OperationError? rejection;
       try {
+        // Device authentication can proceed independently of prior credentials.
         result = await _connection.invoke(operation, request);
       } on OperationError catch (error) {
         if (transition == null) rethrow;

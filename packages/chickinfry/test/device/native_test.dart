@@ -13,6 +13,7 @@ import 'package:chickinfry/src/device/files.dart';
 import 'package:chickinfry/src/signup.dart';
 import 'package:test/test.dart';
 
+import '../support.dart' show clientFailure;
 import 'support.dart';
 
 void main() {
@@ -216,10 +217,10 @@ void main() {
         await expectLater(
           actor.invoke('catalog.list', {}),
           throwsA(
-            isA<OperationError>().having(
+            isA<ClientError>().having(
               (e) => e.code,
               'code',
-              'invalid_token',
+              'failed_precondition',
             ),
           ),
         );
@@ -248,7 +249,7 @@ void main() {
         final lateInstalled = after.session == lateSession;
         expect(signins, 3);
         expect(signups, 1);
-        expect(business, 1);
+        expect(business, 0);
         expect(cleanups, 1);
         expect(
           lateInstalled,
@@ -889,13 +890,7 @@ void main() {
       if (change == 'signed out' || change == 'new account') {
         await expectLater(
           client.invoke('private.check', {}),
-          throwsA(
-            isA<OperationError>().having(
-              (error) => error.code,
-              'code',
-              'unauthenticated',
-            ),
-          ),
+          throwsA(clientFailure('failed_precondition')),
         );
         expect(
           !usedIssued && !usedReplacement && store.transientState == null,
@@ -912,7 +907,7 @@ void main() {
         expect(usedIssued && await store.read() == issued, isTrue);
       }
       expect(
-        protected == (change == 'new account' ? 2 : 1) && refreshes == 0,
+        protected == (change == 'signed out' ? 0 : 1) && refreshes == 0,
         isTrue,
       );
     }, skip: unsupportedPosix);
@@ -1928,7 +1923,10 @@ void main() {
       });
       await arrived.future;
       files.readUnavailable = false;
-      await client.invoke('auth.logout', {});
+      await expectLater(
+        client.invoke('auth.logout', {}),
+        throwsA(clientFailure('unauthenticated')),
+      );
       expect((await observer.load()).authGeneration, 2);
       expect((await observer.load()).attempts.isEmpty, isTrue);
       release.complete();
@@ -1973,7 +1971,10 @@ void main() {
       );
       files.readUnavailable = true;
       expect((await store.load()).attempts.length, 1);
-      await other.invoke('auth.logout', {});
+      await expectLater(
+        other.invoke('auth.logout', {}),
+        throwsA(clientFailure('unauthenticated')),
+      );
       final durable = await peer.load();
       expect(durable.authGeneration, 2);
       files.readUnavailable = false;
@@ -3203,10 +3204,21 @@ void main() {
               }) as Map)['attempt'];
             }
             if (recoveredRead) await actorStore.load();
-            await actor.invoke(
-              boundary == 'logout' ? 'auth.logout' : 'auth.signin',
-              boundary == 'logout' ? {} : {'email': 'actor@example.test'},
-            );
+            if (boundary == 'logout') {
+              final logout = actor.invoke('auth.logout', {});
+              if (memoryAccount) {
+                await logout;
+              } else {
+                await expectLater(
+                  logout,
+                  throwsA(clientFailure('unauthenticated')),
+                );
+              }
+            } else {
+              await actor.invoke('auth.signin', {
+                'email': 'actor@example.test',
+              });
+            }
             final durable = await observer.load();
             expect(durable.authGeneration, greaterThan(baseAuth));
             release.complete();
@@ -3891,13 +3903,7 @@ void main() {
       if (boundary == 'logout') {
         await expectLater(
           first.invoke('example.read', {}),
-          throwsA(
-            isA<OperationError>().having(
-              (e) => e.code,
-              'code',
-              'unauthenticated',
-            ),
-          ),
+          throwsA(clientFailure('unauthenticated')),
         );
       } else {
         await first.invoke('example.read', {});
@@ -3969,13 +3975,7 @@ void main() {
       );
       await expectLater(
         client.invoke('example.read', {}),
-        throwsA(
-          isA<OperationError>().having(
-            (e) => e.code,
-            'code',
-            'unauthenticated',
-          ),
-        ),
+        throwsA(clientFailure('unauthenticated')),
       );
       expect(refreshes, 0);
     },

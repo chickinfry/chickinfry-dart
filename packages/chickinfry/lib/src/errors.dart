@@ -38,7 +38,7 @@ final class ClientError implements Exception {
       'data_loss' => 'Stored session data could not be read. Sign out to clear it, then sign in again.',
       'unimplemented' => 'Use a supported platform, authentication transport, and storage version.',
       'internal' => 'The response or client state was invalid; check the server origin and update the SDK.',
-      'unauthenticated' => 'Sign in again before making this call.',
+      'unauthenticated' => 'A valid session is required.',
       _ => null,
     };
     final suffix = status == null ? '' : ', HTTP $status';
