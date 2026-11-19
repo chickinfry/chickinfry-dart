@@ -6,13 +6,13 @@ import 'http.dart';
 final class SignupBinding implements PublicTransport {
   SignupBinding(this._transport);
 
-  final ClientTransport _transport;
+  final Transport _transport;
   ({String attempt, String email})? _signup;
   int _logoutGeneration = 0;
   final _emailGenerations = <String, int>{};
 
   static Future<T> decode<T>(
-    ClientTransport transport,
+    Transport transport,
     String operation,
     Map<String, Object?> input,
     T Function(Object?) decode, {

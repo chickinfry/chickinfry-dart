@@ -39,7 +39,7 @@ final class BrowserSession {
 // No token, native store, refresh, or automatic retry boundary exists here.
 final class BrowserAuth {
   BrowserAuth(this._transport);
-  final ClientTransport _transport;
+  final Transport _transport;
 
   Future<BrowserSession> session() async =>
       BrowserSession.fromJson(await _transport.invoke('auth.session', {}));

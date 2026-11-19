@@ -118,3 +118,34 @@ abstract interface class SessionStore {
     SessionCredentials? next,
   );
 }
+
+/// MemoryStore holds one session in memory for the lifetime of the store.
+final class MemoryStore implements SessionStore {
+  MemoryStore(this.origin) : coordinationKey = 'memory:${_nextKey++}';
+
+  static int _nextKey = 0;
+
+  @override
+  final String origin;
+  @override
+  final String coordinationKey;
+  SessionCredentials? _value;
+
+  @override
+  Future<SessionCredentials?> read() async => _value;
+
+  @override
+  Future<void> write(SessionCredentials value) async {
+    _value = value;
+  }
+
+  @override
+  Future<bool> compareAndSet(
+    SessionCredentials expected,
+    SessionCredentials? next,
+  ) async {
+    if (_value != expected) return false;
+    _value = next;
+    return true;
+  }
+}

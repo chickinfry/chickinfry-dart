@@ -37,7 +37,7 @@ void main() {
   const origin = 'https://api.example.com';
   final sessions = SecureSessionStore(origin);
   final transport = HttpTransport(origin);
-  final client = Client(transport.withSession(sessions));
+  final client = createClient(transport.withSession(sessions));
   // Pass client and sessions to your app; close transport when it finishes.
 }
 ```

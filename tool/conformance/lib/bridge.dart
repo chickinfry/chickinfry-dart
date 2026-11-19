@@ -16,20 +16,20 @@ typedef Bridge = Future<Map<String, Object?>> Function(
 );
 
 /// Selects the generated SDK only from the explicit fixture identifier.
-(T, Bridge) createBridge<T extends ClientTransport>(
+(T, Bridge) createBridge<T extends Transport>(
   T Function() createTransport, {
   required String fixture,
 }) {
   final factory = switch (fixture) {
-    'plain' => (ClientTransport transport) => plainBridge(
-      plain.Client(transport),
+    'plain' => (Transport transport) => plainBridge(
+      plain.createClient(transport),
     ),
-    'auth' => (ClientTransport transport) => authBridge(auth.Client(transport)),
-    'requiredAuth' => (ClientTransport transport) => requiredAuthBridge(
-      required_auth.Client(transport),
+    'auth' => (Transport transport) => authBridge(auth.createClient(transport)),
+    'requiredAuth' => (Transport transport) => requiredAuthBridge(
+      required_auth.createClient(transport),
     ),
-    'emptySession' => (ClientTransport transport) => emptySessionBridge(
-      empty_session.Client(transport),
+    'emptySession' => (Transport transport) => emptySessionBridge(
+      empty_session.createClient(transport),
     ),
     _ => invalidArgs(),
   };

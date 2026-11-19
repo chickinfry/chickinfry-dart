@@ -1,10 +1,26 @@
-/// OperationError preserves a server error code, HTTP status, and received description.
+/// FieldError identifies a validation failure at an input path.
+final class FieldError {
+  const FieldError(this.path, this.code);
+
+  final String path;
+  final String code;
+}
+
+/// OperationError preserves a server error code, HTTP status, and description.
 final class OperationError implements Exception {
-  const OperationError(this.code, this.status, {this.responseMessage});
+  const OperationError(
+    this.code,
+    this.status, [
+    this.message,
+    this.fields = const [],
+  ]);
 
   final String code;
   final int status;
-  final String? responseMessage;
+  final String? message;
+  final List<FieldError> fields;
+
+  String? get responseMessage => message;
 
   @override
   String toString() =>

@@ -14,18 +14,18 @@ import 'origin.dart';
 import 'session.dart';
 import 'testing/conformance.dart';
 
-/// ClientTransport is the generated client's operation boundary.
-abstract interface class ClientTransport {
+/// Transport is the generated client's operation boundary.
+abstract interface class Transport {
   Future<Object?> invoke(String operation, Map<String, Object?> input);
 }
 
 /// Optional support for operations that can run without a session.
-abstract interface class PublicTransport implements ClientTransport {
+abstract interface class PublicTransport implements Transport {
   Future<Object?> invokePublic(String operation, Map<String, Object?> input);
 }
 
 /// Dispatches public calls while supporting transports that only implement invoke.
-extension PublicInvocation on ClientTransport {
+extension PublicInvocation on Transport {
   Future<Object?> invokePublic(String operation, Map<String, Object?> input) {
     final transport = this;
     return transport is PublicTransport
@@ -486,8 +486,7 @@ final class HttpTransport implements PublicTransport {
         throw OperationError(
           code,
           status,
-          responseMessage:
-              value is Map<String, Object?> && value['message'] is String
+          value is Map<String, Object?> && value['message'] is String
               ? value['message']! as String
               : null,
         );

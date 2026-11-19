@@ -42,7 +42,7 @@ import 'package:chickinfry_client/chickinfry_client.dart';
 
 Future<void> main() async {
   final transport = HttpTransport('https://api.example.com');
-  final client = Client(transport);
+  final client = createClient(transport);
   final result = await client.accountStatus.getStatus(
     AccountStatusGetStatusInput(/* required fields */),
   );
@@ -55,7 +55,8 @@ On native targets, use `transport.withBearer(token)` or
 `transport.withSession(sessions)` for an authenticated copy. Close the original transport when the application finishes.
 Copies share its connections; closing a copy does not close the original.
 
-The application supplies a `SessionStore`. Successful login results are saved
+Use `MemoryStore(origin)` for a session that lives only in memory, or supply a
+persistent `SessionStore`. Successful login results are saved
 explicitly with `sessions.write(SessionCredentials.fromJson(result.toJson()))`.
 Send logout with the captured session credentials, then clear only that session:
 

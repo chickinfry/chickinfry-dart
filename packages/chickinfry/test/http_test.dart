@@ -204,7 +204,7 @@ void main() {
     }
     expect(
       () => transport.withSession(
-        MemorySessionStore(
+        TestSessionStore(
           'https://other.example',
           'other',
           Record(credentials()),

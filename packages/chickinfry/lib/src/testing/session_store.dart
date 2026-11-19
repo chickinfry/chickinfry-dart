@@ -15,8 +15,8 @@ class Record {
   int deletions = 0;
 }
 
-class MemorySessionStore implements SessionStore {
-  MemorySessionStore(this.origin, this.coordinationKey, this.record);
+class TestSessionStore implements SessionStore {
+  TestSessionStore(this.origin, this.coordinationKey, this.record);
   @override
   final String origin;
   @override

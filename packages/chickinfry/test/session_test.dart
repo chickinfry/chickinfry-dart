@@ -216,7 +216,7 @@ void main() {
       final original = credentials();
       final replacement = credentials(rotated: true, session: 'other');
       final record = Record(null);
-      final memory = MemorySessionStore('http://127.0.0.1', 'record', record);
+      final memory = TestSessionStore('http://127.0.0.1', 'record', record);
       final write = memory.write(original);
       expect(record.snapshot, (value: original, revision: 1));
       final second = memory.write(replacement);
@@ -308,11 +308,14 @@ void main() {
     final peer = await Peer.start((request) async {
       await reply(request, {'error': 'unauthenticated'}, status: 401);
     });
-    final store = MemorySessionStore(
-      peer.origin,
-      'empty-protected',
-      Record(null),
-    );
+    final store = MemoryStore(peer.origin);
+    final other = MemoryStore(peer.origin);
+    final initial = credentials();
+    await store.write(initial);
+    expect(await other.read(), isNull);
+    expect(other.coordinationKey, isNot(store.coordinationKey));
+    expect(await store.compareAndSet(initial, null), isTrue);
+    expect(await store.compareAndSet(initial, initial), isFalse);
     final transport = peer.transport().withSession(store);
 
     await expectLater(
@@ -337,7 +340,7 @@ void main() {
       await reply(request, {});
     });
     final record = Record(null);
-    final store = MemorySessionStore(peer.origin, 'fresh', record);
+    final store = TestSessionStore(peer.origin, 'fresh', record);
     final root = peer.transport();
     final session = root.withSession(store);
     await session.invokePublic('thing.get', {});
@@ -379,7 +382,7 @@ void main() {
       });
       final record = Record(credentials());
       final transport = peer.transport().withSession(
-        MemorySessionStore(peer.origin, 'retry', record),
+        TestSessionStore(peer.origin, 'retry', record),
       );
       await expectLater(
         transport.invokePublic('thing.write', input),
@@ -420,7 +423,7 @@ void main() {
         await reply(request, {'error': failure.$2}, status: failure.$1);
       });
       final transport = peer.transport().withSession(
-        MemorySessionStore(peer.origin, 'other-errors', Record(credentials())),
+        TestSessionStore(peer.origin, 'other-errors', Record(credentials())),
       );
       for (final failure in [
         (401, 'account_blocked'),
@@ -458,7 +461,7 @@ void main() {
           ..corrupt = corrupt
           ..failRead = !corrupt;
         final transport = peer.transport().withSession(
-          MemorySessionStore(peer.origin, 'read-failure', record),
+          TestSessionStore(peer.origin, 'read-failure', record),
         );
         final events = <ConformanceEvent>[];
         final call = conformanceCall(
@@ -528,7 +531,7 @@ void main() {
         });
         final record = Record(credentials());
         final transport = peer.transport().withSession(
-          MemorySessionStore(peer.origin, 'changed-expiry', record),
+          TestSessionStore(peer.origin, 'changed-expiry', record),
         );
         expect(await transport.invoke('thing.get', {}), {'value': 'ok'});
         expect(refreshes, 1);
@@ -630,12 +633,8 @@ void main() {
       }
     });
     final record = Record(credentials());
-    final firstStore = MemorySessionStore(
-      peer.origin,
-      'physical-record',
-      record,
-    );
-    final secondStore = MemorySessionStore(
+    final firstStore = TestSessionStore(peer.origin, 'physical-record', record);
+    final secondStore = TestSessionStore(
       peer.origin,
       'physical-record',
       record,
@@ -771,10 +770,10 @@ void main() {
       }
     });
     final first = peer.transport().withSession(
-      MemorySessionStore(peer.origin, 'record-one', Record(credentials())),
+      TestSessionStore(peer.origin, 'record-one', Record(credentials())),
     );
     final second = peer.transport().withSession(
-      MemorySessionStore(peer.origin, 'record-two', Record(credentials())),
+      TestSessionStore(peer.origin, 'record-two', Record(credentials())),
     );
     await Future.wait([
       first.invoke('thing.get', {}),
@@ -810,7 +809,7 @@ void main() {
         first
             .transport()
             .withSession(
-              MemorySessionStore(
+              TestSessionStore(
                 first.origin,
                 'same-key',
                 Record(credentials(session: 'first-origin')),
@@ -820,7 +819,7 @@ void main() {
         second
             .transport()
             .withSession(
-              MemorySessionStore(
+              TestSessionStore(
                 second.origin,
                 'same-key',
                 Record(credentials(session: 'second-origin')),
@@ -861,7 +860,7 @@ void main() {
       });
       final record = Record(credentials());
       final store = RecordingSessionStore(
-        MemorySessionStore(peer.origin, 'reject', record),
+        TestSessionStore(peer.origin, 'reject', record),
       );
       final first = peer.transport().withSession(store);
       final second = peer.transport().withSession(store);
@@ -971,7 +970,7 @@ void main() {
           }
         });
         final store = RecordingSessionStore(
-          MemorySessionStore(peer.origin, 'cas-race-$succeeds', record),
+          TestSessionStore(peer.origin, 'cas-race-$succeeds', record),
         );
         final outcome = expectLater(
           withConformanceCall(
@@ -1018,7 +1017,7 @@ void main() {
         peer
             .transport()
             .withSession(
-              MemorySessionStore(peer.origin, 'already-changed', record),
+              TestSessionStore(peer.origin, 'already-changed', record),
             )
             .invoke('thing.get', {}),
         throwsA(clientFailure('failed_precondition')),
@@ -1044,7 +1043,7 @@ void main() {
         peer
             .transport()
             .withSession(
-              MemorySessionStore(peer.origin, 'delete-failure', record),
+              TestSessionStore(peer.origin, 'delete-failure', record),
             )
             .invoke('thing.get', {}),
         throwsA(
@@ -1122,12 +1121,12 @@ void main() {
             await reply(request, {'error': 'invalid_token'}, status: 401);
           }
         });
-        final firstStore = MemorySessionStore(
+        final firstStore = TestSessionStore(
           peer.origin,
           'uncertain-$kind',
           record,
         );
-        final secondStore = MemorySessionStore(
+        final secondStore = TestSessionStore(
           peer.origin,
           'uncertain-$kind',
           record,
@@ -1298,12 +1297,12 @@ void main() {
           await reply(request, {'error': 'invalid_token'}, status: 401);
         }
       });
-      final firstStore = MemorySessionStore(
+      final firstStore = TestSessionStore(
         peer.origin,
         'overlapping-unknown',
         record,
       );
-      final secondStore = MemorySessionStore(
+      final secondStore = TestSessionStore(
         peer.origin,
         'overlapping-unknown',
         record,
@@ -1363,7 +1362,7 @@ void main() {
           peer
               .transport()
               .withSession(
-                MemorySessionStore(peer.origin, 'identity-$change', record),
+                TestSessionStore(peer.origin, 'identity-$change', record),
               )
               .invoke('thing.write', {}),
           throwsA(clientFailure('internal')),
@@ -1389,7 +1388,7 @@ void main() {
       final record = Record(scenario == 'missing session' ? null : initial);
       final authorizations = <String?>[];
       final activeTokens = {'Bearer $accessToken', 'Bearer $nextAccessToken'};
-      late MemorySessionStore store;
+      late TestSessionStore store;
       final peer = await Peer.start((request) async {
         await request.drain<void>();
         authorizations.add(request.headers.value('authorization'));
@@ -1411,7 +1410,7 @@ void main() {
       });
       store = scenario == 'before request'
           ? LoginAfterReadStore(peer.origin, record, newLogin)
-          : MemorySessionStore(peer.origin, 'logout-$scenario', record);
+          : TestSessionStore(peer.origin, 'logout-$scenario', record);
       final transport = peer.transport().withSession(store);
       if (scenario == 'expired token' || scenario == 'server failure') {
         await expectLater(
@@ -1444,7 +1443,7 @@ void main() {
   }
 }
 
-class FaultyStore extends MemorySessionStore {
+class FaultyStore extends TestSessionStore {
   FaultyStore(Record record, this.fails)
     : super('http://127.0.0.1', 'faulty', record);
   final bool fails;
@@ -1475,7 +1474,7 @@ Future<void> logout(HttpTransport transport, SessionStore sessions) async {
   }
 }
 
-class LoginAfterReadStore extends MemorySessionStore {
+class LoginAfterReadStore extends TestSessionStore {
   LoginAfterReadStore(String origin, Record record, this.newLogin)
     : super(origin, 'logout-before-request', record);
 

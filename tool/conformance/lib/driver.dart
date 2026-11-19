@@ -180,7 +180,7 @@ final class Driver {
         stores[ref] = Store(
           record,
           RecordingSessionStore(
-            MemorySessionStore(origin, '$runId:$caseId:$ref', record),
+            TestSessionStore(origin, '$runId:$caseId:$ref', record),
           ),
         );
         return {'storeRef': ref, 'revision': record.revision};

@@ -7,6 +7,18 @@ import 'package:chickinfry/server.dart';
 import 'package:test/test.dart';
 
 void main() {
+  test('server errors accept the public argument order', () {
+    const field = FieldError('message', 'required');
+    const error = OperationError('invalid_input', 400, 'Check the input', [
+      field,
+    ]);
+    expect(error.code, 'invalid_input');
+    expect(error.status, 400);
+    expect(error.message, 'Check the input');
+    expect(error.fields.single.path, 'message');
+    expect(error.fields.single.code, 'required');
+  });
+
   var calls = 0;
   late Application app;
   setUp(() {

@@ -4,7 +4,7 @@ import 'package:chickinfry/chickinfry.dart';
 import 'package:chickinfry/src/signup.dart';
 import 'package:test/test.dart';
 
-final class _Transport implements ClientTransport {
+final class _Transport implements Transport {
   _Transport(this.call);
   final Future<Object?> Function(String, Map<String, Object?>) call;
 
