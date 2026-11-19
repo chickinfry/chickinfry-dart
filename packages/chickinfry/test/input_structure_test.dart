@@ -223,22 +223,14 @@ Future<void> main() async {
     }
   });
 
-  test('auth-named operations share input structure validation', () async {
-    for (final value in [
-      '${'[' * 64}null${']' * 64}',
-      '1e999',
-      '-1e999',
-      '{"a":0,"a":1}',
-      r'"\ud800"',
-    ]) {
-      final response = await call('{"ignored":$value}', 'auth.signin');
-      expect(calls, 0);
-      expect(contexts, 0);
-      expect(response.status, 400);
-      expect(response.body, '{"error":"invalid_input"}');
+  test('auth-named operations never reach the Dart guest', () async {
+    for (final body in ['{}', '{']) {
+      final response = await call(body, 'auth.signin');
+      expect(response.status, 404);
+      expect(response.body, '{"error":"not_found"}');
     }
-    expect((await call('{}', 'auth.signin')).status, 200);
-    expect(calls, 1);
+    expect(calls, 0);
+    expect(contexts, 0);
   });
 
   test(

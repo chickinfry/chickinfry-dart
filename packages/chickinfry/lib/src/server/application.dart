@@ -67,6 +67,33 @@ class Context {
   }
 }
 
+/// A business request carrying the host's verified session.
+final class AuthenticatedContext<T extends Session?> extends Context {
+  AuthenticatedContext._(Context base, T session)
+    : auth = (session: session),
+      super(base.request, base._log);
+
+  final ({T session}) auth;
+}
+
+const _absentHostAuth = Object();
+
+Object? hostAuthFrame(Map<String, Object?> metadata) =>
+    metadata.containsKey('auth') ? metadata['auth'] : _absentHostAuth;
+
+Map<String, Object?> decodeHostMetadata(String text) {
+  if (text.length > Application.maxRequestBytes ||
+      utf8.encode(text).length > Application.maxRequestBytes ||
+      Application._validateJson(text) != null) {
+    throw const FormatException('Invalid host request metadata.');
+  }
+  final decoded = jsonDecode(text);
+  if (decoded is! Map<String, Object?>) {
+    throw const FormatException('Invalid host request metadata.');
+  }
+  return decoded;
+}
+
 /// Forwards one request-scoped log line; level is one of the shared names.
 typedef ContextLog = Future<void> Function(
   String level,
@@ -75,7 +102,9 @@ typedef ContextLog = Future<void> Function(
 );
 
 final class ApplicationOptions {
-  const ApplicationOptions();
+  const ApplicationOptions({this.authHooks});
+
+  final AuthHooks? authHooks;
 }
 
 /// Internal response consumed by the platform connection.
@@ -95,6 +124,9 @@ final class Application {
     operations, {
     this._contextFactory,
     this._setup,
+    this._authEnabled = false,
+    this._isPublic,
+    this._authContextFactory,
   }) : _operations = Map.unmodifiable(operations);
 
   final Map<
@@ -112,6 +144,9 @@ final class Application {
   )?
   _contextFactory;
   final Future<ApplicationOptions> Function()? _setup;
+  final bool _authEnabled;
+  final bool Function(String)? _isPublic;
+  final Context Function(Context, Session?, bool)? _authContextFactory;
   Future<ApplicationOptions>? _setupResult;
   static const maxRequestBytes = 4 << 20;
   static final _code = RegExp(r'^[a-z_]{1,64}$');
@@ -122,10 +157,15 @@ final class Application {
   Future<void> prepare({ContextLog? log}) async {
     final setup = _setup;
     if (setup != null) {
-      await (_setupResult ??= _capturePrint(
-        log,
-        () => Future<ApplicationOptions>.sync(setup),
-      ));
+      await (_setupResult ??= _capturePrint(log, () async {
+        final options = await Future<ApplicationOptions>.sync(setup);
+        if (!_authEnabled && options.authHooks != null) {
+          throw StateError(
+            'Declare auth in auth.yml before registering auth hooks.',
+          );
+        }
+        return options;
+      }));
     }
   }
 
@@ -138,6 +178,7 @@ final class Application {
     ContextLog? log,
     Vault? vault,
     StorageCall? storage,
+    Object? authFrame = _absentHostAuth,
   }) async {
     try {
       try {
@@ -145,10 +186,8 @@ final class Application {
       } catch (_) {
         return _error('operation_failed', 500);
       }
-      final operation =
-          _operations[request.uri.path.substring(
-            request.uri.path.isEmpty ? 0 : 1,
-          )];
+      final name = request.uri.path.substring(request.uri.path.isEmpty ? 0 : 1);
+      final operation = name.startsWith('auth.') ? null : _operations[name];
       if (request.method != 'POST' ||
           request.uri.hasQuery ||
           (rawUri ?? request.uri.toString()).contains('%') ||
@@ -163,6 +202,25 @@ final class Application {
       if (contentType != 'application/json') {
         return _error('unsupported_media_type', 415);
       }
+      if (!_authEnabled && !identical(authFrame, _absentHostAuth)) {
+        return _error('operation_failed', 500);
+      }
+      final public = _authEnabled && (_isPublic?.call(name) ?? false);
+      final session = _authEnabled ? _decodeVerifiedSession(authFrame) : null;
+      if (_authEnabled && !public && session == null) {
+        return _error('unauthenticated', 401);
+      }
+      final effectiveRequest = _authEnabled
+          ? ServerRequest(
+              method: request.method,
+              uri: request.uri,
+              headers: {
+                for (final entry in request.headers.entries)
+                  if (entry.key != 'authorization' && entry.key != 'cookie')
+                    entry.key: entry.value,
+              },
+            )
+          : request;
       final bytes = BytesBuilder(copy: true);
       final iterator = StreamIterator(body);
       try {
@@ -189,21 +247,25 @@ final class Application {
       if (decoded is! Map<String, Object?>) {
         return _error('invalid_input', 400);
       }
-      final output = await _capturePrint(
-        log,
-        () => operation(
-          _contextFactory?.call(
-                request,
-                connection,
-                secrets,
-                log,
-                vault,
-                storage,
-              ) ??
-              Context(request, log),
-          decoded,
-        ),
-      );
+      final output = await _capturePrint(log, () {
+        final base =
+            _contextFactory?.call(
+              effectiveRequest,
+              connection,
+              secrets,
+              log,
+              vault,
+              storage,
+            ) ??
+            Context(effectiveRequest, log);
+        final context = !_authEnabled
+            ? base
+            : _authContextFactory?.call(base, session, public) ??
+                  (public
+                      ? AuthenticatedContext<Session?>._(base, session)
+                      : AuthenticatedContext<Session>._(base, session!));
+        return operation(context, decoded);
+      });
       return ServerResponse(200, jsonEncode(output));
     } on OperationError catch (error) {
       // Status 501 is reserved for the explicit not_implemented contract.
@@ -218,6 +280,48 @@ final class Application {
       return _error('operation_failed', 500);
     } catch (_) {
       return _error('operation_failed', 500);
+    }
+  }
+
+  /// Called by the host callback entry, outside HTTP dispatch.
+  Future<ServerResponse> handleAuthHook(
+    Object? frame, {
+    DatabaseConnection? connection,
+    ContextLog? log,
+  }) async {
+    final borrowed = connection != null && isBorrowedAuthConnection(connection);
+    try {
+      if (!_authEnabled) return _error('operation_failed', 500);
+      final message = _decodeAuthHook(frame);
+      await prepare(log: log);
+      final hooks = (await _setupResult)?.authHooks;
+      switch (message.kind) {
+        case 'userCreating':
+          if (!borrowed) return _error('operation_failed', 500);
+          try {
+            await _capturePrint(log, () async {
+              await hooks?.userCreating?.call(connection, message.user);
+            });
+          } catch (_) {
+            return _error('user_creation_failed', 500);
+          }
+        case 'userCreated':
+          if (connection != null) return _error('operation_failed', 500);
+          try {
+            await _capturePrint(log, () async {
+              await hooks?.userCreated?.call(message.user);
+            });
+          } catch (_) {
+            return _error('user_created_effect_failed', 500);
+          }
+        default:
+          return _error('operation_failed', 500);
+      }
+      return const ServerResponse(200, '{}');
+    } catch (_) {
+      return _error('operation_failed', 500);
+    } finally {
+      if (borrowed) connection.close();
     }
   }
 
@@ -412,4 +516,85 @@ final class Application {
 
   static ServerResponse _error(String code, int status) =>
       ServerResponse(status, jsonEncode({'error': code}));
+}
+
+/// Identity exposed to a business handler after host verification.
+final class SessionUser {
+  const SessionUser(this.id, this.email);
+
+  final String id;
+  final String email;
+}
+
+/// A verified business session for the current request.
+final class Session {
+  const Session(this.id, this.user);
+
+  final String id;
+  final SessionUser user;
+}
+
+/// The public user snapshot supplied during a host signup callback.
+final class AuthUser {
+  const AuthUser(this.id, this.email, this.createdAt);
+
+  final String id;
+  final String email;
+  final String createdAt;
+}
+
+/// Callbacks wired by generated applications into the host's signup lifecycle.
+final class AuthHooks {
+  const AuthHooks({this.userCreating, this.userCreated});
+
+  final Future<void> Function(DatabaseConnection, AuthUser)? userCreating;
+  final Future<void> Function(AuthUser)? userCreated;
+}
+
+Map<String, Object?> _object(Object? value, int keys) {
+  if (value is! Map<String, Object?> || value.length != keys) {
+    throw const FormatException('Invalid host authentication frame.');
+  }
+  return value;
+}
+
+String _string(Map<String, Object?> value, String key) {
+  final field = value[key];
+  if (field is! String || field.isEmpty) {
+    throw const FormatException('Invalid host authentication frame.');
+  }
+  return field;
+}
+
+void _validateVersion(Map<String, Object?> frame) {
+  final version = frame['version'];
+  if (version is! int || version != 1) {
+    throw const FormatException('Invalid host authentication frame.');
+  }
+}
+
+Session? _decodeVerifiedSession(Object? value) {
+  final frame = _object(value, 2);
+  _validateVersion(frame);
+  if (frame.containsKey('session') && frame['session'] == null) return null;
+  final session = _object(frame['session'], 2);
+  final user = _object(session['user'], 2);
+  return Session(
+    _string(session, 'id'),
+    SessionUser(_string(user, 'id'), _string(user, 'email')),
+  );
+}
+
+({String kind, AuthUser user}) _decodeAuthHook(Object? value) {
+  final frame = _object(value, 3);
+  _validateVersion(frame);
+  final user = _object(frame['user'], 3);
+  return (
+    kind: _string(frame, 'hook'),
+    user: AuthUser(
+      _string(user, 'id'),
+      _string(user, 'email'),
+      _string(user, 'createdAt'),
+    ),
+  );
 }

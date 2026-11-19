@@ -22,17 +22,33 @@ typedef DatabaseCall = Future<Map<String, Object?>> Function(
   Map<String, Object?> frame,
 );
 
+DatabaseConnection borrowedAuthConnection(DatabaseCall call, int lease) {
+  if (lease <= 0 || lease > 9007199254740991) {
+    throw const DatabaseError('invalid_host_call');
+  }
+  return DatabaseConnection._(call, lease, borrowed: true);
+}
+
+bool isBorrowedAuthConnection(DatabaseConnection connection) =>
+    connection._borrowed;
+
 final class DatabaseConnection {
-  DatabaseConnection(DatabaseCall call) : _call = call, _lease = null;
-  DatabaseConnection._(this._call, this._lease);
+  DatabaseConnection(DatabaseCall call)
+    : _call = call,
+      _lease = null,
+      _borrowed = false;
+  DatabaseConnection._(this._call, this._lease, {this._borrowed = false});
   final DatabaseCall _call;
   final int? _lease;
+  final bool _borrowed;
   bool _closed = false;
   bool _transaction = false;
 
   void close() => _closed = true;
   void _check() {
-    if (_closed) throw StateError('Database connection is closed.');
+    if (!_closed) return;
+    if (_borrowed) throw const DatabaseError('invalid_host_call');
+    throw StateError('Database connection is closed.');
   }
 
   Future<Map<String, Object?>> _invoke(
@@ -80,6 +96,7 @@ final class DatabaseConnection {
 
   Future<T> transaction<T>(Future<T> Function(DatabaseConnection) work) async {
     _check();
+    if (_borrowed) throw const DatabaseError('invalid_host_call');
     if (_lease != null || _transaction) {
       throw StateError('Nested transactions are unavailable.');
     }

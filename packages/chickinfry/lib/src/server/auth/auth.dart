@@ -12,29 +12,6 @@ import 'private/database.dart';
 
 part 'cleanup.dart';
 
-/// Identity exposed to application handlers.
-final class SessionUser {
-  const SessionUser(this.id, this.email);
-  final String id;
-  final String email;
-}
-
-/// A validated native session.
-final class Session {
-  const Session(this.id, this.user, this._expiresAt);
-  final String id;
-  final SessionUser user;
-  final String _expiresAt;
-}
-
-/// The user snapshot supplied to signup callbacks.
-final class AuthUser {
-  const AuthUser(this.id, this.email, this.createdAt);
-  final String id;
-  final String email;
-  final String createdAt;
-}
-
 final class Authentication {
   Authentication(
     this._connection,
@@ -236,7 +213,9 @@ final class Authentication {
     );
   }
 
-  Future<Session?> session(String? authorization) async {
+  Future<({Session session, String expiresAt})?> _endpointSession(
+    String? authorization,
+  ) async {
     if (authorization == null) return null;
     if (!authorization.startsWith('Bearer ') ||
         !_validToken(authorization.substring(7))) {
@@ -281,10 +260,9 @@ final class Authentication {
         AppAuthUsersPrimaryKey(id: locked.userId),
       );
       if (!_activeUser(user, locked)) return null;
-      return Session(
-        locked.id,
-        SessionUser(user!.id, user.email),
-        _timestamp(
+      return (
+        session: Session(locked.id, SessionUser(user!.id, user.email)),
+        expiresAt: _timestamp(
           accessExpiry.isBefore(familyExpiry) ? accessExpiry : familyExpiry,
         ),
       );
@@ -399,18 +377,18 @@ final class Authentication {
       case 'auth.logout':
         require(const []);
         final active =
-            await session(context.request.headers['authorization']) ??
+            await _endpointSession(context.request.headers['authorization']) ??
             _fail('unauthenticated', 401);
         if (operation == 'auth.session') {
           return {
-            'id': active.user.id,
-            'email': active.user.email,
-            'session_id': active.id,
-            'expires_at': active._expiresAt,
+            'id': active.session.user.id,
+            'email': active.session.user.email,
+            'session_id': active.session.id,
+            'expires_at': active.expiresAt,
           };
         }
         await _db.appAuthSessions.updateIf(
-          AppAuthSessionsPrimaryKey(id: active.id),
+          AppAuthSessionsPrimaryKey(id: active.session.id),
           (c) => c.revokedAt.isNull(),
           AppAuthSessionsUpdate(revokedAt: Value(_timestamp(DateTime.now()))),
         );
