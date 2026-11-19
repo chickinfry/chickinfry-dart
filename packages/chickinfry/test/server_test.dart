@@ -409,7 +409,7 @@ void main() {
     ServerRequest? factoryRequest;
     final app = Application(
       {'demo.echo': (context, input) async => {}},
-      contextFactory: (request, connection) {
+      contextFactory: (request, connection, secrets, log, _, _) {
         factoryRequest = request;
         return Context(request);
       },
@@ -417,4 +417,181 @@ void main() {
     expect((await callWithProxyCredentials(app)).status, 200);
     expectNoProxyCredentials(factoryRequest!.headers);
   });
+
+  test('context factories receive lazily read secret values', () async {
+    final reads = <String>[];
+    String? handlerValue;
+    final app = Application(
+      {
+        'demo.echo': (context, input) async {
+          handlerValue = await (context as _SecretContext).secrets.value(
+            'API_TOKEN',
+          );
+          return {};
+        },
+      },
+      contextFactory: (request, connection, secrets, log, _, _) =>
+          _SecretContext(request, secrets!),
+    );
+    final response = await app.handle(
+      ServerRequest(
+        method: 'POST',
+        uri: Uri.parse('https://example.test/demo.echo'),
+        headers: const {'Content-Type': 'application/json'},
+      ),
+      Stream.value(utf8.encode('{}')),
+      rawUri: 'https://example.test/demo.echo',
+      secrets: SecretValues((name) async {
+        reads.add(name);
+        return name == 'API_TOKEN' ? 'token-value' : null;
+      }),
+    );
+    expect(response.status, 200);
+    expect(handlerValue, 'token-value');
+    expect(reads, ['API_TOKEN']);
+  });
+
+  test('unbound secret values fail with the shared contract', () async {
+    final app = Application(
+      {
+        'demo.echo': (context, input) async {
+          await (context as _SecretContext).secrets.value('API_TOKEN');
+          return {};
+        },
+      },
+      contextFactory: (request, connection, secrets, log, _, _) =>
+          _SecretContext(request, secrets!),
+    );
+    final response = await app.handle(
+      ServerRequest(
+        method: 'POST',
+        uri: Uri.parse('https://example.test/demo.echo'),
+        headers: const {'Content-Type': 'application/json'},
+      ),
+      Stream.value(utf8.encode('{}')),
+      rawUri: 'https://example.test/demo.echo',
+      secrets: SecretValues((name) async => null),
+    );
+    expect(response.status, 503);
+    expect(jsonDecode(response.body), {'error': 'service_unavailable'});
+  });
+
+  test('context log forwards levels and never fails the request', () async {
+    final entries = <String>[];
+    final app = Application(
+      {
+        'demo.echo': (context, input) async {
+          await context.log('warn', 'half-open connection');
+          await context.log('loud', 'invalid levels are dropped');
+          await context.log('info', 'with fields', {
+            'order': 'o-1',
+            'nested': {'ok': true},
+            'none': null,
+          });
+          await context.log('info', 'bad fields', {'count': double.nan});
+          await context.log('info', 'bad fields', {'huge': 9007199254740992});
+          await context.log('info', 'bad fields', {'custom': Object()});
+          final cycle = <String, Object?>{};
+          cycle['cycle'] = cycle;
+          await context.log('info', 'cyclic fields', cycle);
+          return {};
+        },
+      },
+      contextFactory: (request, connection, secrets, log, _, _) =>
+          Context(request, log),
+    );
+    final response = await app.handle(
+      ServerRequest(
+        method: 'POST',
+        uri: Uri.parse('https://example.test/demo.echo'),
+        headers: const {'Content-Type': 'application/json'},
+      ),
+      Stream.value(utf8.encode('{}')),
+      rawUri: 'https://example.test/demo.echo',
+      log: (level, message, fields) async {
+        entries.add('$level:$message:$fields');
+        if (message == 'half-open connection') {
+          throw StateError('log failure must not fail the request');
+        }
+      },
+    );
+    expect(response.status, 200);
+    expect(jsonDecode(response.body), isEmpty);
+    expect(entries, [
+      'warn:half-open connection:null',
+      'info:with fields:{order: o-1, nested: {ok: true}, none: null}',
+    ]);
+  });
+
+  test(
+    'print stays with the request that resumes after another request',
+    () async {
+      final started = Completer<void>();
+      final resume = Completer<void>();
+      final app = Application(
+        {
+          'demo.echo': (_, input) async {
+            if (input['name'] == 'first') {
+              started.complete();
+              await resume.future;
+            }
+            print(input['name']);
+            return {};
+          },
+        },
+        setup: () async {
+          print('setup');
+          return const ApplicationOptions();
+        },
+      );
+      final records = <String>[];
+      Future<ServerResponse> call(String name) => app.handle(
+        ServerRequest(
+          method: 'POST',
+          uri: Uri.parse('https://example.test/demo.echo'),
+          headers: const {'Content-Type': 'application/json'},
+        ),
+        Stream.value(utf8.encode(jsonEncode({'name': name}))),
+        log: (level, message, _) async {
+          records.add('$name:$level:$message');
+        },
+      );
+
+      final first = call('first');
+      await started.future;
+      expect((await call('second')).status, 200);
+      resume.complete();
+      expect((await first).status, 200);
+      expect(records, [
+        'first:info:setup',
+        'second:info:second',
+        'first:info:first',
+      ]);
+    },
+  );
+
+  test('context log without a binding is dropped', () async {
+    final app = Application({
+      'demo.echo': (context, input) async {
+        await context.log('info', 'unbound');
+        return {};
+      },
+    });
+    final response = await app.handle(
+      ServerRequest(
+        method: 'POST',
+        uri: Uri.parse('https://example.test/demo.echo'),
+        headers: const {'Content-Type': 'application/json'},
+      ),
+      Stream.value(utf8.encode('{}')),
+      rawUri: 'https://example.test/demo.echo',
+    );
+    expect(response.status, 200);
+  });
+}
+
+final class _SecretContext extends Context {
+  _SecretContext(super.request, this.secrets);
+
+  final SecretValues secrets;
 }

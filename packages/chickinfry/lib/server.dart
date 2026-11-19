@@ -8,3 +8,9 @@ export 'src/server/interop_stub.dart'
     show runApplication;
 
 export 'src/server/database.dart';
+export 'src/server/secrets.dart';
+export 'src/server/auth/auth.dart'
+    show Authentication, AuthUser, Session, SessionUser;
+export 'src/server/auth/policy.dart' show SessionPolicy;
+export 'src/server/vault.dart';
+export 'src/server/storage.dart';

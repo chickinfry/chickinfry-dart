@@ -4,6 +4,9 @@ import 'dart:typed_data';
 
 import '../errors.dart';
 import 'database.dart';
+import 'secrets.dart';
+import 'storage.dart';
+import 'vault.dart';
 
 /// Immutable request metadata excluding hop-by-hop proxy credentials.
 final class ServerRequest {
@@ -25,9 +28,51 @@ final class ServerRequest {
 
 /// Request context for an application without selected resources.
 class Context {
-  const Context(this.request);
   final ServerRequest request;
+
+  Context(this.request, [ContextLog? log]) : _log = log;
+
+  final ContextLog? _log;
+
+  /// Emits a request-scoped log line through the platform redaction pipeline.
+  ///
+  /// Logging failures never fail the operation; without a platform binding
+  /// (plain tests) the call is dropped. Unknown levels and non-JSON field
+  /// values discard the whole record.
+  Future<void> log(
+    String level,
+    String message, [
+    Map<String, Object?>? fields,
+  ]) async {
+    if (!const ['debug', 'info', 'warn', 'error'].contains(level)) return;
+    final log = _log;
+    if (log == null) return;
+    try {
+      if (fields != null && !_jsonValue(fields, 1)) return;
+      await log(level, message, fields);
+    } catch (_) {}
+  }
+
+  static bool _jsonValue(Object? value, int depth) {
+    if (depth > 64) return false;
+    if (value == null || value is bool || value is String) return true;
+    if (value is num) return value.isFinite && value.abs() <= 9007199254740991;
+    if (value is Map<String, Object?>) {
+      return value.values.every((item) => _jsonValue(item, depth + 1));
+    }
+    if (value is List<Object?>) {
+      return value.every((item) => _jsonValue(item, depth + 1));
+    }
+    return false;
+  }
 }
+
+/// Forwards one request-scoped log line; level is one of the shared names.
+typedef ContextLog = Future<void> Function(
+  String level,
+  String message,
+  Map<String, Object?>? fields,
+);
 
 final class ApplicationOptions {
   const ApplicationOptions();
@@ -57,7 +102,15 @@ final class Application {
     Future<Map<String, Object?>> Function(Context, Map<String, Object?>)
   >
   _operations;
-  final Context Function(ServerRequest, DatabaseConnection?)? _contextFactory;
+  final Context Function(
+    ServerRequest,
+    DatabaseConnection?,
+    SecretValues?,
+    ContextLog?,
+    Vault?,
+    StorageCall?,
+  )?
+  _contextFactory;
   final Future<ApplicationOptions> Function()? _setup;
   Future<ApplicationOptions>? _setupResult;
   static const maxRequestBytes = 4 << 20;
@@ -66,10 +119,13 @@ final class Application {
 
   /// Called by the platform connection before reporting readiness.
   /// Shares one setup result with [handle], retaining failures without retrying.
-  Future<void> prepare() async {
+  Future<void> prepare({ContextLog? log}) async {
     final setup = _setup;
     if (setup != null) {
-      await (_setupResult ??= Future<ApplicationOptions>.sync(setup));
+      await (_setupResult ??= _capturePrint(
+        log,
+        () => Future<ApplicationOptions>.sync(setup),
+      ));
     }
   }
 
@@ -78,10 +134,14 @@ final class Application {
     Stream<List<int>> body, {
     String? rawUri,
     DatabaseConnection? connection,
+    SecretValues? secrets,
+    ContextLog? log,
+    Vault? vault,
+    StorageCall? storage,
   }) async {
     try {
       try {
-        await prepare();
+        await prepare(log: log);
       } catch (_) {
         return _error('operation_failed', 500);
       }
@@ -116,7 +176,7 @@ final class Application {
       } finally {
         await iterator.cancel();
       }
-      Object? input;
+      final Object? input;
       try {
         final source = utf8.decode(bytes.takeBytes());
         final error = _validateJson(source);
@@ -125,25 +185,58 @@ final class Application {
       } on FormatException {
         return _error('invalid_json', 400);
       }
-      if (input is! Map<String, Object?>) {
+      final decoded = input;
+      if (decoded is! Map<String, Object?>) {
         return _error('invalid_input', 400);
       }
-      final output = await operation(
-        _contextFactory?.call(request, connection) ?? Context(request),
-        input,
+      final output = await _capturePrint(
+        log,
+        () => operation(
+          _contextFactory?.call(
+                request,
+                connection,
+                secrets,
+                log,
+                vault,
+                storage,
+              ) ??
+              Context(request, log),
+          decoded,
+        ),
       );
       return ServerResponse(200, jsonEncode(output));
     } on OperationError catch (error) {
       // Status 501 is reserved for the explicit not_implemented contract.
       if (_code.hasMatch(error.code) &&
           (_statuses.contains(error.status) ||
-              (error.status == 501 && error.code == 'not_implemented'))) {
+              (error.status == 501 && error.code == 'not_implemented') ||
+              (error.status == 500 &&
+                  (error.code == 'user_creation_failed' ||
+                      error.code == 'user_created_effect_failed')))) {
         return _error(error.code, error.status);
       }
       return _error('operation_failed', 500);
     } catch (_) {
       return _error('operation_failed', 500);
     }
+  }
+
+  static Future<T> _capturePrint<T>(
+    ContextLog? log,
+    Future<T> Function() work,
+  ) {
+    if (log == null) return work();
+    return runZoned(
+      work,
+      zoneSpecification: ZoneSpecification(
+        print: (_, _, _, message) {
+          unawaited(
+            Future<void>.sync(() => log('info', message, null))
+                .catchError((Object _) {}),
+          );
+        },
+      ),
+    );
   }
 
   // Check raw values before decoding can discard duplicate object members.
