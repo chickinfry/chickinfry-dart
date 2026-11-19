@@ -31,11 +31,12 @@ final class OperationError implements Exception {
 
 /// ClientError reports a local failure without exposing response details.
 final class ClientError implements Exception {
-  const ClientError(this.code, {this.status, this.operationError});
+  const ClientError(this.code, {this.status, this.operationError, this.cause});
 
   final String code;
   final int? status;
   final OperationError? operationError;
+  final Object? cause;
 
   @override
   String toString() {

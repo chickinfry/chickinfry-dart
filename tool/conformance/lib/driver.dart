@@ -15,6 +15,7 @@ import 'bridge.dart';
 import 'credentials.dart';
 import 'observations.dart';
 import 'protocol.dart';
+import 'realtime_trial.dart';
 
 const driverVersion = '1.0.0';
 
@@ -54,6 +55,9 @@ final class Driver {
   final calls = <String, (ConformanceCall, Observation)>{};
   final deadlines = <String, int>{};
   final elapsed = Stopwatch()..start();
+  int _protocol = 1;
+  final _realtimeClients = <String, (String, RealtimeClient Function())>{};
+  RealtimeTrial? _realtime;
   String? runId;
   String? caseId;
   int? caseDeadline;
@@ -88,6 +92,29 @@ final class Driver {
     if (runId == null) violation();
     const common = {'caseId', 'timeoutMs'};
     switch (command) {
+      case 'realtime.start':
+        fields(args, {
+          ...common,
+          'clientRef',
+          'channel',
+          'onGap',
+          'eventHandler',
+          'transport',
+        });
+        break;
+      case 'realtime.observe':
+        fields(args, {...common, 'point', 'observation'});
+        break;
+      case 'realtime.release':
+        fields(args, {...common, 'point'});
+        break;
+      case 'realtime.unsubscribe':
+      case 'realtime.cancel':
+      case 'realtime.second-consumer':
+      case 'realtime.hold-dispatch':
+      case 'realtime.release-dispatch':
+        fields(args, common);
+        break;
       case 'session.store.create':
         fields(
           args,
@@ -111,7 +138,7 @@ final class Driver {
         fields(
           args,
           {...common, 'clientRef', 'fixture', 'origin', 'requestTimeoutMs'},
-          {'storeRef', 'bearerRef'},
+          {'storeRef', 'bearerRef', if (_protocol == 2) 'transport'},
         );
         break;
       case 'client.copy':
@@ -142,6 +169,19 @@ final class Driver {
         : caseDeadline!;
     if (remaining(id)!.inMilliseconds <= 0) {
       throw const DriverError('deadline_exceeded');
+    }
+    if (command.startsWith('realtime.')) {
+      if (_protocol != 2) unimplemented();
+      if (command == 'realtime.start') {
+        if (_realtime != null) invalidArgs();
+        final ref = identifier(args, 'clientRef');
+        final (origin, client) = lookup(_realtimeClients, ref);
+        final trial = RealtimeTrial();
+        trial.start(args, client(), lookup(clients, ref).bridge, origin);
+        _realtime = trial;
+        return {'accepted': true};
+      }
+      return (await _realtime?.command(command, args)) ?? invalidArgs();
     }
     switch (command) {
       case 'session.store.create':
@@ -267,6 +307,10 @@ final class Driver {
         if (clients.containsKey(ref)) violation();
         final fixture = string(args, 'fixture');
         final origin = string(args, 'origin');
+        if (_protocol == 2 &&
+            (fixture != 'plain' || args['transport'] != 'plain')) {
+          invalidArgs();
+        }
         final timeout = positive(args, 'requestTimeoutMs');
         final storeRef = args.containsKey('storeRef')
             ? identifier(args, 'storeRef')
@@ -297,18 +341,24 @@ final class Driver {
               ownedTransports.add(transport.close);
               return Client(transport.withBearer, bridge, fixture, true);
             }
-            final (transport, bridge) = createBridge(() {
-              final base = HttpTransport(
-                origin,
-                timeout: Duration(milliseconds: timeout),
-              );
-              ownedTransports.add(base.close);
-              return store != null
-                  ? base.withSession(store)
-                  : bearer != null
-                  ? base.withBearer(bearer)
-                  : base;
-            }, fixture: fixture);
+            final (transport, bridge) = createBridge(
+              () {
+                final base = HttpTransport(
+                  origin,
+                  timeout: Duration(milliseconds: timeout),
+                );
+                ownedTransports.add(base.close);
+                return store != null
+                    ? base.withSession(store)
+                    : bearer != null
+                    ? base.withBearer(bearer)
+                    : base;
+              },
+              fixture: fixture,
+              realtime: _protocol == 2
+                  ? (makeClient) => _realtimeClients[ref] = (origin, makeClient)
+                  : null,
+            );
             return Client(transport.withBearer, bridge, fixture, store != null);
           });
           if (call.instrumentationFailed) {
@@ -478,7 +528,9 @@ final class Driver {
     if (versions is! List<Object?> || versions.any((v) => v is! int)) {
       invalidArgs();
     }
-    if (!versions.contains(1)) throw const DriverError('protocol_mismatch');
+    final protocol = conformanceEnabled && versions.contains(2) ? 2 : 1;
+    if (!versions.contains(protocol))
+      throw const DriverError('protocol_mismatch');
     final target = object(args['target']);
     fields(target, {'language', 'role', 'environment'});
     if (target['language'] != 'dart' ||
@@ -490,12 +542,14 @@ final class Driver {
     if (required is! List<Object?> || required.any((cap) => cap is! String)) {
       invalidArgs();
     }
-    if (required.any((cap) => !capabilities.contains(cap))) unimplemented();
+    final available = [...capabilities, if (protocol == 2) 'realtime-v1'];
+    if (required.any((cap) => !available.contains(cap))) unimplemented();
+    _protocol = protocol;
     runId = identifier(args, 'runId');
     return {
-      'protocolVersion': 1,
+      'protocolVersion': protocol,
       'driverVersion': driverVersion,
-      'capabilities': capabilities,
+      'capabilities': available,
     };
   }
 
@@ -550,6 +604,8 @@ final class Driver {
   }
 
   void dispose() {
+    _realtime?.close();
+    _realtimeClients.clear();
     close();
     clients.clear();
     stores.clear();

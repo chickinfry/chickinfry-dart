@@ -521,3 +521,19 @@ final class HttpTransport implements PublicTransport {
     }
   }
 }
+
+// The realtime SDK reuses the exact refresh and compare-and-set path.
+({
+  Future<SessionCredentials?> Function() read,
+  Future<void> Function(SessionCredentials) renew,
+})?
+realtimeSession(HttpTransport transport) {
+  final store = transport._store;
+  if (store == null) return null;
+  return (
+    read: () => transport._read(store),
+    renew: (expected) async {
+      await transport._refresh(store, expected);
+    },
+  );
+}

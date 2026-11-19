@@ -19,11 +19,21 @@ typedef Bridge = Future<Map<String, Object?>> Function(
 (T, Bridge) createBridge<T extends Transport>(
   T Function() createTransport, {
   required String fixture,
+  void Function(RealtimeClient Function())? realtime,
 }) {
   final factory = switch (fixture) {
-    'plain' => (Transport transport) => plainBridge(
-      plain.createClient(transport),
-    ),
+    'plain' => (Transport transport) {
+      final client = plain.createClient(transport);
+      // The protocol-1 fixture does not declare realtime.
+      realtime?.call(() {
+        try {
+          return (client as dynamic).realtime as RealtimeClient;
+        } on NoSuchMethodError {
+          unimplemented();
+        }
+      });
+      return plainBridge(client);
+    },
     'auth' => (Transport transport) => authBridge(auth.createClient(transport)),
     'requiredAuth' => (Transport transport) => requiredAuthBridge(
       required_auth.createClient(transport),

@@ -50,6 +50,9 @@ DeviceTransport createDeviceTransport({
   return DeviceTransport(store, timeout: timeout);
 }
 
+HttpTransport deviceRealtimeTransport(DeviceTransport transport) =>
+    transport._transport;
+
 final class DeviceTransport implements PublicTransport {
   DeviceTransport(this.store, {Duration timeout = const Duration(seconds: 30)})
     : _connection = HttpTransport(store.origin, timeout: timeout) {
