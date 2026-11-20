@@ -1,1 +1,8 @@
+# Test fixtures hold a throwaway key that must never reach the registry.
 test/fixtures/server_key.pem
+# Publish only the runtime library and its metadata. Tests, tooling, and the
+# lockfile stay in the repository; the boundary scan and the file-list assertion
+# both run over what remains.
+test/
+tool/
+pubspec.lock
