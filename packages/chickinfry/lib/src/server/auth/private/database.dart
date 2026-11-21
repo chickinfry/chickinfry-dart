@@ -7,6 +7,7 @@ final class Database {
   Database(this._connection);
   final DatabaseConnection _connection;
   late final AppAuthActionTokensRepository appAuthActionTokens = AppAuthActionTokensRepository(_connection);
+  late final AppAuthDeviceRequestsRepository appAuthDeviceRequests = AppAuthDeviceRequestsRepository(_connection);
   late final AppAuthIdentitiesRepository appAuthIdentities = AppAuthIdentitiesRepository(_connection);
   late final AppAuthInvitesRepository appAuthInvites = AppAuthInvitesRepository(_connection);
   late final AppAuthMigrationsRepository appAuthMigrations = AppAuthMigrationsRepository(_connection);
@@ -134,6 +135,145 @@ final class AppAuthActionTokensRepository {
     return row == null ? null : _decode(row);
   }
   Future<AppAuthActionTokensRow?> delete(AppAuthActionTokensPrimaryKey key) async {
+    final row = await _repository.delete(key._encode());
+    return row == null ? null : _decode(row);
+  }
+}
+
+const _appAuthDeviceRequestsTable = TableDefinition('app_auth_device_requests', ['id', ], [
+  ColumnDefinition('approved_at', 'timestamp', nullable: true, optional: true),
+  ColumnDefinition('consumed_at', 'timestamp', nullable: true, optional: true),
+  ColumnDefinition('created_at', 'timestamp', nullable: false, optional: true),
+  ColumnDefinition('device_code_hash', 'string', nullable: false, optional: false),
+  ColumnDefinition('device_name', 'string', nullable: true, optional: true),
+  ColumnDefinition('expires_at', 'timestamp', nullable: false, optional: false),
+  ColumnDefinition('id', 'id', nullable: false, optional: true),
+  ColumnDefinition('last_polled_at', 'timestamp', nullable: true, optional: true),
+  ColumnDefinition('status', 'string', nullable: false, optional: true),
+  ColumnDefinition('user_code_hash', 'string', nullable: false, optional: false),
+  ColumnDefinition('user_id', 'id', nullable: true, optional: true),
+]);
+
+final class AppAuthDeviceRequestsRow {
+  const AppAuthDeviceRequestsRow({ required this.approvedAt, required this.consumedAt, required this.createdAt, required this.deviceCodeHash, required this.deviceName, required this.expiresAt, required this.id, required this.lastPolledAt, required this.status, required this.userCodeHash, required this.userId, });
+  final String? approvedAt;
+  final String? consumedAt;
+  final String createdAt;
+  final String deviceCodeHash;
+  final String? deviceName;
+  final String expiresAt;
+  final String id;
+  final String? lastPolledAt;
+  final String status;
+  final String userCodeHash;
+  final String? userId;
+}
+
+final class AppAuthDeviceRequestsInsert {
+  const AppAuthDeviceRequestsInsert({ this.approvedAt = const Value<String?>.absent(), this.consumedAt = const Value<String?>.absent(), this.createdAt = const Value<String>.absent(), required this.deviceCodeHash, this.deviceName = const Value<String?>.absent(), required this.expiresAt, this.id = const Value<String>.absent(), this.lastPolledAt = const Value<String?>.absent(), this.status = const Value<String>.absent(), required this.userCodeHash, this.userId = const Value<String?>.absent(), });
+  final Value<String?> approvedAt;
+  final Value<String?> consumedAt;
+  final Value<String> createdAt;
+  final String deviceCodeHash;
+  final Value<String?> deviceName;
+  final String expiresAt;
+  final Value<String> id;
+  final Value<String?> lastPolledAt;
+  final Value<String> status;
+  final String userCodeHash;
+  final Value<String?> userId;
+  Map<String, Object?> _encode() => {
+    if (approvedAt.isPresent) 'approved_at': approvedAt.value,
+    if (consumedAt.isPresent) 'consumed_at': consumedAt.value,
+    if (createdAt.isPresent) 'created_at': createdAt.value,
+    'device_code_hash': deviceCodeHash,
+    if (deviceName.isPresent) 'device_name': deviceName.value,
+    'expires_at': expiresAt,
+    if (id.isPresent) 'id': id.value,
+    if (lastPolledAt.isPresent) 'last_polled_at': lastPolledAt.value,
+    if (status.isPresent) 'status': status.value,
+    'user_code_hash': userCodeHash,
+    if (userId.isPresent) 'user_id': userId.value,
+  };
+}
+
+final class AppAuthDeviceRequestsUpdate {
+  const AppAuthDeviceRequestsUpdate({ this.approvedAt = const Value<String?>.absent(), this.consumedAt = const Value<String?>.absent(), this.createdAt = const Value<String>.absent(), this.deviceCodeHash = const Value<String>.absent(), this.deviceName = const Value<String?>.absent(), this.expiresAt = const Value<String>.absent(), this.lastPolledAt = const Value<String?>.absent(), this.status = const Value<String>.absent(), this.userCodeHash = const Value<String>.absent(), this.userId = const Value<String?>.absent(), });
+  final Value<String?> approvedAt;
+  final Value<String?> consumedAt;
+  final Value<String> createdAt;
+  final Value<String> deviceCodeHash;
+  final Value<String?> deviceName;
+  final Value<String> expiresAt;
+  final Value<String?> lastPolledAt;
+  final Value<String> status;
+  final Value<String> userCodeHash;
+  final Value<String?> userId;
+  Map<String, Object?> _encode() => {
+    if (approvedAt.isPresent) 'approved_at': approvedAt.value,
+    if (consumedAt.isPresent) 'consumed_at': consumedAt.value,
+    if (createdAt.isPresent) 'created_at': createdAt.value,
+    if (deviceCodeHash.isPresent) 'device_code_hash': deviceCodeHash.value,
+    if (deviceName.isPresent) 'device_name': deviceName.value,
+    if (expiresAt.isPresent) 'expires_at': expiresAt.value,
+    if (lastPolledAt.isPresent) 'last_polled_at': lastPolledAt.value,
+    if (status.isPresent) 'status': status.value,
+    if (userCodeHash.isPresent) 'user_code_hash': userCodeHash.value,
+    if (userId.isPresent) 'user_id': userId.value,
+  };
+}
+
+final class AppAuthDeviceRequestsIncrement {
+  const AppAuthDeviceRequestsIncrement();
+  Map<String, int> _encode() => {
+  };
+}
+
+final class AppAuthDeviceRequestsPrimaryKey {
+  const AppAuthDeviceRequestsPrimaryKey({ required this.id, });
+  final String id;
+  Map<String, Object?> _encode() => { 'id': id, };
+}
+
+final class AppAuthDeviceRequestsColumns {
+  const AppAuthDeviceRequestsColumns();
+  final Field<String?> approvedAt = const Field<String?>('app_auth_device_requests', ColumnDefinition('approved_at', 'timestamp', nullable: true, optional: true));
+  final Field<String?> consumedAt = const Field<String?>('app_auth_device_requests', ColumnDefinition('consumed_at', 'timestamp', nullable: true, optional: true));
+  final Field<String> createdAt = const Field<String>('app_auth_device_requests', ColumnDefinition('created_at', 'timestamp', nullable: false, optional: true));
+  final Field<String> deviceCodeHash = const Field<String>('app_auth_device_requests', ColumnDefinition('device_code_hash', 'string', nullable: false, optional: false));
+  final Field<String?> deviceName = const Field<String?>('app_auth_device_requests', ColumnDefinition('device_name', 'string', nullable: true, optional: true));
+  final Field<String> expiresAt = const Field<String>('app_auth_device_requests', ColumnDefinition('expires_at', 'timestamp', nullable: false, optional: false));
+  final Field<String> id = const Field<String>('app_auth_device_requests', ColumnDefinition('id', 'id', nullable: false, optional: true));
+  final Field<String?> lastPolledAt = const Field<String?>('app_auth_device_requests', ColumnDefinition('last_polled_at', 'timestamp', nullable: true, optional: true));
+  final Field<String> status = const Field<String>('app_auth_device_requests', ColumnDefinition('status', 'string', nullable: false, optional: true));
+  final Field<String> userCodeHash = const Field<String>('app_auth_device_requests', ColumnDefinition('user_code_hash', 'string', nullable: false, optional: false));
+  final Field<String?> userId = const Field<String?>('app_auth_device_requests', ColumnDefinition('user_id', 'id', nullable: true, optional: true));
+}
+
+final class AppAuthDeviceRequestsRepository {
+  AppAuthDeviceRequestsRepository(DatabaseConnection connection) : _repository = Repository(connection, _appAuthDeviceRequestsTable);
+  final Repository _repository;
+  final columns = const AppAuthDeviceRequestsColumns();
+  AppAuthDeviceRequestsRow _decode(Map<String, Object?> row) => AppAuthDeviceRequestsRow(approvedAt: row['approved_at'] as String?, consumedAt: row['consumed_at'] as String?, createdAt: row['created_at'] as String, deviceCodeHash: row['device_code_hash'] as String, deviceName: row['device_name'] as String?, expiresAt: row['expires_at'] as String, id: row['id'] as String, lastPolledAt: row['last_polled_at'] as String?, status: row['status'] as String, userCodeHash: row['user_code_hash'] as String, userId: row['user_id'] as String?, );
+  Future<AppAuthDeviceRequestsRow> insert(AppAuthDeviceRequestsInsert input) async => _decode(await _repository.insert(input._encode()));
+  Future<AppAuthDeviceRequestsRow?> findById(AppAuthDeviceRequestsPrimaryKey key) async {
+    final row = await _repository.findById(key._encode());
+    return row == null ? null : _decode(row);
+  }
+  Future<List<AppAuthDeviceRequestsRow>> findMany({Filter Function(AppAuthDeviceRequestsColumns)? where, List<Order> Function(AppAuthDeviceRequestsColumns)? orderBy, int? limit, int? offset}) async =>
+      (await _repository.findMany(where: where?.call(columns), orderBy: orderBy?.call(columns) ?? const [], limit: limit, offset: offset)).map(_decode).toList(growable: false);
+  Future<AppAuthDeviceRequestsRow> update(AppAuthDeviceRequestsPrimaryKey key, AppAuthDeviceRequestsUpdate patch) async => _decode(await _repository.update(key._encode(), patch._encode()));
+  Future<AppAuthDeviceRequestsRow?> updateIf(AppAuthDeviceRequestsPrimaryKey key, Filter Function(AppAuthDeviceRequestsColumns) condition, AppAuthDeviceRequestsUpdate patch) async {
+    final row = await _repository.updateIf(key._encode(), condition(columns), patch._encode());
+    return row == null ? null : _decode(row);
+  }
+  Future<AppAuthDeviceRequestsRow> upsert(AppAuthDeviceRequestsInsert input) async => _decode(await _repository.upsert(input._encode()));
+  Future<AppAuthDeviceRequestsRow> increment(AppAuthDeviceRequestsPrimaryKey key, AppAuthDeviceRequestsIncrement columns) async => _decode(await _repository.increment(key._encode(), columns._encode()));
+  Future<AppAuthDeviceRequestsRow?> incrementIf(AppAuthDeviceRequestsPrimaryKey key, Filter Function(AppAuthDeviceRequestsColumns) condition, AppAuthDeviceRequestsIncrement columns, AppAuthDeviceRequestsUpdate patch) async {
+    final row = await _repository.incrementIf(key._encode(), condition(this.columns), columns._encode(), patch._encode());
+    return row == null ? null : _decode(row);
+  }
+  Future<AppAuthDeviceRequestsRow?> delete(AppAuthDeviceRequestsPrimaryKey key) async {
     final row = await _repository.delete(key._encode());
     return row == null ? null : _decode(row);
   }
