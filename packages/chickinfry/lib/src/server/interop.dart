@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import '../errors.dart';
 import 'application.dart';
 import 'database.dart';
+import 'realtime.dart';
 import 'secrets.dart';
 import 'storage.dart';
 import 'vault.dart';
@@ -18,6 +19,18 @@ external JSPromise<JSUint8Array> _environment(JSUint8Array frame);
 
 @JS('__chikDartLog')
 external JSPromise<JSUint8Array> _log(JSUint8Array frame);
+
+@JS('__chikDartRealtime')
+external JSPromise<JSUint8Array> _realtime(JSUint8Array frame);
+
+RealtimeCall _requestRealtime(int rid) => (frame) async {
+  final bytes = Uint8List.fromList(
+    utf8.encode(jsonEncode({'rid': rid, ...frame})),
+  );
+  final result = await _realtime(bytes.toJS).toDart;
+  return (jsonDecode(utf8.decode(Uint8List.fromList(result.toDart))) as Map)
+      .cast<String, Object?>();
+};
 
 @JS('__chikDartStorage')
 external JSPromise<JSObject> _storage(
@@ -156,6 +169,9 @@ void runApplication(Application application) {
                 vault: vault,
                 storage: value['storage'] == true && requestId != null
                     ? _requestStorage(requestId)
+                    : null,
+                realtime: value['realtime'] == true && rid != null
+                    ? _requestRealtime(rid)
                     : null,
                 log: rid == null ? null : _contextLog(rid),
               );

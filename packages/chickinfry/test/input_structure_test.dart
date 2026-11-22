@@ -26,7 +26,7 @@ Future<void> main() async {
             return {};
           },
       },
-      contextFactory: (request, connection, secrets, log, _, _) {
+      contextFactory: (request, connection, secrets, log, _, _, _) {
         contexts++;
         return Context(request);
       },

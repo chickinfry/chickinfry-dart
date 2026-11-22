@@ -14,3 +14,4 @@ export 'src/server/auth/auth.dart' show Authentication;
 export 'src/server/auth/policy.dart' show SessionPolicy;
 export 'src/server/vault.dart';
 export 'src/server/storage.dart';
+export 'src/server/realtime.dart';

@@ -5,6 +5,7 @@ import 'dart:typed_data';
 import '../errors.dart';
 import 'database.dart';
 import 'secrets.dart';
+import 'realtime.dart';
 import 'storage.dart';
 import 'vault.dart';
 
@@ -101,10 +102,21 @@ typedef ContextLog = Future<void> Function(
   Map<String, Object?>? fields,
 );
 
+/// Decides whether a connection may subscribe to a realtime channel.
+typedef RealtimeAuthorizer = Future<bool> Function(
+  Context context,
+  String channel,
+);
+
 final class ApplicationOptions {
-  const ApplicationOptions({this.authHooks});
+  const ApplicationOptions({this.authHooks, this.authorizeRealtime});
 
   final AuthHooks? authHooks;
+
+  /// Decides realtime subscriptions. A missing callback or an error denies
+  /// the channel. With authentication the context carries the optional
+  /// session the host revalidated.
+  final RealtimeAuthorizer? authorizeRealtime;
 }
 
 /// Internal response consumed by the platform connection.
@@ -141,6 +153,7 @@ final class Application {
     ContextLog?,
     Vault?,
     StorageCall?,
+    RealtimeCall?,
   )?
   _contextFactory;
   final Future<ApplicationOptions> Function()? _setup;
@@ -178,6 +191,7 @@ final class Application {
     ContextLog? log,
     Vault? vault,
     StorageCall? storage,
+    RealtimeCall? realtime,
     Object? authFrame = _absentHostAuth,
   }) async {
     try {
@@ -187,7 +201,13 @@ final class Application {
         return _error('operation_failed', 500);
       }
       final name = request.uri.path.substring(request.uri.path.isEmpty ? 0 : 1);
-      final operation = name.startsWith('auth.') ? null : _operations[name];
+      // Only the host reaches realtime.authorize, after it verified the
+      // realtime engine and revalidated the session.
+      final operation = name.startsWith('auth.')
+          ? null
+          : name == _realtimeAuthorization && realtime != null
+          ? _authorizeRealtime
+          : _operations[name];
       if (request.method != 'POST' ||
           request.uri.hasQuery ||
           (rawUri ?? request.uri.toString()).contains('%') ||
@@ -205,7 +225,9 @@ final class Application {
       if (!_authEnabled && !identical(authFrame, _absentHostAuth)) {
         return _error('operation_failed', 500);
       }
-      final public = _authEnabled && (_isPublic?.call(name) ?? false);
+      final public =
+          _authEnabled &&
+          (name == _realtimeAuthorization || (_isPublic?.call(name) ?? false));
       final session = _authEnabled ? _decodeVerifiedSession(authFrame) : null;
       if (_authEnabled && !public && session == null) {
         return _error('unauthenticated', 401);
@@ -256,6 +278,7 @@ final class Application {
               log,
               vault,
               storage,
+              realtime,
             ) ??
             Context(effectiveRequest, log);
         final context = !_authEnabled
@@ -280,6 +303,22 @@ final class Application {
       return _error('operation_failed', 500);
     } catch (_) {
       return _error('operation_failed', 500);
+    }
+  }
+
+  static const _realtimeAuthorization = 'realtime.authorize';
+
+  Future<Map<String, Object?>> _authorizeRealtime(
+    Context context,
+    Map<String, Object?> input,
+  ) async {
+    final channel = input['channel'];
+    final authorize = (await _setupResult)?.authorizeRealtime;
+    if (channel is! String || authorize == null) return {'allowed': false};
+    try {
+      return {'allowed': await authorize(context, channel)};
+    } catch (_) {
+      return {'allowed': false};
     }
   }
 

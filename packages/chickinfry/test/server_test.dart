@@ -421,7 +421,7 @@ void main() {
     ServerRequest? factoryRequest;
     final app = Application(
       {'demo.echo': (context, input) async => {}},
-      contextFactory: (request, connection, secrets, log, _, _) {
+      contextFactory: (request, connection, secrets, log, _, _, _) {
         factoryRequest = request;
         return Context(request);
       },
@@ -442,7 +442,7 @@ void main() {
           return {};
         },
       },
-      contextFactory: (request, connection, secrets, log, _, _) =>
+      contextFactory: (request, connection, secrets, log, _, _, _) =>
           _SecretContext(request, secrets!),
     );
     final response = await app.handle(
@@ -471,7 +471,7 @@ void main() {
           return {};
         },
       },
-      contextFactory: (request, connection, secrets, log, _, _) =>
+      contextFactory: (request, connection, secrets, log, _, _, _) =>
           _SecretContext(request, secrets!),
     );
     final response = await app.handle(
@@ -509,7 +509,7 @@ void main() {
           return {};
         },
       },
-      contextFactory: (request, connection, secrets, log, _, _) =>
+      contextFactory: (request, connection, secrets, log, _, _, _) =>
           Context(request, log),
     );
     final response = await app.handle(
