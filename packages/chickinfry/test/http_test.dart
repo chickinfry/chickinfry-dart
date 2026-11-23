@@ -256,36 +256,32 @@ void main() {
         expect(beforeSend.httpObservation!.outcomeUnknown, isFalse);
         expect(beforeSend.httpObservation!.cancelObserved, isNull);
 
-        final server = await RawServerSocket.bind(
-          InternetAddress.loopbackIPv4,
-          0,
-        );
-        addTearDown(server.close);
-        var received = 0;
-        server.listen((socket) {
-          addTearDown(socket.close);
-          socket.listen((event) {
-            if (event == RawSocketEvent.read) {
-              received += socket.read(1)?.length ?? 0;
-              unawaited(socket.close());
-            }
-          });
+        String? received;
+        final lostResponse = await Peer.start((request) async {
+          received = await utf8.decoder.bind(request).join();
+          final socket = await request.response.detachSocket(
+            writeHeaders: false,
+          );
+          socket.destroy();
         });
-        final dropped = HttpTransport('http://127.0.0.1:${server.port}');
-        addTearDown(dropped.close);
-        final sent = conformanceCall('partial-send', 'thing.write', Observer());
+        final dropped = lostResponse.transport();
+        final payload = {'data': 'payload'};
+        final sent = conformanceCall(
+          'lost-response',
+          'thing.write',
+          Observer(),
+        );
         await expectLater(
           withConformanceCall(
             sent,
-            () => dropped.invoke('thing.write', {
-              'data': 'x' * (4 * 1024 * 1024 - 512),
-            }),
+            () => dropped.invoke('thing.write', payload),
           ),
           throwsA(clientFailure('unavailable')),
         );
-        expect(received, greaterThan(0));
+        expect(lostResponse.requests, 1);
+        expect(received, jsonEncode(payload));
         expect(sent.httpObservation!.socketBytesWritten, greaterThan(0));
-        expect(sent.httpObservation!.pendingSocketBytes, greaterThan(0));
+        expect(sent.httpObservation!.pendingSocketBytes, 0);
         expect(sent.httpObservation!.responseConfirmed, isFalse);
         expect(sent.httpObservation!.outcomeUnknown, isTrue);
 
