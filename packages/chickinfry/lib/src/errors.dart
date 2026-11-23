@@ -15,6 +15,20 @@ final class OperationError implements Exception {
     this.fields = const [],
   ]);
 
+  // BEGIN generated operation errors
+
+  const OperationError.notFound() : this('not_found', 404);
+
+  const OperationError.invalidInput() : this('invalid_input', 400);
+
+  const OperationError.conflict() : this('conflict', 409);
+
+  const OperationError.forbidden() : this('forbidden', 403);
+
+  const OperationError.notImplemented() : this('not_implemented', 501);
+
+  // END generated operation errors
+
   final String code;
   final int status;
   final String? message;
