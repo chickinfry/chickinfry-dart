@@ -96,8 +96,8 @@ Future<int> child(
       ])
         if (Platform.environment[name] != null)
           name: Platform.environment[name]!,
-      if (home != null) 'HOME': home,
-      if (xdgStateHome != null) 'XDG_STATE_HOME': xdgStateHome,
+      'HOME': ?home,
+      'XDG_STATE_HOME': ?xdgStateHome,
     },
   );
   final output = process.stdout.drain<void>();

@@ -250,7 +250,7 @@ void main() {
         ],
         environment: {
           for (final key in ['HOME', 'PATH', 'TMPDIR', 'LANG'])
-            if (Platform.environment[key] case final value?) key: value,
+            key: ?Platform.environment[key],
         },
         includeParentEnvironment: false,
       );

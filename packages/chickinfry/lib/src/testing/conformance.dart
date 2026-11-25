@@ -400,7 +400,7 @@ final class ConformanceCall {
           .arrive(point, facts)
           ?.then<void>(
             (_) {},
-            onError: (Object _, StackTrace __) {
+            onError: (Object _, StackTrace _) {
               instrumentationFailed = true;
             },
           );
@@ -431,7 +431,7 @@ R withConformanceCall<R>(ConformanceCall call, R Function() body) =>
           unawaited(
             result.then<void>(
               (_) => call.complete(succeeded: true),
-              onError: (Object _, StackTrace __) {
+              onError: (Object _, StackTrace _) {
                 call.complete(succeeded: false);
               },
             ),

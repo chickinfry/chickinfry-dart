@@ -271,7 +271,7 @@ ContextLog _contextLog(int rid) => (level, message, fields) async {
           'rid': rid,
           'level': level,
           'message': message,
-          if (fields != null) 'fields': fields,
+          'fields': ?fields,
         }),
       ),
     );

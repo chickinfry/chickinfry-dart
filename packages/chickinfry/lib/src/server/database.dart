@@ -60,8 +60,8 @@ final class DatabaseConnection {
     final result = await _call({
       'op': op,
       if (_lease != null) 'lease': _lease,
-      if (sql != null) 'sql': sql,
-      if (params != null) 'params': params,
+      'sql': ?sql,
+      'params': ?params,
     });
     _check();
     if (result.containsKey('error')) {

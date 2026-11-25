@@ -120,7 +120,7 @@ void main() {
     );
   });
   test('handshake validates the target and advertises only enabled instrumentation', () {
-    final driver = Driver(Credentials(), (_, __) async => {});
+    final driver = Driver(Credentials(), (_, _) async => {});
     expect(
       () => driver.handshake({
         ...handshake,
@@ -154,7 +154,7 @@ void main() {
       ),
       enabled,
     );
-    final otherRole = Driver(Credentials(), (_, __) async => {});
+    final otherRole = Driver(Credentials(), (_, _) async => {});
     for (final role in ['server', 'cli']) {
       expect(
         () => otherRole.handshake({
@@ -176,7 +176,7 @@ void main() {
   test(
     'fixture is explicit and unknown values fail before SDK construction',
     () async {
-      final driver = Driver(Credentials(), (_, __) async => {})
+      final driver = Driver(Credentials(), (_, _) async => {})
         ..handshake(handshake);
       addTearDown(driver.dispose);
       for (final fixture in ['unknown', '', null, 1]) {
@@ -231,7 +231,7 @@ void main() {
         await request.response.close();
       });
       addTearDown(subscription.cancel);
-      final driver = Driver(refs, (_, __) async => {})..handshake(handshake);
+      final driver = Driver(refs, (_, _) async => {})..handshake(handshake);
       addTearDown(driver.dispose);
       await driver.handle(
         'c:create:auth',
@@ -280,7 +280,7 @@ void main() {
     },
   );
   test('snapshot preserves live watermarks, final projection and unavailable retention', () async {
-    final driver = Driver(Credentials(), (_, __) async => {})
+    final driver = Driver(Credentials(), (_, _) async => {})
       ..handshake(handshake)
       ..caseId = 'case';
     addTearDown(driver.dispose);
@@ -500,7 +500,7 @@ void main() {
   test(
     'store create is all-or-none and snapshot/revision/null are preserved',
     () async {
-      final driver = Driver(Credentials(), (_, __) async => {})
+      final driver = Driver(Credentials(), (_, _) async => {})
         ..handshake(handshake);
       addTearDown(driver.dispose);
       expect(
@@ -715,7 +715,7 @@ void main() {
     'input/ref conflicts include literal null; SDK copy preserves the original',
     () async {
       final credentials = Credentials()..register('bearer', 'a' * 43);
-      final driver = Driver(credentials, (_, __) async => {})
+      final driver = Driver(credentials, (_, _) async => {})
         ..handshake(handshake);
       addTearDown(driver.dispose);
       await driver.handle(
@@ -920,7 +920,7 @@ void main() {
         }),
       );
     }
-    final driver = Driver(refs, (_, __) async => {})..handshake(handshake);
+    final driver = Driver(refs, (_, _) async => {})..handshake(handshake);
     addTearDown(driver.dispose);
     await driver.handle(
       'c:create',
@@ -982,7 +982,7 @@ void main() {
   test(
     'errors preserve unknown observations and tool deadline identity',
     () async {
-      final driver = Driver(Credentials(), (_, __) async => {})
+      final driver = Driver(Credentials(), (_, _) async => {})
         ..handshake(handshake);
       addTearDown(driver.dispose);
       await driver.handle(
